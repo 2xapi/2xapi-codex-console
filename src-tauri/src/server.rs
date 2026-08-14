@@ -481,6 +481,7 @@ mod tests {
             backup_dir: PathBuf::from("/tmp/2xapi-m0-bk"),
             providers_path: PathBuf::from("/tmp/2xapi-m0-providers.json"),
             codex_home: PathBuf::from("/tmp/2xapi-m0-codex-home"),
+            launcher: Default::default(),
         }
     }
 
@@ -539,6 +540,7 @@ mod tests {
             backup_dir: root.join("backups"),
             providers_path: root.join("providers.json"),
             codex_home: root.join("codex"),
+            launcher: Default::default(),
         };
         (state, root)
     }

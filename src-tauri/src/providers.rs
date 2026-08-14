@@ -602,6 +602,7 @@ mod tests {
             access_mode: AccessMode::Mixed,
             wire_api: WireApi::ChatCompletions,
             user_agent: Some("ua".into()),
+            reasoning_levels: None,
             model: "gpt-demo".into(),
             models: vec![ModelConfig {
                 name: "gpt-demo".into(),

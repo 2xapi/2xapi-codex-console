@@ -68,7 +68,7 @@ async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str) -> Respons
         .unwrap_or(false);
     eprintln!(
         "[GW] /{} | provider={} mode={:?} wire={:?} model={} stream={} body={}B",
-        suffix, &provider.id[..8], provider.access_mode, provider.wire_api, req_model, req_stream, body_bytes.len()
+        suffix, provider.id.get(..8).unwrap_or(&provider.id), provider.access_mode, provider.wire_api, req_model, req_stream, body_bytes.len()
     );
 
     // FR-5：wire_api=chat_completions 时，/responses 入口做 Responses→Chat 转换
@@ -228,6 +228,7 @@ mod tests {
             backup_dir: root.join("backups"),
             providers_path: providers_path.clone(),
             codex_home: root.join("codex"),
+            launcher: Default::default(),
         };
         (state, providers_path, root)
     }
@@ -413,6 +414,7 @@ mod tests {
             backup_dir: s.backup_dir.clone(),
             providers_path: s.providers_path.clone(),
             codex_home: s.codex_home.clone(),
+            launcher: s.launcher.clone(),
         }
     }
 }
