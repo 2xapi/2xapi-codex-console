@@ -164,7 +164,7 @@ pub fn chat_sse_to_responses_sse(chat_sse: &[u8]) -> Vec<u8> {
         "response.output_text.done",
         &json!({ "type": "response.output_text.done", "text": text.clone() }),
     );
-    let final_usage = usage.as_ref().map(convert_usage).unwrap_or(json!({}));
+    let final_usage = usage.as_ref().map(convert_usage).unwrap_or_else(zero_usage);
     emit_event(
         &mut out,
         "response.completed",
@@ -183,6 +183,11 @@ fn convert_usage(u: &Value) -> Value {
         "output_tokens": u.get("completion_tokens").cloned().unwrap_or(json!(0)),
         "total_tokens": u.get("total_tokens").cloned().unwrap_or(json!(0)),
     })
+}
+
+/// usage 缺失时的兜底:全零而非空对象——Codex 解析 ResponseCompleted 要求字段存在。
+fn zero_usage() -> Value {
+    json!({ "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 })
 }
 
 /// 从 Responses 的 content（字符串 或 [{type:..,text:..}]）抽出文本。
@@ -207,13 +212,16 @@ fn emit_event(out: &mut String, event: &str, data: &Value) {
 pub struct SseConvState {
     buffer: String,
     created: bool,
+    item_added: bool,
     text: String,
     id: String,
+    model: String,
+    usage: Option<Value>,
 }
 
 impl SseConvState {
     pub fn new() -> Self {
-        Self { buffer: String::new(), created: false, text: String::new(), id: "resp-conv".into() }
+        Self { buffer: String::new(), created: false, item_added: false, text: String::new(), id: "resp-conv".into(), model: String::new(), usage: None }
     }
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
         self.buffer.push_str(&String::from_utf8_lossy(chunk));
@@ -227,20 +235,35 @@ impl SseConvState {
     }
     pub fn finish(&mut self) -> Vec<String> {
         let mut out = self.feed(b"\n");
+        let now = chrono::Utc::now().timestamp();
         out.push(fmt("response.output_text.done", &json!({"type":"response.output_text.done","text":self.text.clone()})));
-        out.push(fmt("response.completed", &json!({"type":"response.completed","response":{"id":self.id.clone(),"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":self.text.clone()}]}],"usage":{}}})));
+        // 真机(codex 0.148)实测修复:delta 必须归属 active item,completed 的 usage 必须含
+        // input_tokens 等字段(空对象会被 Codex 判 parse 失败断流重试)
+        out.push(fmt("response.output_item.done", &json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":format!("msg_{}",self.id),"role":"assistant","status":"completed","content":[{"type":"output_text","text":self.text.clone()}]}})));
+        out.push(fmt("response.completed", &json!({"type":"response.completed","response":{
+            "id":self.id.clone(),"object":"response","created_at":now,"model":self.model.clone(),"status":"completed",
+            "output":[{"type":"message","id":format!("msg_{}",self.id),"role":"assistant","content":[{"type":"output_text","text":self.text.clone()}]}],
+            "usage":self.usage.as_ref().map(convert_usage).unwrap_or_else(zero_usage),
+            "incomplete_details":null
+        }})));
         out
     }
     fn proc(&mut self, line: &str, out: &mut Vec<String>) {
         let p = match line.strip_prefix("data:") { Some(p) => p.trim(), None => return };
         if p == "[DONE]" { return; }
         let v: Value = match serde_json::from_str(p) { Ok(v) => v, Err(_) => return };
+        if let Some(u) = v.get("usage") { self.usage = Some(u.clone()); }
+        if let Some(m) = v.get("model").and_then(|x| x.as_str()) { self.model = m.to_string(); }
         if !self.created {
             if let Some(i) = v.get("id").and_then(|x| x.as_str()) { self.id = i.to_string(); }
-            out.push(fmt("response.created", &json!({"type":"response.created","response":{"id":self.id.clone(),"status":"in_progress","output":[]}})));
+            out.push(fmt("response.created", &json!({"type":"response.created","response":{"id":self.id.clone(),"object":"response","status":"in_progress","output":[]}})));
             self.created = true;
         }
         if let Some(ch) = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("delta")).and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+            if !self.item_added {
+                out.push(fmt("response.output_item.added", &json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":format!("msg_{}",self.id),"role":"assistant","status":"in_progress","content":[]}})));
+                self.item_added = true;
+            }
             self.text.push_str(ch);
             out.push(fmt("response.output_text.delta", &json!({"type":"response.output_text.delta","delta":ch})));
         }
@@ -330,5 +353,37 @@ mod tests {
         assert!(s.contains("event: response.completed"));
         assert!(s.contains(r#""status":"completed""#));
         assert!(s.contains(r#""input_tokens":2"#));
+    }
+
+    /// 真机(codex 0.148)暴露的增量转换器缺陷回归:①delta 前须有 output_item.added(active item)
+    /// ②completed 的 usage 须含 input_tokens(空对象被 Codex 判 parse 失败断流)③标准字段 object/created_at/model。
+    #[test]
+    fn sse_conv_state_emits_item_events_and_full_usage() {
+        let mut c = SseConvState::new();
+        let events = c.feed("data: {\"id\":\"chatcmpl-9\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n".as_bytes());
+        assert_eq!(events.len(), 3, "首块应出 created + item.added + delta:\n{events:?}");
+        assert!(events[0].starts_with("event: response.created"));
+        assert!(events[1].starts_with("event: response.output_item.added"), "delta 前必须有 active item:\n{:?}", events);
+        assert!(events[2].starts_with("event: response.output_text.delta"));
+
+        let mut tail = c.feed("data: {\"id\":\"chatcmpl-9\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"}}]}\n\n".as_bytes());
+        assert_eq!(tail.len(), 1, "后续块只出 delta");
+
+        let mut done = c.finish();
+        let joined = done.join("");
+        assert!(joined.contains("event: response.output_text.done"));
+        assert!(joined.contains("event: response.output_item.done"), "缺 output_item.done:\n{joined}");
+        assert!(joined.contains("event: response.completed"));
+        assert!(joined.contains(r#""object":"response""#), "completed 缺 object:\n{joined}");
+        assert!(joined.contains(r#""created_at""#), "completed 缺 created_at:\n{joined}");
+        assert!(joined.contains(r#""model":"deepseek-chat""#), "completed 缺 model:\n{joined}");
+        assert!(joined.contains(r#""input_tokens":0"#), "无上游 usage 时须全零兜底而非空对象:\n{joined}");
+        assert!(joined.contains(r#""text":"你好""#));
+
+        // 带上游 usage:converted 数值
+        let mut c2 = SseConvState::new();
+        c2.feed("data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n".as_bytes());
+        let f2 = c2.finish().join("");
+        assert!(f2.contains(r#""input_tokens":7"#) && f2.contains(r#""total_tokens":10"#), "上游 usage 应转换:\n{f2}");
     }
 }

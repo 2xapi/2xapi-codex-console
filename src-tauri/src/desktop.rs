@@ -62,8 +62,12 @@ pub fn has_official(codex_home: &Path) -> bool {
 
 /// 当前 config.toml 是否处于本软件托管态。
 /// - custom.base_url 指向网关 → gateway(providerId 用 providers.json active 交叉印证)
-/// - custom.base_url == 当前 active 供应商地址 → direct(本期 host 不产生此形态,判定保留完整性)
-/// - 无 custom 段 / 第三方手写 custom(如 opencode) → null
+/// - 其余(无 custom 段 / 用户手写的第三方 custom)→ null
+///
+/// 注:direct 判定本期不启用(任务书 §1.1(b) direct host 返回 E_DIRECT_UNAVAILABLE,
+/// 软件不可能产生 direct 托管态;真机实测用户手写 custom 与某 active 供应商地址相同时会被
+/// 误判为「已托管 direct」且 unhost 会误删手写配置——见交接日志待 Cowork 事项)。
+/// direct 实现时应配合可靠标记(而非仅地址匹配)再恢复判定。
 pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
     let cfg = read_toml(config_path);
     let base_url = cfg
@@ -89,11 +93,6 @@ pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
             None => (Value::Null, Value::Null),
         };
         return json!({ "providerId": id, "providerName": name, "way": "gateway" });
-    }
-    if let Some(p) = crate::providers::get_active(providers_path) {
-        if p.base_url == base_url {
-            return json!({ "providerId": p.id, "providerName": p.name, "way": "direct" });
-        }
     }
     Value::Null
 }
@@ -512,8 +511,13 @@ mod tests {
         // 第三方 custom(opencode 形态)→ null
         std::fs::write(&cfg, "[model_providers.custom]\nbase_url = \"https://opencode.ai/zen/go/v1\"\n").unwrap();
         assert!(detect_hosting(&cfg, &prov).is_null(), "第三方 custom 不应误判为托管");
-        // gateway 托管 + active
+        // 真机暴露场景:用户手写 custom 地址恰与 active 供应商地址相同 → 仍应 null
+        // (direct 托管本期未开放,软件不可能产生 direct 态;判出必为用户手写,不能被 unhost 误删)
         write_providers(&prov, vec![provider("p1", "A")]);
+        std::fs::write(&cfg, "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://up.example.com\"\n").unwrap();
+        crate::providers::set_active(&prov, "p1");
+        assert!(detect_hosting(&cfg, &prov).is_null(), "地址撞 active 供应商也不应判 direct");
+        // gateway 托管 + active
         std::fs::write(&cfg, "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\n").unwrap();
         crate::providers::set_active(&prov, "p1");
         let h = detect_hosting(&cfg, &prov);
