@@ -403,23 +403,19 @@ async fn handle_providers_fetch_models(State(s): State<Arc<AppState>>, Json(body
         .iter()
         .map(|(n, ctx)| crate::providers::ModelConfig { name: n.clone(), context_window: *ctx, ..Default::default() })
         .collect();
-    // ★ 探测 reasoning levels（用 provider 配置的 model 探，从接口获取而非写死）
-    let probe_model = if let Some(wid) = &write_back_id {
+    // reasoning levels 探测已移出同步路径(2026-08-15 真机:2xa 上游对该探测挂满 15s 超时,
+    // 把拉模型拖到 25s+,用户感知"拉取用不了")。levels 为空时 catalog 用默认 5 级,
+    // 真机对话已验证无影响;显式探测挪到阶段 2 preflight。写回仅更新 models,保留已存 levels。
+    let levels: Vec<String> = if let Some(wid) = &write_back_id {
         crate::providers::load(&s.providers_path)
             .providers.iter().find(|p| p.id == *wid)
-            .map(|p| p.model.clone())
+            .and_then(|p| p.reasoning_levels.clone())
             .unwrap_or_default()
-    } else { String::new() };
-    let probe_model = if probe_model.is_empty() { models.first().map(|m| m.name.clone()).unwrap_or_default() } else { probe_model };
-    let levels = if !probe_model.is_empty() {
-        crate::probe::probe_reasoning_levels(&base_url, &api_key, &probe_model).await
     } else { Vec::new() };
-    // 仅已存 provider 才写回；新建场景只返回，不落库
     if let Some(wid) = write_back_id {
         let mut data = crate::providers::load(&s.providers_path);
         if let Some(p) = data.providers.iter_mut().find(|p| p.id == wid) {
             p.models = models.clone();
-            if !levels.is_empty() { p.reasoning_levels = Some(levels.clone()); }
         }
         let _ = crate::providers::store(&s.providers_path, &data);
     }
