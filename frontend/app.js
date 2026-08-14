@@ -1,558 +1,551 @@
-// app.js — 2xapi Codex Console 前端（对齐 06 布局 + 04 契约）
 "use strict";
+/* ── 2xapi Codex Console · 桌面版主通道形态(阶段 1,视觉规格 = 界面重设计原型) ──
+ * 词汇规范:统一「供应商」;主动词不用于本卡(桌面版 = 开启托管/还原);「会话」仅指对话记录。
+ * 交互规范:禁止内联 onclick(CSP),一律 data-a 事件委托;通路图断言 节点数=连线数+1。
+ */
 
-// 供应商仅支持第三方接入（Mixed/PureApi）；官方登录不是供应商，由顶栏「⇄ 切官方」管理。
-const MODES = [
-  { key: "mixed", title: "保持官登 + API", sub: "Mixed · 走网关，保留官方登录" },
-  { key: "pure_api", title: "第三方 API", sub: "PureApi · 纯第三方，覆盖 key" },
-];
-const MODE_LABEL = { official: "官方", mixed: "Mixed", pure_api: "PureApi" };
-
-const state = {
-  providers: [], activeId: null, health: null,
-  selectedId: null, mode: "view", isNew: false, draft: null,
-  preview: null, diag: null, fieldErrors: {}, toast: null,
-  auth: null, showLogin: false, loginForm: { email: "", password: "" }, loginError: "",
-  keyGroups: null, showKeyGroups: false,
-  confirm: null,
-  showTools: false, toolsTab: "launcher", backups: null, history: null,
-  launcher: { useProvider: "", baseUrl: "", apiKey: "", model: "", projectDir: "", sessions: [], providers: null },
+var state = {
+  providers: [],        // GET /api/providers
+  selId: null,          // 左栏/主卡当前选中供应商
+  mode: "view",         // view | edit
+  isNew: false,
+  draft: null,          // 编辑草稿(input change 时收集,防重绘丢失)
+  fieldErrors: {},
+  diag: null,           // 诊断结果(当前选中供应商)
+  dstate: null,         // GET /api/desktop/state {hasOfficial, hosting, gateway, codexHome}
+  busy: null,           // 进行中动作标记(按钮禁用)
+  modal: null,          // {kind:"login"|"snippet"|"tool", t:"history"|"settings"}
+  toast: null,          // {m, k}
+  confirmBox: null,     // {msg, resolve}
+  loginError: "",
+  session: null,        // 2xapi 登录态
 };
 
-const $ = (s) => document.querySelector(s);
-const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+var $ = function (s) { return document.querySelector(s); };
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  });
+}
+function showToast(m, k) {
+  state.toast = { m: m, k: k || "" }; render();
+  setTimeout(function () { state.toast = null; render(); }, 2800);
+}
+function askConfirm(msg) {
+  return new Promise(function (resolve) { state.confirmBox = { msg: msg, resolve: resolve }; render(); });
+}
+function lineOf(id) { return state.providers.find(function (p) { return p.id === id; }) || null; }
+function hosting() { return (state.dstate && state.dstate.hosting) || null; }
+function hostedBy(id) { var h = hosting(); return !!h && h.way === "gateway" && (id ? h.providerId === id : true); }
+var CHIP_COLORS = ["var(--c-gw)", "var(--c-direct)", "var(--c-accel)", "var(--c-official)"];
+function chipColor(p, i) { return p.iconColor || CHIP_COLORS[i % CHIP_COLORS.length]; }
 
 // ── 数据加载 ──
-async function refreshAll() { await Promise.all([refreshProviders(), refreshHealth(), refreshSession()]); }
-async function refreshSession() {
-  try { const s = await api.session(); state.auth = s && s.authenticated ? s.user : null; }
-  catch { state.auth = null; }
+function normProviders(d) {
+  var arr = (d && d.providers) || (Array.isArray(d) ? d : []);
+  return arr.filter(function (p) { return p && p.accessMode !== "official"; });
 }
 async function refreshProviders() {
-  try {
-    const d = await api.listProviders();
-    state.providers = d.providers || [];
-    state.activeId = d.active_provider_id || null;
-  } catch (e) { showToast(e.message, "error"); }
+  var d = await api.listProviders();
+  state.providers = normProviders(d);
+  if (state.providers.length && !lineOf(state.selId)) {
+    var h = hosting();
+    state.selId = (h && h.providerId && lineOf(h.providerId)) ? h.providerId : state.providers[0].id;
+  }
 }
-async function refreshHealth() {
-  try { state.health = await api.health(); } catch { state.health = null; }
+async function refreshDesktop() {
+  try { state.dstate = await api.desktopState(); } catch (e) { state.dstate = null; }
 }
-function showToast(msg, kind = "info") {
-  state.toast = { msg, kind };
-  render();
-  if (state.toast) setTimeout(() => { state.toast = null; render(); }, 2800);
+async function refreshSession() {
+  try { state.session = await api.session(); } catch (e) { state.session = null; }
+}
+async function refreshAll() {
+  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession()]);
 }
 
 // ── 渲染 ──
-function render() { $("#app").innerHTML = shell(); }
-function shell() {
-  return topbar() +
-    `<main class="layout"><section class="list-pane">${listPane()}</section><section class="detail-pane">${detailPane()}</section></main>` +
-    toastEl() + loginModal() + keyGroupsModal() + confirmModal() + toolsModal();
+function render() {
+  $("#app").innerHTML =
+    '<header class="topbar">'
+    + '<span class="brand"><span class="mark">2×</span>2xapi Codex Console</span>'
+    + '<span class="spacer"></span>'
+    + topChips()
+    + loginBtn()
+    + '</header>'
+    + '<div class="frame"><nav class="rail">' + rail() + '</nav><main class="content">' + mainPane() + '</main></div>'
+    + '<div class="foot-note">desktop-channel · 桌面版主通道 · 终端注入式方案已保存备用</div>'
+    + (state.modal ? modalHtml() : "")
+    + (state.confirmBox ? confirmHtml() : "")
+    + (state.toast ? '<div class="toast ' + state.toast.k + '">' + esc(state.toast.m) + '</div>' : "");
+  assertRouteShape();
 }
 
-function topbar() {
-  const m = activeMode();
-  const dotCls = m ? "dot " + m : "dot";
-  const name = activeName();
-  return `<header class="topbar">
-    <span class="brand">2xapi Codex Console</span>
-    <span class="spacer"></span>
-    <span class="active-tag"><span class="${dotCls}"></span>当前：${esc(name)}${m ? " · " + MODE_LABEL[m] : ""}</span>
-    ${state.auth ? `<button class="btn ghost" data-action="logout" type="button">登出 ${esc((state.auth.email || state.auth.name || "2xapi"))}</button>` : `<button class="btn ghost" data-action="show-login" type="button">登录 2xapi</button>`}
-    <button class="btn ghost" data-action="show-tools" type="button">🛠 工具箱</button>
-    <button class="btn ghost" data-action="activate-official" type="button">⇄ 切官方</button>
-    <button class="btn ghost" data-action="refresh" type="button">↻</button>
-  </header>`;
+/* 通路图形状自检:节点数 = 连线数 + 1(原型踩过的坑) */
+function assertRouteShape() {
+  var st = document.querySelectorAll("#app .route > .st").length;
+  var lk = document.querySelectorAll("#app .route > .lk").length;
+  if (st !== lk + 1) console.warn("通路图形状异常: 节点 " + st + " ≠ 连线 " + lk + " + 1");
 }
-function activeName() {
-  if (!state.activeId) return state.health && state.health.access_mode ? "官方" : "未激活";
-  const p = state.providers.find((x) => x.id === state.activeId);
-  return p ? p.name : "未激活";
-}
-function activeMode() { return (state.health && state.health.access_mode) || null; }
 
-function listPane() {
-  const items = state.providers.map((p) => {
-    const isActive = p.id === state.activeId;
-    const sel = p.id === state.selectedId ? "sel" : "";
-    return `<div class="provider-item ${isActive ? "active" : ""} ${sel}" data-action="select" data-id="${esc(p.id)}">
-      <span class="star">${isActive ? "★" : ""}</span>
-      <span class="name">${esc(p.name)}</span>
-      <span class="mode-tag ${esc(p.accessMode)}">${MODE_LABEL[p.accessMode] || p.accessMode}</span>
-      <button class="icon-btn" data-action="delete" data-id="${esc(p.id)}" title="删除">✕</button>
-    </div>`;
+function topChips() {
+  var gw = (state.dstate && state.dstate.gateway) || null;
+  var h = hosting();
+  var hasOff = state.dstate && state.dstate.hasOfficial;
+  var label;
+  if (h && h.way === "gateway") {
+    label = "桌面版:已托管 · " + (hasOff ? "混入" : "纯API") + " · " + esc(h.providerName || (lineOf(h.providerId) || {}).name || "");
+  } else if (hasOff) {
+    label = "桌面版:官方";
+  } else {
+    label = "桌面版:未配置";
+  }
+  return '<span class="gw-chip ' + (gw && gw.alive ? "alive" : "") + '"><span class="led"></span>gateway ' + (gw ? esc(gw.addr) : "127.0.0.1:8787") + '</span>'
+    + '<span class="gw-chip ' + (h && h.way === "gateway" ? "on" : "") + '">' + label + '</span>';
+}
+function loginBtn() {
+  var s = state.session;
+  var logged = !!(s && (s.loggedIn || s.email));
+  return logged
+    ? '<button class="btn ghost" data-a="logout">' + esc(s.email || "已登录") + " · 登出</button>"
+    : '<button class="btn ghost" data-a="login">登录 2xapi</button>';
+}
+
+function rail() {
+  var rows = state.providers.map(function (p, i) {
+    var isHost = hostedBy(p.id);
+    return '<button class="line-row ' + (p.id === state.selId ? "sel" : "") + '" style="--lc:' + chipColor(p, i) + '" data-a="sel" data-id="' + esc(p.id) + '">'
+      + '<span class="chip">' + esc(p.icon || String(i + 1)) + '</span><span class="nm">' + esc(p.name) + '</span>'
+      + (isHost
+        ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">托管中</span>'
+        : '<span class="tag">' + (p.wireApi === "chat_completions" ? "chat" : "responses") + '</span>')
+      + '</button>';
   }).join("");
-  return `<h3>供应商</h3>${items || `<div class="empty">暂无供应商</div>`}<button class="btn primary" data-action="new" type="button" style="width:100%;margin-top:8px">+ 新建供应商</button>`;
+  return '<div class="eyebrow">供应商</div>' + (rows || '<div class="sub" style="margin:4px 8px 10px">还没有供应商,点下方新建</div>')
+    + '<button class="btn ghost new" data-a="new">＋ 新建供应商</button>'
+    + '<div class="rail-foot"><a data-a="tool" data-t="history">历史会话</a><a data-a="tool" data-t="settings">本机设置</a></div>';
 }
 
-function detailPane() {
-  if (state.mode === "edit") return editForm();
-  const p = state.providers.find((x) => x.id === state.selectedId);
-  let html = detailView(p);
-  if (state.preview) html += previewPanel(state.preview);
-  if (state.diag && state.diag.id === state.selectedId) html += diagnosePanel();
+/* ── 桌面版主卡:账号状态自动检测 × 通路(本期 gateway;direct 待字段实测,加速待阶段 4) ── */
+function desktopCard() {
+  var d = state.dstate || {};
+  var hasOff = !!d.hasOfficial;
+  var h = hosting();
+  var isHost = !!(h && h.way === "gateway");
+  var p = lineOf(state.selId) || lineOf(h && h.providerId);
+  var modeName = hasOff ? "混入模式" : "纯 API 模式";
+  var acctSub = hasOff ? "官方登录保留" : "纯 API · 无官方账号";
+
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c, live) { return '<div class="lk ' + (live ? "live" : "") + '" style="--lc:' + c + '"></div>'; };
+
+  var route, note, mech;
+  if (!isHost) {
+    route = st("var(--c-official)", "桌面版 Codex", hasOff ? "官方登录" : "未配置")
+      + lk("var(--c-official)", false)
+      + st("var(--c-official)", hasOff ? "官方 OpenAI" : "不可用", hasOff ? "chatgpt 登录" : "无官方登录");
+    note = '<div class="route-mode"><span class="k" style="color:var(--c-official)">●</span>'
+      + (hasOff ? "当前:官方直连 · 点下方按钮开启走中转" : "当前:未配置(无官方登录,官方通道不可用)· 开启托管后走中转") + '</div>';
+    mech = hasOff
+      ? '<span>官方登录 · 官方额度</span><span>未做任何修改</span>'
+      : '<span>无官方登录</span><span>未做任何修改</span>';
+  } else {
+    route = st("var(--c-gw)", "桌面版 Codex", acctSub)
+      + lk("var(--c-gw)", true)
+      + st("var(--c-gw)", "网关", "127.0.0.1:8787")
+      + lk("var(--c-gw)", true)
+      + st(p ? chipColor(p, state.providers.indexOf(p)) : "var(--c-gw)", esc(p ? p.name : "?"), "中转站");
+    note = '<div class="route-mode"><span class="k">●</span>通路二:网关(加速即将上线,当前直发上游) · 配置文件零 Key,Key 由网关注入 · ' + modeName + '</div>';
+    mech = (hasOff ? '<span>① 官方登录/插件保留</span>' : '<span>① 无需官方账号</span>')
+      + '<span>② 配置文件零 Key</span><span>③ 协议转换 · chat 中转可用</span><span>依赖本 app 常驻</span>';
+  }
+
+  var opts = state.providers.map(function (x) {
+    return '<option value="' + esc(x.id) + '"' + (x.id === state.selId ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
+  }).join("");
+  var hostPid = isHost ? (h.providerId || state.selId) : state.selId;
+
+  return '<section class="card"><h2>桌面版 Codex(ChatGPT.app)· 主通道</h2>'
+    + '<div class="sub">一键走中转;账号状态自动检测(<b>有官方账号 → 混入模式,登录保留</b>;无账号 → 纯 API 模式),全程自动备份、一键还原。</div>'
+    + '<div style="display:flex;align-items:center;gap:8px;margin:0 0 10px">'
+    + '<span class="tag" style="' + (hasOff ? "border-color:var(--c-official);color:var(--c-official)" : "") + '">检测:官方登录 ' + (hasOff ? "✓" : "未检出") + ' → ' + modeName + '</span>'
+    + '</div>'
+    + '<div class="route">' + route + '</div>'
+    + note
+    + '<div class="mech">' + mech + '</div>'
+    + '<div class="grid">'
+    + '<div class="f full"><label>通路方式</label><div class="seg">'
+    + '<button data-a="way" data-w="direct" aria-pressed="false" style="--lc:var(--c-direct)" disabled>直连 API 端点<small>即将支持 · 不依赖本 app</small></button>'
+    + '<button data-a="way" data-w="gateway" aria-pressed="true" style="--lc:var(--c-gw)"' + (isHost ? "" : " disabled") + '>网关(推荐)<small>零落盘 · 加速可开关</small></button>'
+    + '</div>'
+    + (isHost
+      ? '<div class="seg" style="margin-top:8px;max-width:460px" title="阶段 4 上线">'
+        + '<button data-a="accel" data-m="off" aria-pressed="true" style="--lc:var(--muted)" disabled>加速:关<small>网关直发上游</small></button>'
+        + '<button data-a="accel" data-m="official" aria-pressed="false" style="--lc:var(--c-accel)" disabled>官方加速专线<span class="badge-soon">即将上线</span><small>2xapi 站专用</small></button>'
+        + '<button data-a="accel" data-m="custom" aria-pressed="false" style="--lc:var(--c-accel)" disabled>我的节点<span class="badge-soon">即将上线</span><small>自己的 VPS / 本地代理</small></button>'
+        + '</div>'
+      : "")
+    + '</div>'
+    + '<div class="f"><label>供应商(走哪家中转)</label><select data-a="lsel"' + (state.providers.length ? "" : " disabled") + '>'
+    + (opts || '<option value="">先新建供应商</option>') + '</select><div class="hint">切换即时生效,无需重启桌面版</div></div>'
+    + '<div class="f"><label>状态</label><div style="padding:9px 0;font-size:13px">'
+    + (isHost
+      ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">已托管 · ' + modeName + '</span> <span class="hint">网关 · 配置零 Key</span>'
+      : '<span class="tag">' + (hasOff ? "未托管 · 走官方" : "未托管 · 未配置") + '</span>')
+    + '</div></div>'
+    + '</div>'
+    + '<div class="btn-row" style="margin-top:14px">'
+    + (isHost
+      ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>' + (hasOff ? "还原官方" : "关闭托管(移除中转配置)") + (state.busy === "unhost" ? "…" : "") + '</button>'
+      : '<button class="btn primary" data-a="host"' + (!hostPid || state.busy === "host" ? " disabled" : "") + ' style="--lc:var(--c-gw)">开启:桌面版走中转' + (state.busy === "host" ? "…" : "") + '</button>')
+    + '<button class="btn ghost" data-a="test">⚡ 测试连接</button>'
+    + '</div>'
+    + '<div id="rtest"></div>'
+    + '</section>';
+}
+
+/* ── CLI 注入式:方案已保存,本版不启用 ── */
+function cliBackupCard() {
+  return '<section class="card"><details>'
+    + '<summary>终端注入式启动器(Codex CLI)· 方案已保存,本版暂不启用</summary>'
+    + '<div class="sub" style="margin-top:10px">点一下即开终端版 Codex:零写入、多供应商并行、可同时开多个。完整设计见方案 v3(-c 参数覆盖 / 真 home / 密钥即焚),界面与代码均已备,后续按需启用。</div>'
+    + '<button class="btn" disabled>▶ 启动 Codex(终端版)· 暂未启用</button>'
+    + '</details></section>';
+}
+
+/* ── 供应商详情 / 编辑 ── */
+function detailCard() {
+  if (state.mode === "edit") return editCard();
+  var p = lineOf(state.selId);
+  if (!p) return "";
+  var kv = function (k, v, mono) {
+    return '<div><div class="k">' + k + '</div><div class="v ' + (mono ? "mono" : "") + '">' + esc(v == null || v === "" ? "—" : v) + '</div></div>';
+  };
+  var isHost = hostedBy(p.id);
+  var html = '<section class="card"><div class="eyebrow" style="margin:0 0 8px">供应商详情 · ' + esc(p.name) + (isHost ? ' <span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">桌面版托管中</span>' : "") + '</div>'
+    + '<div class="kv">'
+    + kv("上游地址", p.baseUrl, true)
+    + kv("API Key", p.apiKeyMasked || "—", true)
+    + kv("协议", p.wireApi === "chat_completions" ? "chat(自动经网关转换)" : "responses", true)
+    + kv("默认模型", p.model, true)
+    + kv("模型数", (p.models || []).length || "—", true)
+    + kv("备注", p.notes)
+    + "</div>"
+    + '<div class="btn-row">'
+    + (isHost ? '<button class="btn" disabled>✓ 桌面版正在使用</button>' : '<button class="btn primary" data-a="use-line">▶ 桌面版改用这条线</button>')
+    + '<button class="btn" data-a="edit">编辑</button>'
+    + '<button class="btn" data-a="diag">' + (state.diag ? "收起诊断" : "诊断") + '</button>'
+    + '<button class="btn ghost" data-a="snippet">复制 config 片段(进阶)</button>'
+    + '<button class="btn ghost danger" data-a="del">删除</button>'
+    + '</div>'
+    + '<div class="sub" style="margin:10px 0 0">「复制片段」给愿意手动配置的用户;普通用户点上方按钮即可,一切自动。</div>'
+    + "</section>";
+  if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
   return html;
 }
 
-function detailView(p) {
-  if (!p) return `<div class="empty">选择左侧供应商，或点「新建供应商」</div>`;
-  const isActive = p.id === state.activeId;
-  const row = (l, v) => `<div class="field full"><label>${l}</label><div>${esc(v == null || v === "" ? "—" : v)}</div></div>`;
-  return `<div class="panel-card">
-    <h2>${esc(p.name)} ${isActive ? '<span class="mode-tag mixed">已激活</span>' : ""}</h2>
-    <div class="form-grid" style="margin-bottom:6px">
-      ${row("接入模式", MODE_LABEL[p.accessMode])}
-      ${row("协议", p.wireApi)}
-      ${p.accessMode !== "official" ? row("上游地址", p.baseUrl) : ""}
-      ${p.accessMode !== "official" ? row("API Key", p.apiKeyMasked) : ""}
-      ${row("默认模型", p.model)}
-      ${row("模型数", (p.models && p.models.length) || 0)}
-    </div>
-    <div class="btn-row">
-      <button class="btn primary" data-action="activate" data-id="${esc(p.id)}">${isActive ? "重新激活" : "激活"}</button>
-      <button class="btn" data-action="edit" data-id="${esc(p.id)}">编辑</button>
-      <button class="btn" data-action="diagnose" data-id="${esc(p.id)}">诊断</button>
-      <button class="btn" data-action="preview" data-id="${esc(p.id)}">预览 config</button>
-    </div>
-  </div>`;
+function diagCard(d) {
+  var ok = function (b) { return b ? "✓" : "✗"; };
+  var cls = function (b) { return b ? "" : " bad"; };
+  var errs = (d.errors || []).map(function (e) { return esc(e.message || e.msg || String(e)); }).join(";");
+  return '<section class="card"><div class="eyebrow" style="margin:0 0 10px">诊断 / doctor</div><div class="steps" style="margin-top:0">'
+    + '<div class="step' + cls(d.configValid) + '">' + ok(d.configValid) + ' 配置校验<span class="meta">' + (d.configValid ? "pass" : "fail") + '</span></div>'
+    + '<div class="step' + cls(d.reachable) + '">' + ok(d.reachable) + ' 连接测试<span class="meta">' + (d.reachable ? ((d.latencyMs != null ? d.latencyMs + "ms · " : "") + (d.models || []).length + " models") : "不通") + '</span></div>'
+    + '<div class="step' + cls(d.testOk) + '">' + ok(d.testOk) + ' 真实请求<span class="meta">' + (d.testOk ? "pass" : "fail") + '</span></div>'
+    + '</div>'
+    + (errs ? '<div class="notice">' + errs + '</div>' : "")
+    + '</section>';
 }
 
-// 后端 ModelConfig 是 snake_case，前端 draft 统一用 camelCase
-function normModel(m) {
-  return {
-    name: m.name,
-    displayName: m.display_name != null ? m.display_name : m.displayName,
-    contextWindow: m.context_window != null ? m.context_window : m.contextWindow,
-    isMultimodal: m.is_multimodal != null ? m.is_multimodal : m.isMultimodal,
-    sendAsIs: m.send_as_is != null ? m.send_as_is : m.sendAsIs,
-  };
+function editCard() {
+  var d = state.draft;
+  var fe = function (f) { return state.fieldErrors[f] ? '<div class="err">' + esc(state.fieldErrors[f]) + '</div>' : ""; };
+  var fc = function (f) { return state.fieldErrors[f] ? " has-err" : ""; };
+  var rows = (d.models || []).map(function (x, i) {
+    return '<tr><td><input data-mf="name" data-mi="' + i + '" value="' + esc(x.name || "") + '"></td>'
+      + '<td><input data-mf="cw" data-mi="' + i + '" style="width:90px" value="' + esc(x.contextWindow || "") + '"></td>'
+      + '<td><button class="btn ghost danger" data-a="mrow-del" data-i="' + i + '">✕</button></td></tr>';
+  }).join("");
+  var wireSel = d.wireApi === "chat_completions" ? "chat_completions" : "responses";
+  return '<section class="card"><h2>' + (state.isNew ? "新建供应商" : "编辑供应商 · " + esc(d.name)) + '</h2>'
+    + '<div class="sub">填好地址和 Key,点「拉取模型」自动获取模型列表;Key 只存在本软件里,不写入任何配置文件。</div>'
+    + '<div class="grid">'
+    + '<div class="f full' + fc("name") + '"><label>名称 *</label><input data-f="name" value="' + esc(d.name || "") + '">' + fe("name") + '</div>'
+    + '<div class="f full' + fc("baseUrl") + '"><label>上游地址 *</label><input class="mono" data-f="baseUrl" value="' + esc(d.baseUrl || "") + '" placeholder="https://api.example.com">' + fe("baseUrl") + '</div>'
+    + '<div class="f full' + fc("apiKey") + '"><label>api key' + (state.isNew ? " *" : " · 留空不修改") + '</label><input type="password" class="mono" data-f="apiKey" placeholder="' + (state.isNew ? "sk-..." : (d.apiKeyMasked ? "•••• 未改则留空" : "sk-...")) + '" value="">' + fe("apiKey") + '</div>'
+    + '<div class="f' + fc("model") + '"><label>默认模型 *</label><input class="mono" data-f="model" value="' + esc(d.model || "") + '" placeholder="点「拉取模型」后自动填入">' + fe("model") + '</div>'
+    + "</div>"
+    + '<div class="eyebrow" style="margin:16px 0 6px">模型列表(「拉取模型」自动填写,一般无需手改)</div>'
+    + '<table class="mtable"><thead><tr><th>模型名</th><th>上下文</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>'
+    + '<div class="btn-row">'
+    + '<button class="btn ghost" data-a="mfetch"' + (state.busy === "mfetch" ? " disabled" : '') + '>' + (state.busy === "mfetch" ? "拉取中…" : "⤓ 拉取模型") + '</button>'
+    + '<button class="btn ghost" data-a="mrow-add">＋ 手动加一行</button>'
+    + '</div>'
+    + '<details style="margin-top:10px"><summary>高级(协议 · 代理 · 超时 · 备注)· 不用动</summary><div class="grid" style="margin-top:10px">'
+    + '<div class="f"><label>协议</label><select data-f="wireSel"><option value="auto"' + (d.wireSelUi !== wireSel ? " selected" : "") + '>自动(拉取模型时检测)</option><option value="responses"' + (d.wireSelUi === "responses" ? " selected" : "") + '>Responses</option><option value="chat_completions"' + (d.wireSelUi === "chat_completions" ? " selected" : "") + '>ChatCompletions</option></select><div class="hint">不确定就保持「自动」</div></div>'
+    + '<div class="f"><label>HTTP 代理</label><input class="mono" data-f="proxyUrl" value="' + esc(d.proxyUrl || "") + '" placeholder="http://127.0.0.1:7890"></div>'
+    + '<div class="f"><label>超时(秒)</label><input type="number" data-f="timeoutSecs" value="' + esc(d.timeoutSecs || "") + '"></div>'
+    + '<div class="f full"><label>备注</label><input data-f="notes" value="' + esc(d.notes || "") + '"></div>'
+    + '</div></details>'
+    + '<div class="btn-row" style="margin-top:16px">'
+    + '<button class="btn primary" data-a="save"' + (state.busy === "save" ? " disabled" : "") + '>保存</button>'
+    + '<button class="btn ghost" data-a="cancel">取消</button>'
+    + '</div>'
+    + "</section>";
+}
+
+function mainPane() { return desktopCard() + cliBackupCard() + detailCard(); }
+
+/* ── 弹窗 ── */
+function confirmHtml() {
+  return '<div class="mask" style="z-index:70" data-a="cno"><div class="box" style="width:330px"><div style="margin-bottom:16px">' + esc(state.confirmBox.msg) + '</div><div class="btn-row" style="margin:0"><button class="btn danger" data-a="cyes">删除</button><button class="btn ghost" data-a="cno">取消</button></div></div></div>';
+}
+function modalHtml() {
+  var m = state.modal;
+  if (m.kind === "login") {
+    return '<div class="mask" data-a="mclose"><div class="box" style="width:350px"><h2 style="margin:0 0 4px;font-size:15px">登录 2xapi 账号</h2>'
+      + '<div class="sub">登录后可一键导入你的 Key 和供应商</div>'
+      + '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail || "") + '"></div>'
+      + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password"></div>'
+      + (state.loginError ? '<div class="err" style="color:var(--c-err);font-size:12px">' + esc(state.loginError) + '</div>' : "")
+      + '<div class="btn-row"><button class="btn primary" data-a="do-login">登录</button><button class="btn ghost" data-a="mclose">取消</button></div></div></div>';
+  }
+  if (m.kind === "snippet") {
+    return '<div class="mask" data-a="mclose"><div class="box"><h2 style="margin:0 0 4px;font-size:15px">config 片段(进阶,可选)</h2>'
+      + '<div class="sub">仅给想手动配置 ~/.codex 的用户:自行粘贴、自行负责。日常使用点「开启:桌面版走中转」即可,无需任何手动配置。</div>'
+      + '<pre class="toml">model_provider = "custom"\n\n[model_providers.custom]\nname = "custom"\nbase_url = "http://127.0.0.1:8787"\nwire_api = "responses"\nrequires_openai_auth = true</pre>'
+      + '<div class="btn-row"><button class="btn primary" data-a="copy-snippet">复制到剪贴板</button><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
+  }
+  var body;
+  if (m.t === "history") {
+    body = '<div class="notice">历史会话管理即将上线(阶段 3):统一列表、按供应商筛选、一键修复。</div>';
+  } else {
+    body = '<div class="kv"><div><div class="k">config.toml</div><div class="v mono">~/.codex(托管开启时仅一处 custom 段,零 Key)</div></div><div><div class="k">网关</div><div class="v mono">127.0.0.1:8787 · 托盘常驻</div></div></div>'
+      + '<div class="f full" style="margin-top:12px"><label>我的加速节点(即将上线 · 仅本机保存)</label><input class="mono" placeholder="socks5://127.0.0.1:7890 或 http://用户:密码@你的VPS:8443" disabled><div class="hint">阶段 4 上线:自己的 VPS(跑 gost/squid)或本地代理客户端端口。官方加速专线由 2xapi 下发,无需填写。</div></div>';
+  }
+  var title = { history: "历史会话", settings: "本机设置" }[m.t];
+  return '<div class="mask" data-a="mclose"><div class="box"><h2 style="margin:0 0 12px;font-size:15px">' + title + '</h2>' + body + '<div class="btn-row"><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
+}
+
+/* ── 草稿收集(重绘前从 DOM 收值,防丢输入) ── */
+function collectDraft() {
+  if (state.mode !== "edit" || !state.draft) return;
+  var d = state.draft;
+  var get = function (f) { var el = document.querySelector('[data-f="' + f + '"]'); return el ? el.value : undefined; };
+  ["name", "baseUrl", "model", "proxyUrl", "timeoutSecs", "notes"].forEach(function (f) {
+    var v = get(f);
+    if (v !== undefined) d[f] = v.trim ? v.trim() : v;
+  });
+  // apiKey 特殊:输入框不回显(重绘后 value 恒空),空 = 未输入 → 保留草稿值,不覆盖
+  var ak = get("apiKey");
+  if (typeof ak === "string" && ak !== "") d.apiKey = ak;
+  var wsel = get("wireSel");
+  if (wsel !== undefined) d.wireSelUi = wsel; // "auto" = 保持现值(落库 wireApi 不变);显式选了才更新
+  var mnames = document.querySelectorAll('[data-mf="name"]');
+  mnames.forEach(function (el) { d.models[Number(el.dataset.mi)].name = el.value.trim(); });
+  document.querySelectorAll('[data-mf="cw"]').forEach(function (el) {
+    var v = el.value.trim();
+    d.models[Number(el.dataset.mi)].contextWindow = v ? Number(v) : null;
+  });
 }
 
 function draftFromProvider(p) {
   return {
-    id: p.id, name: p.name, accessMode: p.accessMode, baseUrl: p.baseUrl, apiKey: "",
-    apiKeyMasked: p.apiKeyMasked, wireApi: p.wireApi, model: p.model,
-    models: (p.models || []).map(normModel),
-    proxyUrl: p.proxyUrl, timeoutSecs: p.timeoutSecs, userAgent: p.userAgent,
-    websiteUrl: p.websiteUrl, notes: p.notes, icon: p.icon,
+    id: p.id, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", apiKeyMasked: p.apiKeyMasked || "",
+    wireApi: p.wireApi || "responses", wireSelUi: p.wireApi || "responses",
+    model: p.model || "", models: (p.models || []).map(function (m) { return { name: m.name, contextWindow: m.contextWindow }; }),
+    proxyUrl: p.proxyUrl || "", timeoutSecs: p.timeoutSecs || "", notes: p.notes || "",
   };
 }
 
-function editForm() {
-  const d = state.draft || {};
-  const m = d.accessMode || "pure_api";
-  const isOfficial = m === "official";
-  const fe = state.fieldErrors || {};
-  const ferr = (k) => (fe[k] ? `<div class="err-msg">${esc(fe[k])}</div>` : "");
-  const fcls = (k) => "field " + (fe[k] ? "err" : "");
-  const modeCards = MODES.map((mm) =>
-    `<div class="mode-card ${mm.key === m ? "selected" : ""}" data-action="set-mode" data-mode="${mm.key}"><div class="t">${mm.title}</div><div class="s">${mm.sub}</div></div>`
-  ).join("");
-
-  const modelRows = (d.models || []).map((mdl, i) => `<tr>
-    <td><input data-mk="name" data-i="${i}" value="${esc(mdl.name)}"></td>
-    <td><input data-mk="displayName" data-i="${i}" value="${esc(mdl.displayName || "")}"></td>
-    <td><input data-mk="contextWindow" data-i="${i}" value="${esc(mdl.contextWindow || "")}" style="width:84px"></td>
-    <td style="text-align:center"><input type="checkbox" data-mk="isMultimodal" data-i="${i}" ${mdl.isMultimodal ? "checked" : ""}></td>
-    <td style="text-align:center"><input type="checkbox" data-mk="sendAsIs" data-i="${i}" ${mdl.sendAsIs ? "checked" : ""}></td>
-    <td><button class="icon-btn" data-action="del-model" data-i="${i}">✕</button></td>
-  </tr>`).join("");
-
-  return `<div class="panel-card">
-    <h2>${state.isNew ? "新建供应商" : "编辑供应商"}</h2>
-    <div class="mode-selector">${modeCards}</div>
-    <div class="form-grid">
-      <div class="${fcls("name")} full"><label>名称 *</label><input data-f="name" value="${esc(d.name || "")}">${ferr("name")}</div>
-      ${isOfficial ? "" : `<div class="${fcls("baseUrl")} full"><label>上游地址 Base URL *</label><input data-f="baseUrl" placeholder="https://api.example.com" value="${esc(d.baseUrl || "")}">${ferr("baseUrl")}</div>`}
-      ${isOfficial ? "" : `<div class="${fcls("apiKey")} full"><label>API Key ${state.isNew ? "*" : ""}</label><input data-f="apiKey" type="password" placeholder="${state.isNew ? "输入 Key" : (d.apiKeyMasked || "•••• 未改则留空")}" value="${state.isNew ? esc(d.apiKey || "") : ""}">${ferr("apiKey")}<span class="hint">编辑时留空表示不修改</span></div>`}
-      ${(!isOfficial && state.auth) ? `<div class="full" style="grid-column:1/-1"><button class="btn ghost" data-action="show-keygroups" type="button">从 2xapi 账号导入 Key</button></div>` : ""}
-      ${isOfficial ? "" : `<div class="${fcls("wireApi")}"><label>协议</label><select data-f="wireApi"><option value="responses" ${d.wireApi === "responses" ? "selected" : ""}>Responses</option><option value="chat_completions" ${d.wireApi === "chat_completions" ? "selected" : ""}>ChatCompletions</option></select></div>`}
-      <div class="${fcls("model")}"><label>默认模型 *</label><input data-f="model" value="${esc(d.model || "")}">${ferr("model")}</div>
-    </div>
-    ${m === "pure_api" ? `<div class="notice">PureApi 将覆盖 auth.json 的 OPENAI_API_KEY；官方登录会自动备份（auth.json.official.bak），可一键「切官方」恢复。</div>` : ""}
-    ${isOfficial ? "" : `<hr class="sep"><div class="muted" style="font-size:12px;margin-bottom:6px">模型列表</div>
-      <table class="models-table"><thead><tr><th>模型名</th><th>显示名</th><th>上下文</th><th>多模态</th><th>透传</th><th></th></tr></thead><tbody>${modelRows}</tbody></table>
-      <div class="btn-row"><button class="btn ghost" data-action="add-model" type="button">+ 模型行</button><button class="btn ghost" data-action="fetch-models" type="button">拉取模型</button></div>`}
-    <details style="margin-top:10px"><summary class="muted" style="font-size:12px;cursor:pointer">高级（代理/超时/UA/官网/备注/图标）</summary>
-      <div class="form-grid" style="margin-top:10px">
-        <div class="field"><label>HTTP 代理</label><input data-f="proxyUrl" value="${esc(d.proxyUrl || "")}"></div>
-        <div class="field"><label>超时(秒, 5~3600)</label><input data-f="timeoutSecs" type="number" value="${esc(d.timeoutSecs || "")}"></div>
-        <div class="field"><label>User-Agent</label><input data-f="userAgent" value="${esc(d.userAgent || "")}"></div>
-        <div class="field"><label>官网</label><input data-f="websiteUrl" value="${esc(d.websiteUrl || "")}"></div>
-        <div class="field full"><label>备注</label><input data-f="notes" value="${esc(d.notes || "")}"></div>
-        <div class="field"><label>图标(emoji)</label><input data-f="icon" value="${esc(d.icon || "")}"></div>
-      </div>
-    </details>
-    <div class="btn-row">
-      <button class="btn primary" data-action="save" type="button">保存</button>
-      <button class="btn" data-action="preview-current" type="button">预览 config</button>
-      <button class="btn ghost" data-action="cancel" type="button">取消</button>
-    </div>
-  </div>` + (state.preview ? previewPanel(state.preview) : "");
+function normModel(m) {
+  return {
+    name: m.name || m.id || m.model || "",
+    contextWindow: m.contextWindow || m.context_window || null,
+  };
 }
 
-function previewPanel(pv) {
-  const authLine = pv.auth_action === "set_key"
-    ? `<div>auth.json：<strong>将设置 OPENAI_API_KEY</strong>　备份：<strong>${pv.backup_will_create ? "将创建 .official.bak" : "已存在备份，不覆盖"}</strong></div>`
-    : `<div class="muted">auth.json：不变</div>`;
-  return `<div class="panel-card"><h2>Config 预览（与实际写入一致）</h2><pre class="toml">${esc(pv.config_toml)}</pre>${authLine}</div>`;
-}
-
-function diagnosePanel() {
-  const dg = state.diag;
-  if (dg.loading) return `<div class="panel-card"><h2>Provider Doctor</h2><div class="muted">三步执行中…</div></div>`;
-  const r = dg.result || {};
-  const step = (label, ok, meta) => `<div class="step ${ok ? "ok" : "fail"}"><span class="icon">${ok ? "✓" : "✗"}</span><span class="label">${label}</span><span class="meta">${esc(meta || "")}</span></div>`;
-  return `<div class="panel-card"><h2>Provider Doctor</h2>
-    <div class="steps">
-      ${step("Step1 配置校验", r.configValid, r.configValid ? "通过" : "未通过")}
-      ${step("Step2 连接测试", r.reachable, r.reachable ? `延迟 ${r.latencyMs == null ? "—" : r.latencyMs + "ms"} · 模型 ${(r.models && r.models.length) || 0} 个` : "不可达")}
-      ${step("Step3 真实请求", r.testOk, r.testOk ? "通过" : "未通过")}
-    </div>
-    ${r.errors && r.errors.length ? `<div class="notice">${r.errors.map((e) => esc("[" + e.step + "] " + e.message)).join("；")}</div>` : ""}
-    <div class="btn-row"><button class="btn" data-action="diagnose" data-id="${esc(dg.id)}" type="button">重新诊断</button></div>
-  </div>`;
-}
-
-function launcherPane() {
-  const L = state.launcher;
-  const manual = L.useProvider === "__manual__";
-  const sel = (v) => (L.useProvider === v ? "selected" : "");
-  const providerOpts =
-    `<option value="" ${sel("")}>— 从软件 Provider 带入（key 用软件已填的）—</option>` +
-    (L.providers || []).map((p) => `<option value="${esc(p.id)}" ${sel(p.id)}>${esc(p.name)}</option>`).join("") +
-    `<option value="__manual__" ${sel("__manual__")}>手动填写（客户填自己的 key，单独计费）</option>`;
-  const modelField = manual
-    ? `<div class="field"><label>模型</label><input data-field="model" value="${esc(L.model)}" placeholder="gpt-5.6-sol"></div>`
-    : `<div class="field"><label>模型（留空用 Provider 默认）</label><input data-field="model" value="${esc(L.model)}" placeholder="gpt-5.6-sol"></div>`;
-  const manualFields = manual ? `
-      <div class="field"><label>base_url</label><input data-field="baseUrl" value="${esc(L.baseUrl)}" placeholder="https://2xapi.cc.cd/v1"></div>
-      <div class="field"><label>API Key</label><input type="password" data-field="apiKey" value="${esc(L.apiKey)}" placeholder="sk-..."></div>
-      ${modelField}` : modelField;
-  return `<div class="panel-card"><h2>🚀 Codex 启动器（直连版）</h2>
-    <div class="form-grid">
-      <div class="field full"><label>Key 来源</label>
-        <select data-action="launcher-provider">${providerOpts}</select>
-        <div class="hint">直连中转站端点、不开本地端口；独立 CODEX_HOME，不碰 ~/.codex；关闭 Codex 进程自动清理</div>
-      </div>
-      ${manualFields}
-      <div class="field full"><label>项目目录</label><input data-field="projectDir" value="${esc(L.projectDir)}" placeholder="/Users/xxx/项目（必填）"></div>
-    </div>
-    <div class="btn-row">
-      <button class="btn primary" data-action="launcher-start" type="button">▶ 使用（打开 Codex）</button>
-      <button class="btn ghost" data-action="launcher-refresh" type="button">↻ 状态</button>
-    </div>
-    ${launcherSessionsHtml()}
-  </div>`;
-}
-
-function launcherSessionsHtml() {
-  const ss = state.launcher.sessions || [];
-  if (!ss.length) return `<div class="muted" style="margin-top:12px">暂无运行中的启动会话</div>`;
-  return `<div style="margin-top:12px"><h3 style="font-size:13px;margin:0 0 8px">启动会话</h3>
-    ${ss.map((s) => `<div class="provider-item" style="cursor:default">
-      <span class="name">${esc(s.model || "—")}</span>
-      <span class="mode-tag ${s.alive ? "mixed" : ""}">${s.alive ? "运行中" : "已退出"}</span>
-      <span class="muted" style="font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.projectDir || "")}</span>
-      ${s.alive ? `<button class="btn danger" data-action="launcher-stop" data-id="${esc(s.sessionId)}" type="button">停止</button>` : ""}
-    </div>`).join("")}
-  </div>`;
-}
-
-function loadLauncherStatus() {
-  api.launcherStatus().then((r) => { state.launcher.sessions = (r && r.sessions) || []; render(); }).catch(() => {});
-}
-
-function doLauncherStart() {
-  const L = state.launcher;
-  const manual = L.useProvider === "__manual__";
-  const val = (f) => { const el = document.querySelector(`[data-field="${f}"]`); return el ? el.value.trim() : ""; };
-  const projectDir = val("projectDir");
-  if (!projectDir) { showToast("请填写项目目录", "error"); return; }
-  const body = { projectDir };
-  if (manual) {
-    const baseUrl = val("baseUrl"), apiKey = val("apiKey"), model = val("model");
-    if (!baseUrl || !apiKey || !model) { showToast("手动模式需填 base_url / key / 模型", "error"); return; }
-    body.baseUrl = baseUrl; body.apiKey = apiKey; body.model = model;
-  } else {
-    if (!L.useProvider) { showToast("请选择 Provider，或切到「手动填写」", "error"); return; }
-    body.providerId = L.useProvider;
-    const model = val("model");
-    if (model) body.model = model;
+/* ── 动作 ── */
+async function doHost(providerId) {
+  state.busy = "host"; render();
+  try {
+    var r = await api.desktopHost(providerId, "gateway");
+    await refreshAll();
+    state.selId = providerId;
+    showToast(r.switched ? "已切换供应商(即时生效)" : "桌面版已托管走中转(已自动备份,可随时还原)", "ok");
+  } catch (e) {
+    if (e.code === "E_DIRECT_UNAVAILABLE") showToast("直连方式即将支持,当前请使用网关方式", "error");
+    else showToast(e.message, "error");
+    await refreshDesktop();
   }
-  api.launcherStart(body)
-    .then((r) => { showToast("已启动 Codex，请查看系统终端窗口", "success"); loadLauncherStatus(); })
-    .catch((e) => showToast(e.message, "error"));
+  state.busy = null; render();
+}
+async function doUnhost() {
+  if (!await askConfirm("还原桌面版配置?托管写入的中转设置将被移除,官方登录/手写配置不受影响。")) return;
+  state.busy = "unhost"; render();
+  try {
+    var r = await api.desktopUnhost();
+    await refreshAll();
+    showToast(r.restored ? "已还原(可从备份目录恢复)" : "当前未托管,无需还原", "ok");
+  } catch (e) { showToast(e.message, "error"); await refreshDesktop(); }
+  state.busy = null; render();
 }
 
-function doLauncherStop(id) {
-  api.launcherStop(id)
-    .then(() => { showToast("已停止并清理临时目录", "success"); loadLauncherStatus(); })
-    .catch((e) => showToast(e.message, "error"));
-}
-
-function toolsModal() {
-  if (!state.showTools) return "";
-  const tab = state.toolsTab;
-  const tabBtn = (id, label) => `<button class="btn ${tab===id?"primary":"ghost"}" data-action="tools-tab" data-tab="${id}" type="button" style="flex:1">${label}</button>`;
-  let body = "";
-  if (tab === "launcher") {
-    body = launcherPane();
-  } else if (tab === "backups") {
-    if (!state.backups) { body = `<div class="muted">加载中…</div>`; }
-    else {
-      const items = (state.backups.backups || []).map((b) => `<div class="provider-item" style="cursor:default">
-        <span class="name">${esc(b.title || b.id || b.path || "备份")}</span>
-        <span class="mode-tag">${esc(b.purpose || b.kind || "")}</span>
-        <button class="btn ghost" data-action="restore-config" data-path="${esc(b.path)}" type="button">恢复</button>
-      </div>`).join("");
-      body = `${items || `<div class="muted">暂无备份</div>`}
-        <div class="btn-row"><button class="btn primary" data-action="create-snapshot" type="button">创建快照</button></div>`;
-    }
-  } else if (tab === "history") {
-    if (!state.history) { body = `<div class="muted">加载中…</div>`; }
-    else {
-      const s = state.history.state || {};
-      body = `<div class="panel-card"><h2>历史会话诊断（只读）</h2>
-        <div class="form-grid">
-          <div class="field"><label>sessions</label><div>${s.total ?? "—"}</div></div>
-          <div class="field"><label>rollouts</label><div>${s.rolloutTotal ?? "—"}</div></div>
-        </div>
-        <div class="notice" style="margin-top:10px">⚠️ 会话修复（SQLite 索引/rollout 对账）后端尚未实现，本期为只读诊断。后续开发补齐。</div>
-      </div>`;
-    }
-  } else if (tab === "settings") {
-    body = `<div class="panel-card"><h2>本机设置</h2>
-      <div class="field full" style="margin:6px 0"><label>config.toml</label><div>${esc("/Users/" + "wenkezhi/.codex/config.toml")}</div></div>
-      <div class="field full" style="margin:6px 0"><label>当前 Provider</label><div>${esc(state.activeId ? "custom（第三方）" : "openai（官方）")}</div></div>
-      <div class="field full" style="margin:6px 0"><label>网关</label><div>127.0.0.1:8787（关窗不退出，托盘常驻）</div></div>
-      <div class="field full" style="margin:6px 0"><label>写入策略</label><div>字段级合并（保留用户其他配置）；写入前自动备份</div></div>
-    </div>`;
-  }
-  return `<div style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60" data-action="hide-tools">
-    <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;width:560px;max-width:90vw;max-height:80vh;overflow:auto" onclick="event.stopPropagation()">
-      <h2 style="margin:0 0 10px">工具箱</h2>
-      <div style="display:flex;gap:6px;margin-bottom:14px">${tabBtn("launcher","🚀 启动器")} ${tabBtn("backups","备份恢复")} ${tabBtn("history","历史会话")} ${tabBtn("settings","本机设置")}</div>
-      ${body}
-      <div class="btn-row"><button class="btn ghost" data-action="hide-tools" type="button">关闭</button></div>
-    </div></div>`;
-}
-
-function toastEl() { return state.toast ? `<div class="toast ${state.toast.kind}">${esc(state.toast.msg)}</div>` : ""; }
-
-function confirmModal() {
-  if (!state.confirm) return "";
-  return `<div style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:70" data-action="confirm-no">
-    <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;width:340px;max-width:90vw">
-      <div style="margin-bottom:16px">${esc(state.confirm.message)}</div>
-      <div class="btn-row"><button class="btn danger" data-action="confirm-yes" type="button">删除</button><button class="btn ghost" data-action="confirm-no" type="button">取消</button></div>
-    </div></div>`;
-}
-function askConfirm(message) {
-  return new Promise((resolve) => { state.confirm = { message, resolve }; render(); });
-}
-
-function loginModal() {
-  if (!state.showLogin) return "";
-  const f = state.loginForm;
-  return `<div style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60" data-action="hide-login">
-    <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;width:360px;max-width:90vw">
-      <h2 style="margin:0 0 4px">登录 2xapi 账号</h2>
-      <div class="muted" style="font-size:12px;margin-bottom:10px">用于从 2xapi 获取 API Key（可选；直接填 Key 也可正常使用）</div>
-      <div class="field" style="margin:8px 0"><label>邮箱</label><input data-login="email" value="${esc(f.email)}"></div>
-      <div class="field" style="margin:8px 0"><label>密码</label><input data-login="password" type="password" value="${esc(f.password)}"></div>
-      ${state.loginError ? `<div class="notice">${esc(state.loginError)}</div>` : ""}
-      <div class="btn-row"><button class="btn primary" data-action="do-login" type="button">登录</button><button class="btn ghost" data-action="hide-login" type="button">取消</button></div>
-    </div>
-  </div>`;
-}
-
-function keyGroupsModal() {
-  if (!state.showKeyGroups) return "";
-  let body;
-  if (!state.keyGroups) {
-    body = `<div class="muted">加载中…</div>`;
-  } else {
-    const arr = Array.isArray(state.keyGroups) ? state.keyGroups : ((state.keyGroups && (state.keyGroups.groups || state.keyGroups.data)) || []);
-    body = arr.length ? arr.map((g, i) => `<div class="provider-item" data-action="pick-keygroup" data-i="${i}"><span class="name">${esc(g.name || g.title || g.group || ("分组 " + i))}</span></div>`).join("") : `<div class="muted">没有可用分组</div>`;
-  }
-  return `<div style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60" data-action="hide-keygroups">
-    <div style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;width:380px;max-width:90vw;max-height:80vh;overflow:auto">
-      <h2 style="margin:0 0 10px">从 2xapi 选择 Key 分组</h2>${body}
-      <div class="btn-row"><button class="btn ghost" data-action="hide-keygroups" type="button">关闭</button></div>
-    </div>
-  </div>`;
-}
-
-function collectLogin() {
-  document.querySelectorAll("[data-login]").forEach((inp) => { state.loginForm[inp.dataset.login] = inp.value; });
-}
-function doLogin() {
-  collectLogin();
-  api.login(state.loginForm.email, state.loginForm.password)
-    .then((r) => { state.auth = (r && r.user) || r || null; state.showLogin = false; state.loginError = ""; render(); showToast("已登录", "success"); })
-    .catch((e) => { state.loginError = e.message; render(); });
-}
-function pickKeygroup(i) {
-  const arr = Array.isArray(state.keyGroups) ? state.keyGroups : ((state.keyGroups && (state.keyGroups.groups || state.keyGroups.data)) || []);
-  const g = arr[i] || {};
-  collectDraft();
-  const key = g.key || g.api_key || g.apiKey || g.token || "";
-  const base = g.base_url || g.baseUrl || g.endpoint || "";
-  if (key) state.draft.apiKey = key;
-  if (base) state.draft.baseUrl = base;
-  if (g.name || g.title) state.draft.name = g.name || g.title;
-  state.showKeyGroups = false;
-  render(); showToast("已导入，请检查并保存", "success");
-}
-
-// ── 表单收集 ──
-function collectDraft() {
-  if (!state.draft || !document.querySelector("[data-f]")) return;
-  const d = state.draft;
-  document.querySelectorAll("[data-f]").forEach((inp) => {
-    const k = inp.dataset.f;
-    if (k === "timeoutSecs") d[k] = inp.value ? Number(inp.value) : null;
-    else d[k] = inp.value;
-  });
-  const models = [];
-  document.querySelectorAll("tbody tr").forEach((tr) => {
-    const pick = (mk) => tr.querySelector('[data-mk="' + mk + '"]');
-    const name = pick("name");
-    if (!name) return;
-    const cw = pick("contextWindow");
-    models.push({
-      name: name.value || "",
-      displayName: pick("displayName").value || undefined,
-      contextWindow: cw && cw.value ? Number(cw.value) : undefined,
-      isMultimodal: pick("isMultimodal").checked,
-      sendAsIs: pick("sendAsIs").checked,
-    });
-  });
-  d.models = models; // 不在此过滤空行（否则新增的空模型行会在下次重渲染被吞掉）；空行在保存时再过滤
-}
-
-// ── 动作 ──
 async function doSave() {
   collectDraft();
-  const d = state.draft;
-  const body = {
-    name: d.name, accessMode: d.accessMode, model: d.model,
-    baseUrl: d.baseUrl || "", apiKey: d.apiKey || "", wireApi: d.wireApi || "responses",
-    models: (d.models || []).filter((m) => m && m.name), proxyUrl: d.proxyUrl || "", timeoutSecs: d.timeoutSecs || null,
-    userAgent: d.userAgent || "", websiteUrl: d.websiteUrl || "", notes: d.notes || "", icon: d.icon || "",
+  var d = state.draft;
+  var errs = {};
+  if (!d.name) errs.name = "必填";
+  if (!d.baseUrl) errs.baseUrl = "必填";
+  if (state.isNew && !d.apiKey) errs.apiKey = "新建必填";
+  if (!d.model) errs.model = "必填(可先点「拉取模型」)";
+  state.fieldErrors = errs;
+  if (Object.keys(errs).length) { render(); showToast("还有必填项未完成", "error"); return; }
+  var body = {
+    name: d.name, accessMode: "pure_api", model: d.model,
+    baseUrl: d.baseUrl, apiKey: d.apiKey || "",
+    wireApi: d.wireSelUi === "auto" ? d.wireApi : d.wireSelUi,  // 「自动」= 保持现值
+    models: (d.models || []).filter(function (m) { return m && m.name; }),
+    proxyUrl: d.proxyUrl || "", timeoutSecs: d.timeoutSecs ? Number(d.timeoutSecs) : null,
+    notes: d.notes || "",
   };
+  state.busy = "save"; render();
   try {
-    const saved = state.isNew ? await api.createProvider(body) : await api.updateProvider(d.id, body);
-    state.fieldErrors = {}; state.preview = null;
+    var saved = state.isNew ? await api.createProvider(body) : await api.updateProvider(d.id, body);
+    state.fieldErrors = {};
     await refreshProviders();
-    state.selectedId = saved.id; state.mode = "view"; state.isNew = false;
-    showToast("已保存", "success");
+    state.selId = saved.id; state.mode = "view"; state.isNew = false; state.draft = null;
+    showToast("供应商已保存(仅存于本软件,未写任何配置)", "ok");
   } catch (e) {
     state.fieldErrors = {};
-    if (e.fields && e.fields.length) e.fields.forEach((f) => (state.fieldErrors[f] = "校验未通过（见顶部提示）"));
+    if (e.fields && e.fields.length) e.fields.forEach(function (f) { state.fieldErrors[f] = "校验未通过"; });
     showToast(e.message, "error");
-    render();
+  }
+  state.busy = null; render();
+}
+
+async function doFetchModels() {
+  collectDraft();
+  var d = state.draft;
+  var fmBody = (!state.isNew && d.id) ? { id: d.id } : { baseUrl: d.baseUrl, apiKey: d.apiKey };
+  if (!state.isNew && d.apiKey) fmBody = { id: d.id, apiKey: d.apiKey }; // 编辑时改了 key → 用显式 key 探测
+  if (fmBody.baseUrl !== undefined && (!fmBody.baseUrl || !fmBody.apiKey)) {
+    showToast("新建供应商请先填上游地址和 api key", "error"); return;
+  }
+  state.busy = "mfetch"; render();
+  try {
+    var r = await api.fetchModels(fmBody);
+    d.models = (r.models || []).map(normModel);
+    if (!d.model && d.models.length) d.model = d.models[0].name; // 自动默认第一个,降低小白负担
+    state.busy = null; render();
+    showToast("拉取到 " + d.models.length + " 个模型" + (d.models.length ? ",默认模型已填入" : ""), "ok");
+  } catch (e) {
+    state.busy = null; render();
+    showToast("拉取模型失败:" + e.message, "error");
   }
 }
 
-async function onClick(ev) {
-  const t = ev.target.closest("[data-action]");
+async function doDiag() {
+  var p = lineOf(state.selId);
+  if (!p) return;
+  if (state.diag && state.diag.forId === p.id) { state.diag = null; render(); return; }
+  state.diag = { forId: p.id, data: null }; render();
+  try {
+    var d = await api.diagnose(p.id);
+    state.diag = { forId: p.id, data: d };
+  } catch (e) { state.diag = null; showToast(e.message, "error"); }
+  render();
+}
+
+async function doDelete() {
+  var p = lineOf(state.selId);
+  if (!p) return;
+  if (!await askConfirm('删除供应商「' + p.name + '」?此操作只删本软件记录,不动任何配置文件。')) return;
+  try {
+    await api.deleteProvider(p.id);
+    if (hostedBy(p.id)) await refreshDesktop(); // active 被清,托管态可能变化
+    await refreshProviders();
+    showToast("已删除", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+  render();
+}
+
+async function doLogin() {
+  var email = (document.querySelector('[data-l="email"]') || {}).value || "";
+  var password = (document.querySelector('[data-l="password"]') || {}).value || "";
+  if (!email || !password) { state.loginError = "邮箱和密码都要填"; render(); return; }
+  try {
+    await api.login(email, password);
+    state.modal = null; state.loginError = "";
+    await refreshSession();
+    showToast("登录成功", "ok");
+  } catch (e) {
+    state.loginError = e.message; render();
+  }
+}
+
+/* ── 事件(委托,无内联处理器) ── */
+document.addEventListener("click", function (ev) {
+  var t = ev.target.closest("[data-a]");
   if (!t) return;
-  const a = t.dataset.action;
-  const id = t.dataset.id;
-  // 遮罩类动作（点遮罩关闭）：仅当点击元素就是遮罩本身时触发；
-  // 点击弹窗内容区不得关闭（原为内联 stopPropagation，被 CSP 阻止后失效）。
-  if (["confirm-no", "hide-login", "hide-keygroups"].includes(a) && ev.target !== t) return;
+  var a = t.dataset.a;
+  if (a === "cno" && ev.target !== t) return;   // 点弹窗内容不关
+  if (a === "mclose" && ev.target !== t) return;
   ev.preventDefault();
-
   switch (a) {
-    case "refresh": refreshAll().then(render); break;
-    case "activate-official":
-      api.activateOfficial().then((r) => refreshAll().then(() => { render(); showToast("已切官方" + (r.auth_restored ? " · 恢复了 auth.json" : ""), "success"); })).catch((e) => showToast(e.message, "error"));
-      break;
-    case "select":
-      if (state.mode === "edit" && !await askConfirm("放弃未保存的修改？")) break; state.selectedId = id; state.mode = "view"; state.diag = null; state.preview = null; render(); break;
+    case "sel": collectDraft(); state.selId = t.dataset.id; state.mode = "view"; state.diag = null; render(); break;
     case "new":
-      if (state.mode === "edit" && !await askConfirm("放弃未保存的修改？")) break; state.draft = { accessMode: "pure_api", wireApi: "responses", models: [] }; state.isNew = true; state.mode = "edit"; state.fieldErrors = {}; state.preview = null; render(); break;
+      state.draft = { name: "", baseUrl: "", apiKey: "", model: "", models: [], wireApi: "responses", wireSelUi: "responses", proxyUrl: "", timeoutSecs: "", notes: "" };
+      state.isNew = true; state.mode = "edit"; state.fieldErrors = {}; state.diag = null; render(); break;
     case "edit": {
-      const p = state.providers.find((x) => x.id === id); if (!p) break;
-      state.draft = draftFromProvider(p); state.isNew = false; state.mode = "edit"; state.fieldErrors = {}; state.preview = null; render(); break;
+      var p = lineOf(state.selId); if (!p) break;
+      state.draft = draftFromProvider(p); state.isNew = false; state.mode = "edit"; state.fieldErrors = {}; state.diag = null; render(); break;
     }
-    case "set-mode": collectDraft(); state.draft.accessMode = t.dataset.mode; render(); break;
-    case "add-model": collectDraft(); state.draft.models.push({ name: "", isMultimodal: false, sendAsIs: false }); render(); break;
-    case "del-model": collectDraft(); state.draft.models.splice(Number(t.dataset.i), 1); render(); break;
-    case "fetch-models": {
-      collectDraft();
-      const fmBody = state.draft.id ? { id: state.draft.id } : { baseUrl: state.draft.baseUrl, apiKey: state.draft.apiKey };
-      api.fetchModels(fmBody).then((r) => {
-        state.draft.models = (r.models || []).map(normModel);
-        render();
-        showToast("拉取到 " + (state.draft.models || []).length + " 个模型", "success");
-        if (state.draft.id) refreshProviders();
-      }).catch((e) => showToast(e.message, "error"));
-      break;
-    }
+    case "cancel": state.mode = "view"; state.draft = null; state.fieldErrors = {}; render(); break;
     case "save": doSave(); break;
-    case "show-login": state.showLogin = true; state.loginError = ""; render(); break;
-    case "hide-login": state.showLogin = false; render(); break;
+    case "mfetch": doFetchModels(); break;
+    case "mrow-add": collectDraft(); state.draft.models.push({ name: "", contextWindow: null }); render(); break;
+    case "mrow-del": collectDraft(); state.draft.models.splice(Number(t.dataset.i), 1); render(); break;
+    case "use-line": if (state.selId) doHost(state.selId); break;
+    case "host": { var pid = (hosting() && hosting().providerId) || state.selId; if (pid) doHost(pid); break; }
+    case "unhost": doUnhost(); break;
+    case "lsel": break; // change 事件处理
+    case "diag": doDiag(); break;
+    case "del": doDelete(); break;
+    case "snippet": state.modal = { kind: "snippet" }; render(); break;
+    case "copy-snippet": {
+      var txt = document.querySelector(".box pre.toml");
+      if (txt && navigator.clipboard) navigator.clipboard.writeText(txt.textContent).then(function () { showToast("片段已复制(进阶自担;日常请用一键托管)", "ok"); });
+      break;
+    }
+    case "login": state.loginError = ""; state.modal = { kind: "login" }; render(); break;
     case "do-login": doLogin(); break;
-    case "logout": api.logout().then(() => { state.auth = null; render(); showToast("已登出", "success"); }).catch((e) => showToast(e.message, "error")); break;
-    case "show-keygroups": state.showKeyGroups = true; state.keyGroups = null; render(); api.keyGroups().then((g) => { state.keyGroups = g; render(); }).catch((e) => { state.showKeyGroups = false; showToast(e.message, "error"); render(); }); break;
-    case "hide-keygroups": state.showKeyGroups = false; render(); break;
-    case "pick-keygroup": pickKeygroup(Number(t.dataset.i)); break;
-    case "confirm-yes": { const c = state.confirm; state.confirm = null; render(); if (c) c.resolve(true); break; }
-    case "confirm-no": { const c = state.confirm; state.confirm = null; render(); if (c) c.resolve(false); break; }
-    case "show-tools":
-      state.showTools = true; state.toolsTab = "launcher"; state.backups = null; state.history = null; render();
-      api.listProviders().then((d) => { state.launcher.providers = (d && d.providers) || (Array.isArray(d) ? d : []); render(); }).catch(() => {});
-      api.launcherStatus().then((r) => { state.launcher.sessions = (r && r.sessions) || []; render(); }).catch(() => {});
-      api.backups().then((b) => { state.backups = b; render(); }).catch((e) => showToast(e.message, "error"));
-      api.inspectHistory().then((h) => { state.history = h; render(); }).catch(() => {});
-      break;
-    case "hide-tools": state.showTools = false; render(); break;
-    case "tools-tab": state.toolsTab = t.dataset.tab; render(); break;
-    case "launcher-provider": state.launcher.useProvider = t.value; state.launcher.model = ""; render(); break;
-    case "launcher-start": doLauncherStart(); break;
-    case "launcher-stop": doLauncherStop(t.dataset.id); break;
-    case "launcher-refresh": loadLauncherStatus(); showToast("已刷新", "success"); break;
-    case "create-snapshot": api.snapshot().then(() => showToast("快照已创建", "success")).then(() => api.backups()).then((b) => { state.backups = b; render(); }).catch((e) => showToast(e.message, "error")); break;
-    case "restore-config":
-      askConfirm("恢复此备份的 config.toml？").then((yes) => { if (!yes) return; api.restoreConfig(t.dataset.path).then(() => showToast("已恢复", "success")).catch((e) => showToast(e.message, "error")); });
-      break;
-    case "cancel": state.mode = "view"; state.draft = null; state.fieldErrors = {}; state.preview = null; render(); break;
-    case "activate":
-      api.activate(id).then((r) => refreshAll().then(() => { render(); showToast("已激活：config " + (r.config_written ? "已写" : "未变") + " · auth " + (r.auth_changed ? "已改" : "未动") + (r.backup_created ? " · 已备份" : ""), "success"); })).catch((e) => showToast(e.message, "error"));
-      break;
-    case "delete":
-      ev.stopPropagation();
-      if (!await askConfirm("删除该供应商？")) break;
-      api.deleteProvider(id).then(() => { if (state.selectedId === id) { state.selectedId = null; state.mode = "view"; } return refreshAll(); }).then(render).then(() => showToast("已删除", "success")).catch((e) => showToast(e.message, "error"));
-      break;
-    case "preview":
-      api.previewConfig({ id }).then((pv) => { state.preview = pv; render(); }).catch((e) => showToast(e.message, "error"));
-      break;
-    case "preview-current":
-      collectDraft(); api.previewConfig(state.draft).then((pv) => { state.preview = pv; render(); }).catch((e) => showToast(e.message, "error"));
-      break;
-    case "diagnose":
-      state.diag = { id, loading: true }; render();
-      api.diagnose(id).then((r) => { state.diag = { id, loading: false, result: r }; render(); })
-        .catch((e) => { state.diag = { id, loading: false, result: { configValid: false, reachable: false, latencyMs: null, models: [], testOk: false, errors: [{ step: "request", code: "E", message: e.message }] } }; render(); showToast(e.message, "error"); });
-      break;
+    case "logout": api.logout().then(function () { state.session = null; render(); showToast("已登出", "ok"); }).catch(function (e) { showToast(e.message, "error"); }); break;
+    case "tool": state.modal = { kind: "tool", t: t.dataset.t }; render(); break;
+    case "mclose": state.modal = null; render(); break;
+    case "cyes": { var c = state.confirmBox; state.confirmBox = null; render(); if (c) c.resolve(true); break; }
+    case "cno": { var c2 = state.confirmBox; state.confirmBox = null; render(); if (c2) c2.resolve(false); break; }
+    case "test": showToast("测试连接即将上线(下一阶段)", "ok"); break;
   }
-}
+});
 
-// ── 启动 ──
-function init() {
-  document.addEventListener("click", onClick);
-  document.addEventListener("change", (ev) => {
-    const t = ev.target.closest("[data-action='launcher-provider']");
-    if (!t) return;
-    state.launcher.useProvider = t.value; state.launcher.model = ""; render();
-  });
-  refreshAll().then(render);
-}
-document.addEventListener("DOMContentLoaded", init);
+/* 下拉/change:输入收集 + 供应商切换(已托管 = 热切换) */
+document.addEventListener("change", function (ev) {
+  var sel = ev.target.closest("[data-a='lsel']");
+  if (sel) {
+    var id = sel.value;
+    if (hosting() && hosting().way === "gateway" && id !== hosting().providerId) {
+      state.selId = id; render(); doHost(id); // 已托管:切下拉 = 切中转(网关热切换)
+    } else {
+      collectDraft(); state.selId = id; render();
+    }
+    return;
+  }
+  if (ev.target.closest("[data-f], [data-mf], [data-l]")) collectDraft();
+});
+/* 输入中也收集(避免重绘时机丢半个字) */
+document.addEventListener("input", function (ev) {
+  if (ev.target.closest("[data-f], [data-mf], [data-l]")) collectDraft();
+});
+
+/* ── 启动 ── */
+refreshAll().then(render).catch(function (e) { console.error(e); render(); });
