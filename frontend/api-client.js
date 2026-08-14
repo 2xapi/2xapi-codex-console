@@ -70,6 +70,34 @@
     launcherStop: (sessionId) => request("POST", "/api/launcher/stop", { body: { sessionId } }),
     launcherStatus: () => request("GET", "/api/launcher/status"),
 
+    // ── 桌面版托管开关（阶段 1，任务书 §1.1）──
+    // host/unhost 的错误形态为 {"error": code, "message": msg}（非 04 信封），需单独剥出 code
+    desktopState: () => request("GET", "/api/desktop/state"),
+    desktopHost: async (providerId, way) => {
+      const resp = await fetch("/api/desktop/host", {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        body: JSON.stringify({ providerId, way }),
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (resp.ok && payload && payload.ok === true) return payload.data;
+      const err = new Error((payload && payload.message) || "托管失败 (" + resp.status + ")");
+      err.code = (payload && payload.error) || "E_UNKNOWN";
+      err.status = resp.status;
+      throw err;
+    },
+    desktopUnhost: async () => {
+      const resp = await fetch("/api/desktop/unhost", {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (resp.ok && payload && payload.ok === true) return payload.data;
+      const err = new Error((payload && payload.message) || "还原失败 (" + resp.status + ")");
+      err.code = (payload && payload.error) || "E_UNKNOWN";
+      err.status = resp.status;
+      throw err;
+    },
+    // 预留:阶段 2 preflight(POST /api/launcher/preflight),先占位不实现
+
     // ── 运维：备份/快照/恢复/历史诊断（旧路由，raw 响应）──
     backups: async () => rawJson("GET", "/api/backups"),
     snapshot: async () => rawJson("POST", "/api/config/snapshot", {}),
