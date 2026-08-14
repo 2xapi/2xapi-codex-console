@@ -115,6 +115,9 @@ pub fn state(config_path: &Path, providers_path: &Path, codex_home: &Path) -> Va
 // ── host ─────────────────────────────────────────────────────
 
 /// 合并出 gateway 托管态 config(零 Key:不写 experimental_bearer_token,任务书 §1.1(b) 契约)。
+/// model_catalog_json 恒插入:catalog 文件由 host 保证写入(无模型时生成最小目录),
+/// 真机教训——指向不存在的文件会让 codex(桌面版新建聊天/CLI)直接报
+/// "No such file or directory / failed to resolve feature override precedence"。
 fn build_hosted_config(current: &Value, provider: &Provider, catalog_path: &str, requires_openai_auth: bool) -> Value {
     let mut cfg = current.clone();
     let obj = cfg.as_object_mut().expect("config 不是 object");
@@ -122,10 +125,7 @@ fn build_hosted_config(current: &Value, provider: &Provider, catalog_path: &str,
     if !provider.model.is_empty() {
         obj.insert("model".into(), json!(provider.model));
     }
-    // catalog 仅在供应商有模型时指向(文件也仅在此时写),避免指向不存在文件
-    if !provider.models.is_empty() {
-        obj.insert("model_catalog_json".into(), json!(catalog_path));
-    }
+    obj.insert("model_catalog_json".into(), json!(catalog_path));
     let mut custom = serde_json::Map::new();
     custom.insert("name".into(), json!("custom"));
     custom.insert("base_url".into(), json!(GATEWAY_BASE_URL));
@@ -183,13 +183,53 @@ pub fn host(
         .find(|p| p.id == provider_id)
         .cloned()
         .ok_or_else(|| (404, "E_PROVIDER_NOT_FOUND".to_string(), "找不到该供应商".to_string()))?;
+    // catalog 最小目录以默认模型生成:无默认模型则无从生成(见 build_hosted_config 注释)
+    if provider.model.is_empty() {
+        return Err((422, "E_NO_MODEL".to_string(), "该供应商未配置默认模型,请先在编辑里拉取模型或手填".to_string()));
+    }
 
     let io = |e: String| -> OpError { (500, "E_IO".to_string(), e) };
 
-    // 已处于 gateway 托管(含换供应商):仅 set_active,不重写 config(任务书 §1.1(b):custom 段不变)
+    // 已处于 gateway 托管(含换供应商):custom 段不动(网关热切换),set_active;
+    // 真机故障补充(2026-08-15,交接日志):同步 model 字段与 catalog——不同步会让新供应商
+    // 收到旧模型名/读到旧 catalog,桌面版与 CLI 均实测故障。决策本意(custom 稳定+热切换)保留。
     let already = detect_hosting(config_path, providers_path);
     if already.get("way").and_then(|v| v.as_str()) == Some("gateway") {
         crate::providers::set_active(providers_path, &provider.id);
+        let mut config_written = false;
+
+        let current = read_toml(config_path);
+        let model_differs = current.get("model").and_then(|v| v.as_str()) != Some(provider.model.as_str());
+        let catalog_missing = !codex_home.join(MODEL_CATALOG_FILENAME).exists();
+        if (model_differs || catalog_missing) && !provider.model.is_empty() {
+            let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
+            let mut merged = current.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert("model".into(), json!(provider.model));
+            }
+            let new_toml = config_to_toml_string(&merged).map_err(io)?;
+            let current_toml = config_to_toml_string(&current).unwrap_or_default();
+            if new_toml != current_toml {
+                backup_file(config_path, backup_dir, "config-apply", "pre-switch").map_err(io)?;
+                write_toml(config_path, &merged).map_err(io)?;
+            }
+            let catalog_models: Vec<crate::providers::ModelConfig> = if provider.models.is_empty() {
+                vec![crate::providers::ModelConfig {
+                    name: provider.model.clone(),
+                    display_name: None,
+                    context_window: None,
+                    is_multimodal: false,
+                    send_as_is: false,
+                }]
+            } else {
+                provider.models.clone()
+            };
+            let catalog = build_model_catalog(&catalog_models, provider.reasoning_levels.as_deref().unwrap_or(&[]));
+            let raw = serde_json::to_string_pretty(&catalog).unwrap_or_default();
+            let _ = std::fs::write(&catalog_path, format!("{raw}\n"));
+            config_written = true;
+        }
+
         let mut auth_changed = false;
         if !has_official(codex_home) {
             auth_changed = ensure_auth_key(codex_home, &provider.api_key).map_err(io)?.0;
@@ -198,7 +238,7 @@ pub fn host(
             "hosted": true, "switched": true,
             "hasOfficial": has_official(codex_home),
             "hosting": detect_hosting(config_path, providers_path),
-            "changed": { "config": false, "auth": auth_changed },
+            "changed": { "config": config_written, "auth": auth_changed },
         }));
     }
 
@@ -217,11 +257,22 @@ pub fn host(
         false
     };
 
-    if !provider.models.is_empty() {
-        let catalog = build_model_catalog(&provider.models, provider.reasoning_levels.as_deref().unwrap_or(&[]));
-        let raw = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string()).map_err(io)?;
-        std::fs::write(&catalog_path, format!("{raw}\n")).map_err(|e| e.to_string()).map_err(io)?;
-    }
+    // catalog 恒写:有模型用全量;无模型用默认模型生成最小目录(保证 config 指向的文件存在,
+    // 且模型名对桌面版/CLI 可解析——真机教训,缺文件 = fatal error)
+    let catalog_models: Vec<crate::providers::ModelConfig> = if provider.models.is_empty() {
+        vec![crate::providers::ModelConfig {
+            name: provider.model.clone(),
+            display_name: None,
+            context_window: None,
+            is_multimodal: false,
+            send_as_is: false,
+        }]
+    } else {
+        provider.models.clone()
+    };
+    let catalog = build_model_catalog(&catalog_models, provider.reasoning_levels.as_deref().unwrap_or(&[]));
+    let raw = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string()).map_err(io)?;
+    std::fs::write(&catalog_path, format!("{raw}\n")).map_err(|e| e.to_string()).map_err(io)?;
 
     // 无官方账号:auth.json 写供应商 key(先备份)
     let (auth_changed, backup_created) = if has_off {
@@ -488,15 +539,66 @@ mod tests {
     }
 
     #[test]
-    fn host_switch_provider_keeps_custom_section() {
+    fn host_switch_provider_keeps_custom_and_syncs_model() {
         let (root, cfg, bk, home, prov) = sandbox("host-switch");
-        write_providers(&prov, vec![provider("p1", "A"), provider("p2", "B")]);
+        let mut p1 = provider("p1", "A");
+        p1.model = "model-a".into();
+        let mut p2 = provider("p2", "B");
+        p2.model = "model-b".into();
+        write_providers(&prov, vec![p1, p2]);
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
         let before = std::fs::read_to_string(&cfg).unwrap();
+        let custom_before: String = before.split("[model_providers.custom]").nth(1).unwrap().to_string();
         let r = host(&cfg, &bk, &home, &prov, "p2", "gateway").unwrap();
         assert!(r["switched"].as_bool().unwrap());
-        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before, "换供应商仅 set_active,config 不变(任务书契约)");
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        let custom_after: String = after.split("[model_providers.custom]").nth(1).unwrap().lines().take(5).collect::<String>();
+        assert!(
+            after.contains("[model_providers.custom]") && after.contains("base_url = \"http://127.0.0.1:8787\""),
+            "custom 段应保留(网关指向不变):\n{after}"
+        );
+        assert!(after.contains("model = \"model-b\""), "换供应商应同步 model(真机故障:旧模型名发给新上游):\n{after}");
+        assert_eq!(
+            custom_before.lines().take(5).collect::<String>(),
+            custom_after,
+            "custom 段内容不应变化"
+        );
         assert_eq!(crate::providers::load(&prov).active_provider_id, Some("p2".into()));
+        // catalog 同步为新供应商
+        let catalog = std::fs::read_to_string(home.join(MODEL_CATALOG_FILENAME)).unwrap();
+        assert!(catalog.contains("model-b"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 真机故障回归(2026-08-15):供应商无 models 时 host 也必须写 catalog 文件——
+    /// config 指向不存在的文件,codex(桌面版新建聊天/CLI)直接报
+    /// "No such file or directory / failed to resolve feature override precedence"。
+    #[test]
+    fn host_without_models_still_writes_minimal_catalog() {
+        let (root, cfg, bk, home, prov) = sandbox("host-mincat");
+        let p = provider("p1", "NoModels"); // models 为空
+        write_providers(&prov, vec![p]);
+        host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+
+        let catalog_path = home.join(MODEL_CATALOG_FILENAME);
+        assert!(catalog_path.exists(), "无 models 也必须生成最小 catalog(config 恒指向它)");
+        let catalog: Value = serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        let slugs: Vec<&str> = catalog["models"].as_array().unwrap()
+            .iter().map(|m| m["slug"].as_str().unwrap()).collect();
+        assert_eq!(slugs, vec!["gpt-demo"], "最小目录应含默认模型(模型名对客户端可解析):\n{slugs:?}");
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(written.contains("model_catalog_json"), "config 应指向 catalog:\n{written}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_rejects_provider_without_model() {
+        let (root, cfg, bk, home, prov) = sandbox("host-nomodel");
+        let mut p = provider("p1", "NoDefault");
+        p.model = String::new();
+        write_providers(&prov, vec![p]);
+        let err = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap_err();
+        assert_eq!(err.1, "E_NO_MODEL");
         let _ = std::fs::remove_dir_all(&root);
     }
 

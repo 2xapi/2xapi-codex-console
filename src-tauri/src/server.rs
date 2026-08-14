@@ -736,7 +736,9 @@ mod tests {
         )
         .await;
         assert_eq!(v["data"]["switched"], true);
-        assert_eq!(std::fs::read_to_string(&state.config_path).unwrap(), cfg_after_host, "换供应商不应重写 config");
+        let cfg_after_switch = std::fs::read_to_string(&state.config_path).unwrap();
+        assert!(cfg_after_switch.contains("base_url = \"http://127.0.0.1:8787\""), "custom 段(网关指向)不变");
+        assert!(cfg_after_switch.contains("model = \"m-b\""), "model 同步为新供应商(真机故障修复)");
 
         // direct 未开放：400 + E_DIRECT_UNAVAILABLE
         let app = build_router(state.clone());

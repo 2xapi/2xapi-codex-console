@@ -36,6 +36,12 @@ pub fn responses_to_chat_request(body: &[u8]) -> Result<ConvertedRequest, String
         Some(Value::Array(arr)) => {
             for item in arr {
                 if let Some(role) = item.get("role").and_then(|x| x.as_str()) {
+                    // 真机(DeepSeek)实测:codex 以 developer role 传系统指令,多数 chat 上游
+                    // 只认 system/user/assistant/tool —— developer 一律映射为 system
+                    let role = match role {
+                        "developer" => "system",
+                        r => r,
+                    };
                     let content = extract_text(item.get("content"));
                     messages.push(json!({ "role": role, "content": content }));
                 } else if let Some(s) = item.as_str() {
@@ -296,6 +302,21 @@ mod tests {
         assert_eq!(v["temperature"], 0.5);
         // 未知 Responses 字段（max_output_tokens 之外）不应泄漏为 chat 字段
         assert!(v.get("input").is_none());
+    }
+
+    /// 真机(DeepSeek)实测回归:codex 的 developer role 消息须映射为 system,
+    /// 否则上游报 unknown variant `developer`。
+    #[test]
+    fn maps_developer_role_to_system() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let conv = responses_to_chat_request(body).unwrap();
+        let v: Value = serde_json::from_slice(&conv.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system", "developer 应映射为 system:\n{msgs:?}");
+        assert_eq!(msgs[0]["content"], "You are Codex");
+        assert_eq!(msgs[1]["role"], "user");
     }
 
     #[test]
