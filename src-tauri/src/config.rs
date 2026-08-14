@@ -20,8 +20,8 @@ use crate::providers::{AccessMode, ModelConfig, Provider, ProviderData};
 
 /// 网关地址：config 里 `custom.base_url` 指向它（02 §5.2）。
 pub const GATEWAY_BASE_URL: &str = "http://127.0.0.1:8787";
-const MODEL_CATALOG_FILENAME: &str = "2xapi-model-catalog.json";
-const AUTH_OFFICIAL_BAK: &str = "auth.json.official.bak";
+pub(crate) const MODEL_CATALOG_FILENAME: &str = "2xapi-model-catalog.json";
+pub(crate) const AUTH_OFFICIAL_BAK: &str = "auth.json.official.bak";
 
 // ── TOML 读写（JSON Value ↔ TOML，原子写）────────────────────
 
@@ -46,7 +46,7 @@ pub fn write_toml(path: &Path, cfg: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn config_to_toml_string(cfg: &Value) -> Result<String, String> {
+pub(crate) fn config_to_toml_string(cfg: &Value) -> Result<String, String> {
     let t = json_to_toml(cfg);
     toml::to_string_pretty(&t).map_err(|e| format!("TOML 编码失败: {e}"))
 }
@@ -94,14 +94,14 @@ fn json_to_toml(v: &Value) -> toml::Value {
 
 // ── auth.json 读写 ───────────────────────────────────────────
 
-fn read_auth_json(path: &Path) -> Value {
+pub(crate) fn read_auth_json(path: &Path) -> Value {
     match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw).unwrap_or(json!({})),
         Err(_) => json!({}),
     }
 }
 
-fn write_auth_json(path: &Path, v: &Value) -> Result<(), String> {
+pub(crate) fn write_auth_json(path: &Path, v: &Value) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &raw).map_err(|e| e.to_string())?;
@@ -387,7 +387,7 @@ pub fn activate_official(
 
 // ── model catalog（富格式；CCR-001 待 02 §5.5 同步）─────────
 
-fn build_model_catalog(models: &[ModelConfig], reasoning_levels: &[String]) -> Value {
+pub(crate) fn build_model_catalog(models: &[ModelConfig], reasoning_levels: &[String]) -> Value {
     // 若上游探测到 levels 用它；否则用默认 5 级
     let levels: Vec<String> = if reasoning_levels.is_empty() {
         vec!["low","medium","high","xhigh","max"].iter().map(|s|s.to_string()).collect()

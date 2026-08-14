@@ -64,6 +64,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/launcher/start", post(handle_launcher_start))
         .route("/api/launcher/stop", post(handle_launcher_stop))
         .route("/api/launcher/status", get(handle_launcher_status))
+        // --- 桌面版托管开关(阶段 1,任务书 §1.1)---
+        .route("/api/desktop/state", get(handle_desktop_state))
+        .route("/api/desktop/host", post(handle_desktop_host))
+        .route("/api/desktop/unhost", post(handle_desktop_unhost))
         // --- Backups & history ---
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
@@ -535,6 +539,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("2xapi-m4-{label}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("backups")).unwrap();
         let state = AppState {
             config_path: root.join("config.toml"),
             backup_dir: root.join("backups"),
@@ -655,6 +660,153 @@ mod tests {
         assert_eq!(h["active_provider_id"], id);
         assert_eq!(h["access_mode"], "mixed");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 阶段 1 E2E（任务书 §1.3）：state → host → state → 换供应商 → direct 拒绝 → unhost → state 全链。
+    #[tokio::test]
+    async fn e2e_desktop_host_unhost_full_chain() {
+        let (state, root) = unique_state("desk-e2e");
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+        // 无官方登录：auth 只有别家 key（还原后应回到它）
+        std::fs::write(state.codex_home.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-old"}"#).unwrap();
+
+        // 建两个供应商
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder().method("POST").uri("/api/providers").header("content-type", "application/json")
+                    .body(Body::from(json!({"name":"A","baseUrl":"https://a.test","apiKey":"sk-1","model":"m-a","accessMode":"mixed"}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap();
+        let id1 = body_json(resp).await["data"]["id"].as_str().unwrap().to_string();
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder().method("POST").uri("/api/providers").header("content-type", "application/json")
+                    .body(Body::from(json!({"name":"B","baseUrl":"https://b.test","apiKey":"sk-2","model":"m-b","accessMode":"mixed"}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap();
+        let id2 = body_json(resp).await["data"]["id"].as_str().unwrap().to_string();
+
+        // 初始 state：未托管、无官方登录
+        let app = build_router(state.clone());
+        let v = body_json(app.oneshot(Request::builder().method("GET").uri("/api/desktop/state").body(Body::empty()).unwrap()).await.unwrap()).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["data"]["hasOfficial"], false);
+        assert!(v["data"]["hosting"].is_null());
+
+        // host gateway
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/host").header("content-type", "application/json")
+                    .body(Body::from(json!({"providerId": id1, "way": "gateway"}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["data"]["hosted"], true);
+
+        let cfg_after_host = std::fs::read_to_string(&state.config_path).unwrap();
+        assert!(cfg_after_host.contains("base_url = \"http://127.0.0.1:8787\""));
+        assert!(cfg_after_host.contains("requires_openai_auth = false"));
+        assert!(cfg_after_host.contains("experimental_bearer_token") == false);
+        let auth = std::fs::read_to_string(state.codex_home.join("auth.json")).unwrap();
+        assert!(auth.contains("sk-1"), "无账号应写供应商 key:\n{auth}");
+
+        // state 反映托管
+        let app = build_router(state.clone());
+        let v = body_json(app.oneshot(Request::builder().method("GET").uri("/api/desktop/state").body(Body::empty()).unwrap()).await.unwrap()).await;
+        assert_eq!(v["data"]["hosting"]["way"], "gateway");
+        assert_eq!(v["data"]["hosting"]["providerId"], id1.as_str());
+
+        // 换供应商：仅 set_active，config 不变
+        let app = build_router(state.clone());
+        let v = body_json(
+            app.oneshot(
+                Request::builder().method("POST").uri("/api/desktop/host").header("content-type", "application/json")
+                    .body(Body::from(json!({"providerId": id2, "way": "gateway"}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(v["data"]["switched"], true);
+        assert_eq!(std::fs::read_to_string(&state.config_path).unwrap(), cfg_after_host, "换供应商不应重写 config");
+
+        // direct 未开放：400 + E_DIRECT_UNAVAILABLE
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/host").header("content-type", "application/json")
+                    .body(Body::from(json!({"providerId": id2, "way": "direct"}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "E_DIRECT_UNAVAILABLE");
+
+        // unhost：回到干净态
+        let app = build_router(state.clone());
+        let v = body_json(
+            app.oneshot(Request::builder().method("POST").uri("/api/desktop/unhost").body(Body::empty()).unwrap()).await.unwrap(),
+        )
+        .await;
+        assert_eq!(v["data"]["restored"], true);
+
+        let cfg_after = std::fs::read_to_string(&state.config_path).unwrap();
+        assert!(!cfg_after.contains("[model_providers.custom]"));
+        assert_eq!(
+            std::fs::read_to_string(state.codex_home.join("auth.json")).unwrap(),
+            r#"{"OPENAI_API_KEY":"sk-old"}"#,
+            "auth 应恢复 host 前状态"
+        );
+
+        let app = build_router(state.clone());
+        let v = body_json(app.oneshot(Request::builder().method("GET").uri("/api/desktop/state").body(Body::empty()).unwrap()).await.unwrap()).await;
+        assert!(v["data"]["hosting"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ── 桌面版托管开关（阶段 1，任务书 §1.1）────────────────────
+
+// GET /api/desktop/state
+async fn handle_desktop_state(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(crate::desktop::state(&s.config_path, &s.providers_path, &s.codex_home))
+}
+
+// POST /api/desktop/host {providerId, way}
+async fn handle_desktop_host(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let provider_id = body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let way = body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if provider_id.is_empty() || way.is_empty() {
+        return err_env(StatusCode::BAD_REQUEST, "E_BAD_REQUEST", "缺少 providerId 或 way", None);
+    }
+    match crate::desktop::host(&s.config_path, &s.backup_dir, &s.codex_home, &s.providers_path, provider_id, way) {
+        Ok(v) => ok_env(v),
+        Err((status, code, msg)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "error": code, "message": msg })),
+        )
+            .into_response(),
+    }
+}
+
+// POST /api/desktop/unhost
+async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
+    match crate::desktop::unhost(&s.config_path, &s.backup_dir, &s.codex_home, &s.providers_path) {
+        Ok(v) => ok_env(v),
+        Err((status, code, msg)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "error": code, "message": msg })),
+        )
+            .into_response(),
     }
 }
 

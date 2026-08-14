@@ -4,6 +4,7 @@ mod server;
 #[path = "launcher/mod.rs"]
 mod launcher;
 mod config;
+mod desktop;
 mod providers;
 mod probe;
 mod auth;
