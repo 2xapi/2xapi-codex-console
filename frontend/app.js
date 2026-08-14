@@ -244,6 +244,11 @@ function detailCard() {
 }
 
 function diagCard(d) {
+  if (!d) {
+    // 诊断进行中(diagnose 含真实网络请求,可达数秒):占位而非空卡
+    return '<section class="card"><div class="eyebrow" style="margin:0 0 10px">诊断 / doctor</div><div class="steps" style="margin-top:0">'
+      + '<div class="step">⟳ 诊断进行中…<span class="meta">连接测试 + 真实请求</span></div></div></section>';
+  }
   var ok = function (b) { return b ? "✓" : "✗"; };
   var cls = function (b) { return b ? "" : " bad"; };
   var errs = (d.errors || []).map(function (e) { return esc(e.message || e.msg || String(e)); }).join(";");
