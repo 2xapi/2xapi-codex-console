@@ -1,0 +1,807 @@
+//! 供应商数据层（M1，契约 02 冻结）。
+//!
+//! - `Provider` 结构逐字段对齐 02 §1（23 字段）。
+//! - `AccessMode`/`WireApi` 序列化按 02 §4（snake_case）；**反序列化兼容历史 camelCase 值**，避免旧 providers.json 被清空。
+//! - `providers.json` 存储按 02 §3（`schema_version` + `active_provider_id` + `providers[]`），原子写（临时文件→rename）。
+//! - 字段校验按 02 §2（返回 `Vec<ValidationError>` 字段级错误，供 M4 映射为 422 `E_VALIDATION`）。
+//! - CRUD 按 FR-1.1~1.6。
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::Path;
+
+const SCHEMA_VERSION: i64 = 1;
+
+// ── 枚举（02 §4）────────────────────────────────────────────
+
+/// 接入模式：序列化 `"official"`/`"mixed"`/`"pure_api"`；反序列化兼容历史 `"pureApi"` 等。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessMode {
+    Official,
+    Mixed,
+    PureApi,
+}
+
+impl Default for AccessMode {
+    fn default() -> Self {
+        AccessMode::PureApi
+    }
+}
+
+impl AccessMode {
+    /// 宽松解析：接受 snake_case / camelCase / 全小写。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "official" => Some(Self::Official),
+            "mixed" => Some(Self::Mixed),
+            "pure_api" | "pureapi" => Some(Self::PureApi),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AccessMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        AccessMode::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("未知 access_mode: {s}")))
+    }
+}
+
+/// 上游协议：序列化 `"responses"`/`"chat_completions"`；反序列化兼容 `"chat"` 等。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireApi {
+    Responses,
+    ChatCompletions,
+}
+
+impl Default for WireApi {
+    fn default() -> Self {
+        WireApi::Responses
+    }
+}
+
+impl WireApi {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "responses" => Some(Self::Responses),
+            "chat_completions" | "chatcompletions" | "chat" => Some(Self::ChatCompletions),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WireApi {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        WireApi::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("未知 wire_api: {s}")))
+    }
+}
+
+// ── 数据结构（02 §1）─────────────────────────────────────────
+
+/// 单个模型条目（02 §1）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelConfig {
+    pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub is_multimodal: bool,
+    #[serde(default)]
+    pub send_as_is: bool,
+}
+
+/// Provider 完整结构（02 §1，23 字段，逐字段一致）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Provider {
+    // ── 基础 ──
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub icon_color: Option<String>,
+    #[serde(default)]
+    pub sort_index: i64,
+    #[serde(default)]
+    pub created_at: i64, // unix 秒（02 §1；旧代码用毫秒，已修正）
+    #[serde(default)]
+    pub website_url: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+
+    // ── 连接 ──
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub access_mode: AccessMode,
+    #[serde(default)]
+    pub wire_api: WireApi,
+
+    // ── 协议 ──
+    #[serde(default)]
+    pub user_agent: Option<String>,
+
+    // ── 模型 ──
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
+    #[serde(default)]
+    pub context_window: Option<String>,
+
+    // ── 网络 ──
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+
+    // ── Sub2API（本期 stub，01-D6）──
+    #[serde(default)]
+    pub sub2api_enabled: bool,
+    #[serde(default = "default_multiplier")]
+    pub sub2api_multiplier: f64,
+
+    // ── 高级 ──
+    #[serde(default)]
+    pub custom_headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub config_toml_snapshot: Option<String>,
+    #[serde(default)]
+    pub auth_json_snapshot: Option<String>,
+    #[serde(default)]
+    pub reasoning_levels: Option<Vec<String>>,
+}
+
+fn default_multiplier() -> f64 {
+    1.0
+}
+
+/// providers.json 顶层结构（02 §3）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderData {
+    #[serde(default)]
+    pub schema_version: i64,
+    #[serde(default)]
+    pub active_provider_id: Option<String>,
+    #[serde(default)]
+    pub providers: Vec<Provider>,
+}
+
+/// 字段级校验错误（02 §2）。M4 将映射为 422 `E_VALIDATION` + fields。
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    pub field: String,
+    pub message: String,
+}
+
+/// 创建/更新输入（不含 id/created_at/sort_index/snapshot，这些由系统生成或不可变）。
+/// FR-1.4「编辑=合并」以此结构承载新值。
+#[derive(Debug, Clone, Default)]
+pub struct ProviderInput {
+    pub name: String,
+    pub icon: Option<String>,
+    pub icon_color: Option<String>,
+    pub website_url: Option<String>,
+    pub notes: Option<String>,
+    pub base_url: String,
+    pub api_key: String,
+    pub access_mode: AccessMode,
+    pub wire_api: WireApi,
+    pub user_agent: Option<String>,
+    pub model: String,
+    pub models: Vec<ModelConfig>,
+    pub context_window: Option<String>,
+    pub proxy_url: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub sub2api_enabled: bool,
+    pub sub2api_multiplier: f64,
+    pub custom_headers: Option<HashMap<String, String>>,
+}
+
+// ── 存储读写（02 §3，原子写）─────────────────────────────────
+
+pub fn load(path: &Path) -> ProviderData {
+    let mut data: ProviderData = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => ProviderData::default(),
+    };
+    // 兼容旧文件 / 空 default：保证 schema_version 落地。
+    if data.schema_version == 0 {
+        data.schema_version = SCHEMA_VERSION;
+    }
+    data
+}
+
+fn save_atomic(path: &Path, data: &ProviderData) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(data).map_err(|e| format!("序列化失败: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &raw).map_err(|e| format!("写临时文件失败: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("重命名失败: {e}"))?;
+    Ok(())
+}
+
+/// 持久化 ProviderData（供 config.rs 的 activate 编排用）。
+pub fn store(path: &Path, data: &ProviderData) -> Result<(), String> {
+    save_atomic(path, data)
+}
+
+/// ProviderInput → Provider（id/created_at/sort_index 置空；供 preview 临时对象用）。
+pub fn input_to_provider(input: ProviderInput) -> Provider {
+    Provider {
+        id: String::new(),
+        name: input.name,
+        icon: input.icon,
+        icon_color: input.icon_color,
+        sort_index: 0,
+        created_at: 0,
+        website_url: input.website_url,
+        notes: input.notes,
+        base_url: input.base_url,
+        api_key: input.api_key,
+        access_mode: input.access_mode,
+        wire_api: input.wire_api,
+        user_agent: input.user_agent,
+        model: input.model,
+        models: input.models,
+        context_window: input.context_window,
+        proxy_url: input.proxy_url,
+        timeout_secs: input.timeout_secs,
+        sub2api_enabled: input.sub2api_enabled,
+        sub2api_multiplier: input.sub2api_multiplier,
+        custom_headers: input.custom_headers,
+        config_toml_snapshot: None,
+        auth_json_snapshot: None,
+        reasoning_levels: None,
+    }
+}
+
+// ── 校验（02 §2）─────────────────────────────────────────────
+
+pub fn validate(input: &ProviderInput) -> Result<(), Vec<ValidationError>> {
+    let mut errs = Vec::new();
+
+    let name_len = input.name.trim().chars().count();
+    if name_len == 0 || name_len > 40 {
+        errs.push(ValidationError { field: "name".into(), message: "名称需 1~40 字符".into() });
+    }
+
+    // 非 Official 模式：base_url / api_key 必填
+    if input.access_mode != AccessMode::Official {
+        let base = input.base_url.trim();
+        if base.is_empty() {
+            errs.push(ValidationError { field: "base_url".into(), message: "非 Official 模式必填 base_url".into() });
+        } else if !(base.starts_with("http://") || base.starts_with("https://")) {
+            errs.push(ValidationError { field: "base_url".into(), message: "base_url 须为 http(s):// 开头".into() });
+        } else if base.ends_with('/') {
+            errs.push(ValidationError { field: "base_url".into(), message: "base_url 末尾不带 /".into() });
+        }
+        if input.api_key.trim().is_empty() {
+            errs.push(ValidationError { field: "api_key".into(), message: "非 Official 模式必填 api_key".into() });
+        }
+    }
+
+    if input.model.trim().is_empty() {
+        errs.push(ValidationError { field: "model".into(), message: "model 不能为空".into() });
+    }
+
+    if let Some(t) = input.timeout_secs {
+        if !(5..=3600).contains(&t) {
+            errs.push(ValidationError { field: "timeout_secs".into(), message: "timeout_secs 须在 5~3600".into() });
+        }
+    }
+
+    if input.sub2api_multiplier <= 0.0 {
+        errs.push(ValidationError { field: "sub2api_multiplier".into(), message: "sub2api_multiplier 须 > 0".into() });
+    }
+
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
+pub fn format_errors(errs: &[ValidationError]) -> String {
+    errs.iter()
+        .map(|e| format!("{}: {}", e.field, e.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+// ── CRUD（FR-1.1~1.6）────────────────────────────────────────
+
+/// FR-1.1 新建：校验 → 生成 id/created_at/sort_index → 持久化。
+pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<ValidationError>> {
+    validate(&input)?;
+    let mut data = load(path);
+    let sort_index = data.providers.iter().map(|p| p.sort_index).max().unwrap_or(-1) + 1;
+    let provider = Provider {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: input.name,
+        icon: input.icon,
+        icon_color: input.icon_color,
+        sort_index,
+        created_at: chrono::Utc::now().timestamp(),
+        website_url: input.website_url,
+        notes: input.notes,
+        base_url: input.base_url,
+        api_key: input.api_key,
+        access_mode: input.access_mode,
+        wire_api: input.wire_api,
+        user_agent: input.user_agent,
+        model: input.model,
+        models: input.models,
+        context_window: input.context_window,
+        proxy_url: input.proxy_url,
+        timeout_secs: input.timeout_secs,
+        sub2api_enabled: input.sub2api_enabled,
+        sub2api_multiplier: input.sub2api_multiplier,
+        custom_headers: input.custom_headers,
+        config_toml_snapshot: None,
+        auth_json_snapshot: None,
+        reasoning_levels: None,
+    };
+    data.providers.push(provider.clone());
+    save_atomic(path, &data).map_err(io_errs)?;
+    Ok(provider)
+}
+
+/// FR-1.4 编辑：合并更新，**id/created_at/sort_index/snapshot 不变**。
+/// key 敏感：编辑时不回填（06 §7），传入空 api_key 则保留旧值。
+pub fn update(path: &Path, id: &str, input: ProviderInput) -> Result<Provider, Vec<ValidationError>> {
+    let mut data = load(path);
+    let existing_key = data
+        .providers
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.api_key.clone())
+        .ok_or_else(|| vec![ValidationError { field: "id".into(), message: "供应商不存在".into() }])?;
+
+    let mut eff = input;
+    if eff.api_key.trim().is_empty() {
+        eff.api_key = existing_key; // 保留旧 key
+    }
+    validate(&eff)?;
+
+    let p = data.providers.iter_mut().find(|p| p.id == id).expect("已校验存在");
+    p.name = eff.name;
+    p.icon = eff.icon;
+    p.icon_color = eff.icon_color;
+    p.website_url = eff.website_url;
+    p.notes = eff.notes;
+    p.base_url = eff.base_url;
+    p.api_key = eff.api_key;
+    p.access_mode = eff.access_mode;
+    p.wire_api = eff.wire_api;
+    p.user_agent = eff.user_agent;
+    p.model = eff.model;
+    p.models = eff.models;
+    p.context_window = eff.context_window;
+    p.proxy_url = eff.proxy_url;
+    p.timeout_secs = eff.timeout_secs;
+    p.sub2api_enabled = eff.sub2api_enabled;
+    p.sub2api_multiplier = eff.sub2api_multiplier;
+    p.custom_headers = eff.custom_headers;
+    let updated = p.clone();
+    save_atomic(path, &data).map_err(io_errs)?;
+    Ok(updated)
+}
+
+/// FR-1.5 删除：若删的是 active，active 置 None（不自动切换）。
+pub fn delete(path: &Path, id: &str) {
+    let mut data = load(path);
+    data.providers.retain(|p| p.id != id);
+    if data.active_provider_id.as_deref() == Some(id) {
+        data.active_provider_id = None;
+    }
+    let _ = save_atomic(path, &data);
+}
+
+/// FR-1.3 列表：按 sort_index 升序。
+#[allow(dead_code)] // 路由用 load；保留作数据层 API/测试
+pub fn list(path: &Path) -> Vec<Provider> {
+    let mut data = load(path);
+    data.providers.sort_by_key(|p| p.sort_index);
+    data.providers
+}
+
+/// FR-1.6 重排：按给定 id 顺序重写 sort_index。
+pub fn reorder(path: &Path, ids: &[String]) {
+    let mut data = load(path);
+    for (idx, id) in ids.iter().enumerate() {
+        if let Some(p) = data.providers.iter_mut().find(|p| &p.id == id) {
+            p.sort_index = idx as i64;
+        }
+    }
+    let _ = save_atomic(path, &data);
+}
+
+// ── active 管理（数据层；config 写入在 M2）──────────────────
+
+#[allow(dead_code)] // 测试/未来路由用
+pub fn set_active(path: &Path, id: &str) {
+    let mut data = load(path);
+    data.active_provider_id = Some(id.to_string());
+    let _ = save_atomic(path, &data);
+}
+
+#[allow(dead_code)] // activate-official（M2）会用到
+pub fn clear_active(path: &Path) {
+    let mut data = load(path);
+    data.active_provider_id = None;
+    let _ = save_atomic(path, &data);
+}
+
+pub fn get_active(path: &Path) -> Option<Provider> {
+    let data = load(path);
+    let id = data.active_provider_id.as_ref()?;
+    data.providers.into_iter().find(|p| &p.id == id)
+}
+
+// ── 边界映射 / 兼容（供 server.rs，camelCase ↔ snake_case；M4 会以正式路由替代）──
+
+/// 旧入口：接收前端 camelCase JSON，转成 ProviderInput 后 create-or-update。
+#[allow(dead_code)] // 兼容入口；04 契约路由已用 create/update，保留备用
+pub fn save(path: &Path, body: &Value) -> Result<Provider, Vec<ValidationError>> {
+    let input = value_to_input(body);
+    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if id.is_empty() {
+        create(path, input)
+    } else {
+        update(path, id, input)
+    }
+}
+
+/// 脱敏后的 Provider（前端用，camelCase，不回传明文 key）。
+pub fn public_provider(p: &Provider) -> Value {
+    json!({
+        "id": p.id, "name": p.name,
+        "icon": p.icon, "iconColor": p.icon_color,
+        "sortIndex": p.sort_index, "createdAt": p.created_at,
+        "websiteUrl": p.website_url, "notes": p.notes,
+        "baseUrl": p.base_url, "apiKeyMasked": mask_key(&p.api_key),
+        "accessMode": serde_json::to_value(p.access_mode).unwrap_or(json!("pure_api")),
+        "wireApi": serde_json::to_value(p.wire_api).unwrap_or(json!("responses")),
+        "userAgent": p.user_agent,
+        "model": p.model, "models": p.models, "contextWindow": p.context_window,
+        "proxyUrl": p.proxy_url, "timeoutSecs": p.timeout_secs,
+        "sub2apiEnabled": p.sub2api_enabled, "sub2apiMultiplier": p.sub2api_multiplier,
+        "customHeaders": p.custom_headers,
+    })
+}
+
+fn mask_key(key: &str) -> String {
+    if key.len() > 8 {
+        format!("{}...{}", &key[..5], &key[key.len() - 4..])
+    } else {
+        String::new()
+    }
+}
+
+fn io_errs(e: String) -> Vec<ValidationError> {
+    vec![ValidationError { field: "_io".into(), message: e }]
+}
+
+/// 前端 camelCase JSON → ProviderInput。
+pub fn value_to_input(body: &Value) -> ProviderInput {
+    ProviderInput {
+        name: body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        icon: opt_str(body, &["icon"]),
+        icon_color: opt_str(body, &["iconColor", "icon_color"]),
+        website_url: opt_str(body, &["websiteUrl", "website_url"]),
+        notes: opt_str(body, &["notes"]),
+        base_url: opt_str(body, &["baseUrl", "base_url"]).unwrap_or_default(),
+        api_key: opt_str(body, &["apiKey", "api_key"]).unwrap_or_default(),
+        access_mode: opt_str(body, &["accessMode", "access_mode"])
+            .and_then(|s| AccessMode::parse(&s))
+            .unwrap_or_default(),
+        wire_api: opt_str(body, &["wireApi", "wire_api"])
+            .and_then(|s| WireApi::parse(&s))
+            .unwrap_or_default(),
+        user_agent: opt_str(body, &["userAgent", "user_agent"]),
+        model: body.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        models: body.get("models").map(parse_models).unwrap_or_default(),
+        context_window: opt_str(body, &["contextWindow", "context_window"]),
+        proxy_url: opt_str(body, &["proxyUrl", "proxy_url"]),
+        timeout_secs: body
+            .get("timeoutSecs")
+            .or_else(|| body.get("timeout_secs"))
+            .and_then(|v| v.as_u64()),
+        sub2api_enabled: body
+            .get("sub2apiEnabled")
+            .or_else(|| body.get("sub2api_enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        sub2api_multiplier: body
+            .get("sub2apiMultiplier")
+            .or_else(|| body.get("sub2api_multiplier"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0),
+        custom_headers: body.get("customHeaders").or_else(|| body.get("custom_headers")).map(parse_headers),
+    }
+}
+
+fn opt_str(body: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| body.get(*k).and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+fn parse_models(v: &Value) -> Vec<ModelConfig> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some(ModelConfig {
+                        name,
+                        display_name: opt_str(m, &["displayName", "display_name"]),
+                        context_window: m.get("contextWindow").or_else(|| m.get("context_window")).and_then(|x| x.as_u64()),
+                        is_multimodal: m.get("isMultimodal").or_else(|| m.get("is_multimodal")).and_then(|x| x.as_bool()).unwrap_or(false),
+                        send_as_is: m.get("sendAsIs").or_else(|| m.get("send_as_is")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_headers(v: &Value) -> HashMap<String, String> {
+    v.as_object()
+        .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+        .unwrap_or_default()
+}
+
+// ── 单测（M1 Gate）────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("2xapi-m1-{}-{}-{}.json", label, std::process::id(), n));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn sample_input(name: &str, mode: AccessMode) -> ProviderInput {
+        ProviderInput {
+            name: name.into(),
+            model: "m".into(),
+            access_mode: mode,
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        }
+    }
+
+    fn sample_provider() -> Provider {
+        Provider {
+            id: "uuid-1".into(),
+            name: "Demo".into(),
+            icon: Some("🚀".into()),
+            icon_color: Some("#fff".into()),
+            sort_index: 3,
+            created_at: 1_700_000_000,
+            website_url: Some("https://x.test".into()),
+            notes: Some("n".into()),
+            base_url: "https://up.test".into(),
+            api_key: "sk-secret".into(),
+            access_mode: AccessMode::Mixed,
+            wire_api: WireApi::ChatCompletions,
+            user_agent: Some("ua".into()),
+            model: "gpt-demo".into(),
+            models: vec![ModelConfig {
+                name: "gpt-demo".into(),
+                display_name: Some("Demo".into()),
+                context_window: Some(128000),
+                is_multimodal: true,
+                send_as_is: false,
+            }],
+            context_window: Some("128k".into()),
+            proxy_url: Some("http://127.0.0.1:7890".into()),
+            timeout_secs: Some(120),
+            sub2api_enabled: true,
+            sub2api_multiplier: 1.5,
+            custom_headers: Some(HashMap::from([("X-Test".into(), "1".into())])),
+            config_toml_snapshot: Some("...toml...".into()),
+            auth_json_snapshot: Some("...json...".into()),
+        }
+    }
+
+    fn has_field(errs: &[ValidationError], field: &str) -> bool {
+        errs.iter().any(|e| e.field == field)
+    }
+
+    #[test]
+    fn enum_serialization_is_snake_case() {
+        assert_eq!(serde_json::to_string(&AccessMode::Official).unwrap(), "\"official\"");
+        assert_eq!(serde_json::to_string(&AccessMode::Mixed).unwrap(), "\"mixed\"");
+        assert_eq!(serde_json::to_string(&AccessMode::PureApi).unwrap(), "\"pure_api\"");
+        assert_eq!(serde_json::to_string(&WireApi::Responses).unwrap(), "\"responses\"");
+        assert_eq!(serde_json::to_string(&WireApi::ChatCompletions).unwrap(), "\"chat_completions\"");
+        // 历史 camelCase 反序列化兼容
+        let am: AccessMode = serde_json::from_str("\"pureApi\"").unwrap();
+        assert!(matches!(am, AccessMode::PureApi));
+    }
+
+    #[test]
+    fn provider_round_trip() {
+        let p = sample_provider();
+        let s = serde_json::to_string(&p).unwrap();
+        let back: Provider = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn validation_branches() {
+        // 空 name
+        assert!(has_field(&validate(&sample_input("", AccessMode::Official)).unwrap_err(), "name"));
+        // name 过长
+        let mut long = sample_input(&"x".repeat(41), AccessMode::Official);
+        assert!(has_field(&validate(&long).unwrap_err(), "name"));
+        long.name = "ok".into();
+
+        // PureApi 缺 base_url
+        let mut i = sample_input("X", AccessMode::PureApi);
+        assert!(has_field(&validate(&i).unwrap_err(), "base_url"));
+        // 非法 url
+        i.base_url = "not-a-url".into();
+        assert!(has_field(&validate(&i).unwrap_err(), "base_url"));
+        // 末尾带 /
+        i.base_url = "https://up.test/".into();
+        assert!(has_field(&validate(&i).unwrap_err(), "base_url"));
+        // 合法 url 但缺 key
+        i.base_url = "https://up.test".into();
+        assert!(has_field(&validate(&i).unwrap_err(), "api_key"));
+        // 合法
+        i.api_key = "sk".into();
+        assert!(validate(&i).is_ok(), "{:?}", validate(&i));
+
+        // Official：无需 base_url/key
+        assert!(validate(&sample_input("O", AccessMode::Official)).is_ok());
+
+        // timeout 越界
+        let mut t = sample_input("T", AccessMode::Official);
+        t.timeout_secs = Some(1);
+        assert!(has_field(&validate(&t).unwrap_err(), "timeout_secs"));
+        t.timeout_secs = Some(4000);
+        assert!(has_field(&validate(&t).unwrap_err(), "timeout_secs"));
+        t.timeout_secs = Some(120);
+        assert!(validate(&t).is_ok());
+
+        // multiplier <= 0
+        let mut m = sample_input("M", AccessMode::Official);
+        m.sub2api_multiplier = 0.0;
+        assert!(has_field(&validate(&m).unwrap_err(), "sub2api_multiplier"));
+
+        // model 空
+        let mut e = sample_input("E", AccessMode::Official);
+        e.model = "".into();
+        assert!(has_field(&validate(&e).unwrap_err(), "model"));
+    }
+
+    #[test]
+    fn crud_persists_and_reloads() {
+        let path = tmp_path("crud");
+
+        let mut a = sample_input("Alpha", AccessMode::PureApi);
+        a.base_url = "https://up.test".into();
+        a.api_key = "sk-a".into();
+        a.model = "gpt-a".into();
+        let pa = create(&path, a).expect("create");
+        assert!(!pa.id.is_empty());
+        assert_eq!(pa.sort_index, 0);
+
+        let mut b = sample_input("Beta", AccessMode::PureApi);
+        b.base_url = "https://up2.test".into();
+        b.api_key = "sk-b".into();
+        b.model = "gpt-b".into();
+        let pb = create(&path, b).expect("create2");
+        assert_eq!(pb.sort_index, 1);
+
+        // 列表升序
+        let l = list(&path);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].name, "Alpha");
+
+        // 重启后持久（重新从文件 load）
+        let l2 = list(&path);
+        assert_eq!(l2.len(), 2);
+
+        // 编辑：name 变，created_at 不变
+        let mut up = sample_input("Alpha2", AccessMode::PureApi);
+        up.base_url = "https://up.test".into();
+        up.api_key = "sk-a".into();
+        up.model = "gpt-a".into();
+        let updated = update(&path, &pa.id, up).expect("update");
+        assert_eq!(updated.name, "Alpha2");
+        assert_eq!(updated.created_at, pa.created_at);
+
+        // 删除
+        delete(&path, &pa.id);
+        assert_eq!(list(&path).len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_version_present() {
+        let path = tmp_path("schema");
+        let mut i = sample_input("S", AccessMode::Official);
+        i.model = "m".into();
+        let _ = create(&path, i).unwrap();
+        let data = load(&path);
+        assert_eq!(data.schema_version, SCHEMA_VERSION);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_management() {
+        let path = tmp_path("active");
+        let mut i = sample_input("A", AccessMode::PureApi);
+        i.base_url = "https://up.test".into();
+        i.api_key = "sk".into();
+        i.model = "m".into();
+        let p = create(&path, i).unwrap();
+
+        set_active(&path, &p.id);
+        assert_eq!(get_active(&path).map(|x| x.id), Some(p.id.clone()));
+
+        // 删除 active → active 置 None
+        delete(&path, &p.id);
+        assert!(get_active(&path).is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reorder_recomputes_sort_index() {
+        let path = tmp_path("reorder");
+        let a = create(&path, sample_input("A", AccessMode::Official)).unwrap();
+        let b = create(&path, sample_input("B", AccessMode::Official)).unwrap();
+        let c = create(&path, sample_input("C", AccessMode::Official)).unwrap();
+
+        // 新顺序：C, A, B
+        reorder(&path, &[c.id.clone(), a.id.clone(), b.id.clone()]);
+
+        let l = list(&path);
+        assert_eq!(l[0].name, "C");
+        assert_eq!(l[1].name, "A");
+        assert_eq!(l[2].name, "B");
+        assert_eq!((l[0].sort_index, l[1].sort_index, l[2].sort_index), (0, 1, 2));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_file_loads_without_wipe() {
+        // 模拟旧格式（current_provider_id + camelCase access_mode + 11 字段），不应崩、不应清空。
+        let path = tmp_path("legacy");
+        let legacy = r#"{
+            "schema_version": 1,
+            "current_provider_id": "old-1",
+            "providers": [
+                {"id":"old-1","name":"Old","base_url":"https://up.test","api_key":"sk","model":"m","wire_api":"responses","access_mode":"pureApi","sort_index":0,"created_at":1700000000}
+            ]
+        }"#;
+        std::fs::write(&path, legacy).unwrap();
+        let data = load(&path);
+        assert_eq!(data.providers.len(), 1);
+        assert_eq!(data.providers[0].name, "Old");
+        assert!(matches!(data.providers[0].access_mode, AccessMode::PureApi));
+        let _ = std::fs::remove_file(&path);
+    }
+}

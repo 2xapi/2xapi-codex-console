@@ -1,0 +1,21 @@
+{
+  "productName": "2xapi Codex Console",
+  "version": "1.0.0",
+  "identifier": "com.zhi.2xapi-codex-console",
+  "build": {
+    "frontendDist": "../frontend"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}
