@@ -432,6 +432,54 @@ pub fn unhost(
     }))
 }
 
+// ── Claude 注入式启动(批「Claude 接入」§3)──────────────────────
+
+/// Claude 注入式启动信息:`POST /api/desktop/claude-start`(handler 在 server.rs)。
+/// 返回可直接粘贴进终端的启动命令 + 结构化 env;本批**只生成信息,不真正 spawn claude**
+/// (避免长驻进程的 UX 复杂度)。校验:存在 agent=claude 的供应商(取数规则与网关
+/// `/anthropic/*` 一致 = `providers::get_provider_for_agent`)。
+///
+/// - `way="direct"` → `ANTHROPIC_BASE_URL` 直指供应商 base_url(不经网关、无加速、app 关闭也能用);
+/// - 其余(默认 `"gateway"`)→ `ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic`(经网关注入)。
+///
+/// Key 取自供应商 `api_key`,**仅在返回的 command/env 里**:不落盘、不进 ~/.claude、
+/// 不进日志(调用方/前端不得把它写文件)。
+///
+/// ⚠️ 环境变量名「待罗盘实测校准」(探索子任务,交接日志 Claude 接入):本机 claude 2.1.232
+/// 计划注入 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`(开发任务书 §2,前者指向网关 /anthropic,
+/// 后者令 claude 发 `Authorization: Bearer <key>` 与本网关认法一致)。若罗盘实测
+/// `ANTHROPIC_BASE_URL` 不生效而 `ANTHROPIC_API_KEY` 生效,则改用 `ANTHROPIC_API_KEY`
+/// (网关 /anthropic 路由不变,需同步校准并记入交接日志)。
+pub fn claude_start(providers_path: &Path, way: &str) -> Result<Value, OpError> {
+    let p = crate::providers::get_provider_for_agent(providers_path, "claude")
+        .ok_or((503u16, "E_NO_CLAUDE_PROVIDER".to_string(), "请先选择 Claude 供应商".to_string()))?;
+    if p.api_key.trim().is_empty() {
+        return Err((400u16, "E_NO_KEY".to_string(), "该 Claude 供应商缺少 api_key".to_string()));
+    }
+    let base_url = if way == "direct" {
+        p.base_url.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}/anthropic", GATEWAY_ADDR)
+    };
+    // Key 只在返回值里;command 供前端一键复制到终端(行内 env 前缀)
+    let env = json!({
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_AUTH_TOKEN": p.api_key,
+    });
+    let command = format!(
+        "ANTHROPIC_BASE_URL={} ANTHROPIC_AUTH_TOKEN={} claude",
+        base_url, p.api_key
+    );
+    Ok(json!({
+        "command": command,
+        "env": env,
+        "way": if way == "direct" { "direct" } else { "gateway" },
+        "providerId": p.id,
+        "providerName": p.name,
+        "model": p.model,
+    }))
+}
+
 // ── 单测(任务书 §1.3)────────────────────────────────────────
 
 #[cfg(test)]
@@ -815,6 +863,60 @@ mod tests {
         // 幂等:二次 unhost → alreadyClean
         let out2 = unhost(&cfg, &bk, &home, &prov).unwrap();
         assert!(out2["alreadyClean"].as_bool().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Claude 接入:claude_start(注入式启动信息)──
+
+    fn claude_provider(id: &str, name: &str) -> Provider {
+        Provider {
+            id: id.into(),
+            name: name.into(),
+            agent: "claude".into(),
+            base_url: "https://up.claude.example.com".into(),
+            api_key: "sk-claude-test-secret".into(),
+            access_mode: AccessMode::PureApi,
+            model: "claude-sonnet".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 缺省 way → 网关注入:base 指向 8787/anthropic,env 含 ANTHROPIC_BASE_URL + AUTH_TOKEN,command 可复制。
+    #[test]
+    fn claude_start_gateway_returns_command_and_env() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-start");
+        write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
+        let out = claude_start(&prov, "").unwrap();
+        assert_eq!(out["way"], "gateway");
+        assert_eq!(out["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787/anthropic");
+        assert_eq!(out["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
+        assert_eq!(out["providerId"], "p1");
+        let cmd = out["command"].as_str().unwrap();
+        assert!(cmd.starts_with("ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic ANTHROPIC_AUTH_TOKEN=sk-claude-test-secret "));
+        assert!(cmd.ends_with(" claude"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// way=direct → base_url 直指供应商,不经网关。
+    #[test]
+    fn claude_start_direct_uses_provider_base_url() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-direct");
+        write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
+        let out = claude_start(&prov, "direct").unwrap();
+        assert_eq!(out["way"], "direct");
+        assert_eq!(out["env"]["ANTHROPIC_BASE_URL"], "https://up.claude.example.com");
+        assert_eq!(out["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 无 claude 供应商(只有 codex)→ 503 E_NO_CLAUDE_PROVIDER。
+    #[test]
+    fn claude_start_no_claude_provider_errs() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-noprov");
+        write_providers(&prov, vec![provider("p1", "Cx")]); // agent 默认空 → codex
+        let err = claude_start(&prov, "").unwrap_err();
+        assert_eq!(err.0, 503);
+        assert_eq!(err.1, "E_NO_CLAUDE_PROVIDER");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

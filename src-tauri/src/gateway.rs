@@ -34,12 +34,97 @@ pub async fn proxy_models(State(s): State<Arc<AppState>>, req: Request<Body>) ->
     dispatch(&s, req, "models").await
 }
 
-/// 统一转发：取 active provider → 注入凭证 → 转发 → 流式透传响应。
+/// Claude 流量转发入口(`/anthropic/v1/messages` 与 `/anthropic/messages`,server.rs 注册)。
+pub async fn proxy_anthropic(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    dispatch_anthropic(&s, req).await
+}
+
+/// Claude 转发(Claude 接入批次):与 Codex 路径(dispatch)隔离——
+/// - 取 agent=claude 的 active 供应商(规则见 providers::get_provider_for_agent,global active 是 codex 时取 claude 首个);
+/// - 注入该供应商 api_key 作 `Authorization: Bearer <key>`(Key 只走上游,不进日志),透传到供应商 base_url 的 `/v1/messages`;
+/// - base_url 已以 `/v1` 结尾(挂载在根) → 拼 `/messages`;否则拼 `/v1/messages`(中转站两形态均可,CTO 实测 2xa.cc.cd 均 200);
+/// - 透传原样 body,**不做** Responses/Chat 转换(中转站原生 Anthropic 兼容);本期不加加速线路(加速复用留待接线员/罗盘结论)。
+async fn dispatch_anthropic(state: &AppState, req: Request<Body>) -> Response<Body> {
+    let provider = match crate::providers::get_provider_for_agent(&state.providers_path, "claude") {
+        Some(p) => p,
+        None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择 Claude 供应商"),
+    };
+    // Official 不应经网关（01-D1）；防御性拒绝
+    if provider.access_mode == AccessMode::Official {
+        return err_resp(StatusCode::BAD_REQUEST, "Official 模式不走网关");
+    }
+
+    let client = match build_client(&provider) {
+        Ok(c) => c,
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("build client: {e}")),
+    };
+    let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
+    };
+
+    let base = provider.base_url.trim_end_matches('/');
+    let target = if base.ends_with("/v1") {
+        format!("{}/messages", base)
+    } else {
+        format!("{}/v1/messages", base)
+    };
+
+    // 01-D3：注入 provider.api_key（覆盖任何来源的凭证）
+    let mut rb = client
+        .request(method, target)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", provider.api_key));
+    if let Some(ua) = provider.user_agent.as_deref().filter(|s| !s.is_empty()) {
+        rb = rb.header(reqwest::header::USER_AGENT, ua);
+    }
+    if let Some(hs) = provider.custom_headers.as_ref() {
+        for (k, v) in hs {
+            rb = rb.header(k, v);
+        }
+    }
+    if let Some(ct) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+        rb = rb.header(reqwest::header::CONTENT_TYPE, ct.clone());
+    }
+    if !body_bytes.is_empty() {
+        rb = rb.body(body_bytes.clone());
+    }
+
+    let upstream = match rb.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
+        Err(e) => {
+            eprintln!("[GW] anthropic ✗ upstream ERR: {e}");
+            return err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable");
+        }
+    };
+
+    // 原样透传（FR-4.11）：上游状态码 + body 流式回传，不做协议转换
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut resp = Response::builder().status(status);
+    if let Some(ct) = upstream.headers().get(reqwest::header::CONTENT_TYPE) {
+        if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
+            resp = resp.header(axum::http::header::CONTENT_TYPE, hv);
+        }
+    }
+    let stream = upstream
+        .bytes_stream()
+        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    match resp.body(Body::from_stream(stream)) {
+        Ok(r) => r,
+        Err(_) => err_resp(StatusCode::BAD_GATEWAY, "build response body"),
+    }
+}
+
+/// 统一转发(Codex 路径 `/v1/*`):取 agent=codex 的 active 供应商 → 注入凭证 → 转发 → 流式透传响应。
+/// 本期语义(Claude 接入):按 agent 过滤取供应商,见 providers::get_provider_for_agent——
+/// 全局 active 若是 claude,`/v1/*` 取 codex 首个,不把 Codex 流量发给 claude 供应商。
 async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str) -> Response<Body> {
     // FR-4.9 热切换：每次都重新读 active
-    let provider = match crate::providers::get_active(&state.providers_path) {
+    let provider = match crate::providers::get_provider_for_agent(&state.providers_path, "codex") {
         Some(p) => p,
-        None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "no active provider"),
+        None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择 Codex 供应商"),
     };
     // Official 不应经网关（01-D1）；防御性拒绝
     if provider.access_mode == AccessMode::Official {
@@ -809,6 +894,142 @@ mod tests {
     async fn no_active_provider_returns_503() {
         let (state, _providers_path, root) = make_state("noactive");
         let resp = proxy_responses(State(Arc::new(state)), req_post_responses("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Claude 接入(批):/anthropic/* 路由────────────────────
+
+    /// mock 上游:同时挂 /v1/messages 与 /messages,记录 (Authorization, 命中的路径)。
+    async fn mock_anthropic_upstream() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s_v1 = seen.clone();
+        let s_m = seen.clone();
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                    let seen = s_v1.clone();
+                    async move {
+                        let auth = h.get("authorization").and_then(|v| v.to_str().ok()).map(String::from).unwrap_or_default();
+                        seen.lock().unwrap().push((auth, "/v1/messages".into()));
+                        (StatusCode::OK, "ANTHROPIC_OK_V1")
+                    }
+                }),
+            )
+            .route(
+                "/messages",
+                post(move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                    let seen = s_m.clone();
+                    async move {
+                        let auth = h.get("authorization").and_then(|v| v.to_str().ok()).map(String::from).unwrap_or_default();
+                        seen.lock().unwrap().push((auth, "/messages".into()));
+                        (StatusCode::OK, "ANTHROPIC_OK_M")
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), seen)
+    }
+
+    async fn req_post_anthropic(body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/anthropic/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn add_claude_provider(path: &std::path::Path, base_url: &str, api_key: &str) -> String {
+        let input = ProviderInput {
+            name: "ClaudeT".into(),
+            agent: "claude".into(),
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: "claude-sonnet".into(),
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        };
+        let p = providers::create(path, input).unwrap();
+        providers::set_active(path, &p.id);
+        p.id
+    }
+
+    /// Claude 接入:base_url 无 /v1 前缀 → 拼 /v1/messages;注入 Bearer {claude api_key};body 透传。
+    #[tokio::test]
+    async fn anthropic_route_injects_claude_key_and_hits_v1_messages() {
+        let (base, seen) = mock_anthropic_upstream().await;
+        let (state, providers_path, root) = make_state("anthropic");
+        let _id = add_claude_provider(&providers_path, &base, "sk-claude-secret");
+
+        let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{\"model\":\"claude-sonnet\"}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"ANTHROPIC_OK_V1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.first().map(|(a, _)| a.as_str()), Some("Bearer sk-claude-secret"));
+        assert_eq!(seen.first().map(|(_, p)| p.as_str()), Some("/v1/messages"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Claude 接入:base_url 已带 /v1 后缀 → 拼 /messages(不产生 /v1/v1/messages)。
+    #[tokio::test]
+    async fn anthropic_route_base_url_v1_suffix_still_hits_v1_messages() {
+        let (base, seen) = mock_anthropic_upstream().await;
+        let (state, providers_path, root) = make_state("anthropic-v1");
+        let _id = add_claude_provider(&providers_path, &format!("{}/v1", base), "sk-claude-v1");
+
+        let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"ANTHROPIC_OK_V1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let seen = seen.lock().unwrap();
+        // 命中 /v1/messages(而非 /v1/v1/messages 或 /messages)
+        assert_eq!(seen.first().map(|(a, p)| (a.as_str(), p.as_str())), Some(("Bearer sk-claude-v1", "/v1/messages")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Claude 接入:全局 active 是 codex,但存在 claude 供应商 → /anthropic/* 仍取 claude(不串台)。
+    #[tokio::test]
+    async fn anthropic_route_uses_claude_provider_even_when_active_is_codex() {
+        let (base, seen) = mock_anthropic_upstream().await;
+        let (state, providers_path, root) = make_state("anthropic-isolate");
+        // codex 供应商(active)+ claude 供应商(不 active)
+        let input_cx = ProviderInput {
+            name: "Cx".into(),
+            agent: "codex".into(),
+            base_url: "http://127.0.0.1:9".into(), // 若误发到 codex 会立刻失败
+            api_key: "sk-codex-key".into(),
+            model: "gpt-test".into(),
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        };
+        let p_cx = providers::create(&providers_path, input_cx).unwrap();
+        let _p_cl = add_claude_provider(&providers_path, &base, "sk-claude-secret");
+        // 全局 active 保持 codex
+        providers::set_active(&providers_path, &p_cx.id);
+
+        let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"ANTHROPIC_OK_V1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(seen.lock().unwrap().first().map(|(a, _)| a.as_str()), Some("Bearer sk-claude-secret"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Claude 接入:无 claude 供应商 → 503。
+    #[tokio::test]
+    async fn anthropic_route_no_claude_provider_returns_503() {
+        let (state, _providers_path, root) = make_state("anthropic-none");
+        let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{}").await).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let _ = std::fs::remove_dir_all(&root);
     }

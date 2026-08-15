@@ -62,6 +62,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/chat/completions", post(crate::gateway::proxy_chat))
         .route("/v1/models", get(crate::gateway::proxy_models))
         .route("/models", get(crate::gateway::proxy_models))
+        // --- 网关代理 /anthropic/*（Claude 接入；Claude Code 以 /anthropic 为 base 会请求 /anthropic/v1/messages）---
+        .route("/anthropic/v1/messages", post(crate::gateway::proxy_anthropic))
+        .route("/anthropic/messages", post(crate::gateway::proxy_anthropic))
         // --- Health & session ---
         .route("/api/health", get(handle_health))
         .route("/api/session", get(handle_session))
@@ -95,6 +98,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/desktop/state", get(handle_desktop_state))
         .route("/api/desktop/host", post(handle_desktop_host))
         .route("/api/desktop/unhost", post(handle_desktop_unhost))
+        // --- Claude 注入式启动(批「Claude 接入」§3;返回启动命令+env,不真正 spawn)---
+        .route("/api/desktop/claude-start", post(handle_desktop_claude_start))
         // --- Backups & history ---
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
@@ -1178,6 +1183,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── Claude 接入:claude-start 接口(批「Claude 接入」§3)──
+
+    #[tokio::test]
+    async fn e2e_claude_start_returns_command_and_env() {
+        let (state, root) = unique_state("claude-start");
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+        let app = build_router(state.clone());
+        // 建 claude 供应商(agent=claude)
+        let resp = app
+            .oneshot(
+                Request::builder().method("POST").uri("/api/providers").header("content-type", "application/json")
+                    .body(Body::from(json!({"name":"ClaudeT","agent":"claude","baseUrl":"https://up.claude.example.com","apiKey":"sk-claude-test-secret","model":"claude-sonnet","accessMode":"pure_api"}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(resp).await["data"]["id"].as_str().unwrap().to_string();
+
+        let app = build_router(state.clone());
+        let v = body_json(
+            app.oneshot(
+                Request::builder().method("POST").uri("/api/desktop/claude-start").header("content-type", "application/json")
+                    .body(Body::from(json!({}).to_string())).unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(v["ok"], true, "成功应带 ok:true");
+        assert_eq!(v["way"], "gateway");
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787/anthropic");
+        assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
+        assert_eq!(v["providerId"], id.as_str());
+        assert!(v["command"].as_str().unwrap().ends_with(" claude"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn e2e_claude_start_no_provider_returns_error_envelope() {
+        let (state, root) = unique_state("claude-start-noprov");
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/claude-start").header("content-type", "application/json")
+                    .body(Body::from("{}".to_string())).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "E_NO_CLAUDE_PROVIDER");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── 阶段 4 加速线路路由(任务书 §五)──
 
     fn accel_line(id: &str, scope: &[&str]) -> crate::acclines::AccLine {
@@ -1619,6 +1679,27 @@ async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
         Err((status, code, msg)) => (
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
             Json(json!({ "error": code, "message": msg })),
+        )
+            .into_response(),
+    }
+}
+
+// POST /api/desktop/claude-start { way? }
+// 返回 Claude 注入式启动信息(契约:成功 {ok:true, command, env:{...}, ...} 供前端展示/复制;
+// 失败 {ok:false, error:{code,message}})。Key 只在响应里,不落盘、不进 ~/.claude、不进日志。
+async fn handle_desktop_claude_start(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let way = body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim();
+    match crate::desktop::claude_start(&s.providers_path, way) {
+        Ok(data) => {
+            let mut v = data;
+            if let Value::Object(m) = &mut v {
+                m.insert("ok".into(), Value::Bool(true));
+            }
+            Json(v).into_response()
+        }
+        Err((status, code, msg)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "ok": false, "error": { "code": code, "message": msg } })),
         )
             .into_response(),
     }

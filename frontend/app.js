@@ -8,8 +8,9 @@ var state = {
   agent: "codex",      // codex | claude
   view: "dash",        // dash | history
   selId: null,         // 当前选中供应商
-  providers: [],       // GET /api/providers(pure_api 过滤后)
-  dstate: null,        // GET /api/desktop/state {hasOfficial, gateway, hosting}
+  providers: [],       // GET /api/providers(pure_api 过滤后;含 agent 字段,按 agent 分流)
+  dstate: null,        // GET /api/desktop/state {hasOfficial, gateway, hosting}(Codex 托管)
+  claude: null,        // Claude 注入式(前端本地态:null 或 {started, way, providerId, providerName, env, command, model};后端无 claude-state 接口)
   accel: null,         // GET /api/accel/state {mode, customNode, lines, scopeNote, usage}
   session: null,       // GET /api/session
   balance: null,       // GET /api/auth/me → user.balance
@@ -43,12 +44,27 @@ function esc(s) {
 }
 var CHIP_COLORS = ["var(--c-gw)", "var(--c-direct)", "var(--c-accel)", "var(--c-official)"];
 function chipColor(p, i) { return p.iconColor || CHIP_COLORS[i % CHIP_COLORS.length]; }
-function lineOf(id) { return state.providers.find(function (p) { return p.id === id; }) || null; }
+/* 当前 agent 的供应商列表(listProviders 返回全部,前端按 agent 字段分流;旧数据缺省 codex) */
+function providersFor(agent) {
+  return state.providers.filter(function (p) { return (p.agent || "codex") === agent; });
+}
+function lineOf(id) { return providersFor(state.agent).find(function (p) { return p.id === id; }) || null; }
 function hosting() {
   var d = state.dstate;
   return (d && d.hosting && d.hosting.way === "gateway") ? d.hosting : null;
 }
-function hostedBy(id) { var h = hosting(); return !!h && h.providerId === id; }
+function claudeStarted() { var c = state.claude; return !!(c && c.started); }
+function claudeWay() { var c = state.claude; return (c && c.way) || "gateway"; }
+function hostedBy(id) {
+  if (state.agent === "claude") { var c = state.claude; return !!(c && c.started && c.providerId === id); }
+  var h = hosting(); return !!h && h.providerId === id;
+}
+function wireLabel(p) {
+  var w = p.wireApi;
+  if (w === "chat_completions") return "chat";
+  if (w === "anthropic") return "anthropic";
+  return w || "responses";
+}
 function loggedIn() {
   var s = state.session;
   return !!(s && (s.authenticated || s.loggedIn || s.email || (s.user && s.user.email)));
@@ -99,13 +115,22 @@ function normProviders(d) {
 async function refreshProviders() {
   var d = await api.listProviders();
   state.providers = normProviders(d);
-  if (state.providers.length && !lineOf(state.selId)) {
+  var mine = providersFor(state.agent);
+  if (mine.length && !lineOf(state.selId)) {
     var h = hosting();
-    state.selId = (h && h.providerId && lineOf(h.providerId)) ? h.providerId : state.providers[0].id;
+    state.selId = (h && h.providerId && lineOf(h.providerId)) ? h.providerId : mine[0].id;
   }
 }
 async function refreshDesktop() {
   try { state.dstate = await api.desktopState(); } catch (e) { state.dstate = null; }
+}
+async function refreshClaudeState() {
+  /* 后端无 claude-state 接口:注入态纯前端本地;注入的供应商若已被删除 → 复位未注入 */
+  var c = state.claude;
+  if (c && c.started) {
+    var p = providersFor("claude").find(function (x) { return x.id === c.providerId; });
+    if (!p) state.claude = null;
+  }
 }
 async function refreshAccel() {
   try {
@@ -126,12 +151,12 @@ async function refreshSession() {
   }
 }
 async function refreshAll() {
-  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel()]);
+  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel(), refreshClaudeState()]);
 }
 
 /* ── 渲染 ── */
 function renderNav() {
-  var noRail = state.agent !== "codex" || state.view === "history";
+  var noRail = state.view === "history";
   document.getElementById("frame").classList.toggle("no-rail", noRail);
   document.querySelectorAll(".nav-btn.agent").forEach(function (b) {
     b.classList.toggle("on", b.dataset.g === state.agent);
@@ -146,36 +171,48 @@ function renderNav() {
     chip.lastChild.textContent = " " + ((gw && gw.addr) || "127.0.0.1:8787");
     if (led) led.classList.toggle("off", !(gw && gw.alive));
   }
-  /* 托管 chip */
+  /* 托管 chip:Codex 走桌面托管,Claude 走注入式 */
   var h = hosting();
   var hc = document.getElementById("hostChip");
-  if (hc) hc.textContent = (state.agent === "codex" && h && h.providerName) ? "托管 · " + h.providerName : "未托管";
+  if (hc) {
+    hc.classList.toggle("claude", state.agent === "claude");
+    if (state.agent === "claude") {
+      var c = state.claude;
+      hc.textContent = (c && c.started && c.providerName) ? "Claude · 注入 " + c.providerName : "Claude · 未注入";
+    } else {
+      hc.textContent = (h && h.providerName) ? "托管 · " + h.providerName : "未托管";
+    }
+  }
 }
 function renderRail() {
   var el = document.getElementById("railList"); if (!el) return;
-  if (!state.providers.length) {
+  var isC = state.agent === "claude";
+  var who = isC ? "Claude" : "Codex";
+  var mine = providersFor(state.agent);
+  if (!mine.length) {
     el.innerHTML =
-      '<div class="rail-head"><span class="eyebrow">供应商</span><span class="tag">0</span></div>'
-      + '<div class="sub" style="padding:8px 2px">还没有供应商。<br>' + (loggedIn() ? "登录后一键导入,或点下方「＋ 新建」。" : "登录 2xapi 一键导入,或点下方「＋ 新建」。") + '</div>'
+      '<div class="rail-head"><span class="eyebrow">' + who + ' 供应商</span><span class="tag">0</span></div>'
+      + '<div class="sub" style="padding:8px 2px">' + (isC ? "还没有 Claude 的供应商。" : "还没有供应商。") + '<br>' + (loggedIn() ? "登录后一键导入,或点下方「＋ 新建」。" : "登录 2xapi 一键导入,或点下方「＋ 新建」。") + '</div>'
       + '<button class="btn ghost" data-a="new" style="width:100%;margin-top:8px">＋ 新建供应商</button>';
     return;
   }
   el.innerHTML =
-    '<div class="rail-head"><span class="eyebrow">供应商</span><span class="tag">共 ' + state.providers.length + '</span></div>'
+    '<div class="rail-head"><span class="eyebrow">' + who + ' 供应商</span><span class="tag">共 ' + mine.length + '</span></div>'
     + '<input class="rail-search" data-a="search" placeholder="筛选名称或地址…" value="' + esc(state.search) + '">'
     + '<div id="railRows"></div>'
     + '<button class="btn ghost" data-a="new" style="width:100%;margin-top:8px">＋ 新建供应商</button>'
-    + '<div class="sub" style="margin:8px 2px 0">点选即切换;✎ 编辑;详情操作在右侧。</div>';
+    + '<div class="sub" style="margin:8px 2px 0">这套列表只属于 ' + who + ',两边互相看不见。</div>';
   renderRailRows();
 }
 function railRowsHtml() {
   var q = state.search;
-  var list = state.providers.filter(function (p) {
+  var mine = providersFor(state.agent);
+  var list = mine.filter(function (p) {
     return !q || (p.name || "").toLowerCase().includes(q) || (p.baseUrl || "").toLowerCase().includes(q);
   });
   if (!list.length) return '<div class="sub" style="padding:8px 2px">没有匹配的供应商。</div>';
   return list.map(function (p) {
-    var i = state.providers.indexOf(p);
+    var i = mine.indexOf(p);
     return '<button class="line-row ' + (p.id === state.selId ? "sel" : "") + '" style="--lc:' + chipColor(p, i) + '" data-a="sel" data-id="' + esc(p.id) + '">'
       + '<span class="line-chip">' + esc(p.icon || String(i + 1)) + '</span><span class="nm">' + esc(p.name) + '</span>'
       + (hostedBy(p.id) ? '<span class="tag on">托管中</span>' : '')
@@ -187,9 +224,8 @@ function renderRailRows() {
 }
 function renderContent() {
   var c = document.getElementById("content"); if (!c) return;
-  if (state.agent === "claude") c.innerHTML = claudeHtml();
-  else if (state.view === "history") c.innerHTML = historyHtml();
-  else c.innerHTML = dashHtml();
+  if (state.view === "history") c.innerHTML = historyHtml();
+  else c.innerHTML = (state.agent === "claude") ? claudeDashHtml() : dashHtml();
 }
 function renderTopAuth() {
   var el = document.getElementById("topAuth"); if (!el) return;
@@ -221,12 +257,13 @@ function renderTopAuth() {
     + '</div>';
 }
 function render() {
-  if (state.providers.length && !lineOf(state.selId)) {
+  var mine = providersFor(state.agent);
+  if (mine.length && !lineOf(state.selId)) {
     var h = hosting();
-    state.selId = (h && h.providerId && lineOf(h.providerId)) ? h.providerId : state.providers[0].id;
+    state.selId = (h && h.providerId && lineOf(h.providerId)) ? h.providerId : mine[0].id;
   }
   renderNav();
-  if (state.agent === "codex" && state.view !== "history") renderRail();
+  if (state.view !== "history") renderRail();
   renderContent();
   renderTopAuth();
   assertRouteShape();
@@ -238,9 +275,10 @@ function assertRouteShape() {
   if (st && st !== lk + 1) console.warn("通路图形状异常: 节点 " + st + " ≠ 连线 " + lk + " + 1");
 }
 
-/* ── 主卡 dash ── */
+/* ── 主卡 dash(Codex)── */
 function dashHtml() {
-  if (!state.providers.length) {
+  var mine = providersFor("codex");
+  if (!mine.length) {
     return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
       + '<div style="font-size:30px">🚀</div>'
       + '<h2 style="font-size:15px">开始使用 Codex</h2>'
@@ -263,11 +301,11 @@ function dashHtml() {
     r = st("var(--c-official)", "桌面版 Codex", "官方登录") + lk("var(--c-official)") + st("var(--c-official)", "官方 OpenAI", "chatgpt 登录");
     note = '当前:官方直连 · 选一个供应商并「开启托管」即可走中转';
   } else if (!accelOn) {
-    r = st("var(--c-gw)", "桌面版 Codex", "官方登录保留") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787") + lk("var(--c-gw)") + st(chipColor(hp, state.providers.indexOf(hp)), esc(hp.name), "中转站");
+    r = st("var(--c-gw)", "桌面版 Codex", "官方登录保留") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787") + lk("var(--c-gw)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
     note = '通路:网关(加速已关,直发上游) · 配置零 Key,Key 由网关注入';
   } else {
     r = st("var(--c-gw)", "桌面版 Codex", "官方登录保留") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787")
-      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, state.providers.indexOf(hp)), esc(hp.name), "中转站");
+      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
     note = '通路:网关 + 加速(已启用线路自动择优,失败自动切换) · 配置零 Key,Key 由网关注入';
   }
   /* scope 提示条(琥珀,后端给定文案) */
@@ -280,7 +318,7 @@ function dashHtml() {
     scopeHtml += '<div style="margin:6px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ 官方加速配额已用满,已自动切换直连;可在 ⚙ 设置 → IP 管理 刷新凭证重试。</div>';
   }
   var selVal = hp ? hp.id : state.selId;
-  var opts = state.providers.map(function (x) {
+  var opts = mine.map(function (x) {
     return '<option value="' + esc(x.id) + '"' + (x.id === selVal ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
   }).join("");
   var p = lineOf(state.selId) || hp;
@@ -310,19 +348,155 @@ function dashHtml() {
       : '<button class="btn primary" data-a="host-on"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
     + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
     + '</div><div id="rtest"></div></section>';
-  if (p) {
-    html += '<section class="card"><div class="eyebrow" style="margin:0 0 2px">供应商详情 · ' + esc(p.name) + (hostedBy(p.id) ? ' <span class="tag on">托管中</span>' : '') + '</div>'
-      + '<div class="kv">'
-      + '<div><div class="k">上游地址</div><div class="v mono">' + esc(p.baseUrl) + '</div></div>'
-      + '<div><div class="k">api key</div><div class="v mono">' + esc(p.apiKeyMasked || "—") + '</div></div>'
-      + '<div><div class="k">协议</div><div class="v mono">' + (p.wireApi === "chat_completions" ? "chat" : "responses") + '</div></div>'
-      + '<div><div class="k">默认模型</div><div class="v mono">' + esc(p.model || "—") + '</div></div>'
-      + '</div>'
-      + '<div class="btn-row"><button class="btn primary" data-a="edit" data-id="' + esc(p.id) + '">编辑</button><button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
-      + (hostedBy(p.id) ? '<button class="btn ghost" disabled>删除(托管中)</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>')
-      + '</div></section>';
-    if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
+  if (p) html += providerDetailCard(p);
+  if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
+  return html;
+}
+
+/* 供应商详情卡(Codex / Claude 共用;按 agent 过滤与分支按钮) */
+function providerDetailCard(p) {
+  var hb = hostedBy(p.id);
+  var tagLabel = state.agent === "claude" ? "注入中" : "托管中";
+  var btns;
+  if (state.agent === "claude") {
+    /* Claude 世界:启用(未注入)/停用(已注入) + 编辑 + 诊断 + 删除(注入中禁用) */
+    btns = (hb
+      ? '<button class="btn" data-a="claude-stop" data-id="' + esc(p.id) + '"' + (state.busy === "claude-stop" ? " disabled" : "") + '>停用</button>'
+      : '<button class="btn primary" data-a="claude-start" data-id="' + esc(p.id) + '"' + (state.busy === "claude-start" ? " disabled" : "") + '>启用</button>')
+      + '<button class="btn" data-a="edit" data-id="' + esc(p.id) + '">编辑</button>'
+      + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
+      + (hb ? '<button class="btn ghost" disabled>删除(注入中)</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
+  } else {
+    btns = '<button class="btn primary" data-a="edit" data-id="' + esc(p.id) + '">编辑</button>'
+      + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
+      + (hb ? '<button class="btn ghost" disabled>删除(' + tagLabel + ')</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
   }
+  var html = '<section class="card"><div class="eyebrow" style="margin:0 0 2px">供应商详情 · ' + esc(p.name) + (hb ? ' <span class="tag on">' + tagLabel + '</span>' : '') + '</div>'
+    + '<div class="kv">'
+    + '<div><div class="k">上游地址</div><div class="v mono">' + esc(p.baseUrl) + '</div></div>'
+    + '<div><div class="k">api key</div><div class="v mono">' + esc(p.apiKeyMasked || "—") + '</div></div>'
+    + '<div><div class="k">协议</div><div class="v mono">' + esc(wireLabel(p)) + '</div></div>'
+    + '<div><div class="k">默认模型</div><div class="v mono">' + esc(p.model || "—") + '</div></div>'
+    + '</div>'
+    + '<div class="btn-row">' + btns + '</div></section>';
+  if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
+  return html;
+}
+
+/* ── 主卡 dash(Claude:注入式托管)── */
+function claudeEmptyHtml() {
+  return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
+    + '<svg viewBox="0 0 24 24" width="40" height="40" fill="var(--c-claude)" aria-hidden="true"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
+    + '<h2 style="font-size:15px">Claude Code · 接入预览</h2>'
+    + '<div class="sub" style="max-width:400px">还没有 Claude 供应商。点下方「新建」添加一个 Anthropic 兼容中转站;这套列表只属于 Claude,与 Codex 完全独立。</div>'
+    + '<div class="btn-row" style="justify-content:center"><button class="btn primary" data-a="new">＋ 新建供应商</button></div></section>';
+}
+function maskKey(k) {
+  var s = String(k == null ? "" : k);
+  if (!s) return "";
+  if (s.length <= 8) return s.slice(0, 2) + "…" + s.slice(-2);
+  return s.slice(0, 6) + "…" + s.slice(-4);
+}
+function claudeEnvHtml() {
+  var c = state.claude;
+  if (!c || !c.started) return "";
+  var p = c.providerId ? lineOf(c.providerId) : null;
+  var env = c.env || {};
+  var base = env.ANTHROPIC_BASE_URL || env.baseUrl || "http://127.0.0.1:8787/anthropic";
+  var rawTok = env.ANTHROPIC_AUTH_TOKEN || "";
+  var tok = rawTok ? maskKey(rawTok) : (env.authTokenMasked || (p && p.apiKeyMasked) || "");
+  var model = env.ANTHROPIC_DEFAULT_MODEL || env.model || (p && p.model) || c.model || "";
+  var rows = '<div><div class="k">ANTHROPIC_BASE_URL</div><div class="v mono">' + esc(base) + '</div></div>';
+  if (tok) rows += '<div><div class="k">ANTHROPIC_AUTH_TOKEN</div><div class="v mono">' + esc(tok) + '</div></div>';
+  if (model) rows += '<div><div class="k">ANTHROPIC_DEFAULT_MODEL</div><div class="v mono">' + esc(model) + '</div></div>';
+  /* 可复制启动命令:界面掩码展示,「复制」取完整命令(含 Key)进剪贴板 */
+  var cmdHtml = "";
+  if (c.command) {
+    var disp = rawTok ? c.command.split(rawTok).join(maskKey(rawTok)) : c.command;
+    cmdHtml = '<div style="margin-top:8px;display:flex;gap:6px;align-items:center">'
+      + '<code style="flex:1;min-width:0;overflow-x:auto;white-space:nowrap;font:11px var(--mono);color:var(--text);background:var(--ink);border:1px solid var(--hair);border-radius:7px;padding:6px 9px">' + esc(disp) + '</code>'
+      + '<button class="btn sm ghost" data-a="claude-copy" title="复制完整启动命令(含 Key)到剪贴板">复制</button></div>';
+  }
+  return '<div class="sub" style="margin:10px 0 0;padding:8px 10px;background:var(--raised);border:1px solid var(--hair);border-radius:8px">'
+    + '<div class="eyebrow" style="margin:0 0 6px">已注入环境变量(Key 已掩码,不显明文)</div>'
+    + '<div class="kv" style="margin-top:0">' + rows + '</div>' + cmdHtml + '</div>';
+}
+function claudeDashHtml() {
+  var mine = providersFor("claude");
+  if (!mine.length) return claudeEmptyHtml();
+  var started = claudeStarted();
+  var hp = started ? (lineOf(state.claude.providerId) || null) : null;
+  started = !!hp; /* 注入的供应商已删除 → 视为未启动,回到「启动」态 */
+  var acc = state.accel || {};
+  var accelMode = acc.mode || "off";
+  var accelOn = accelMode !== "off";
+  var ac = "var(--c-claude)";
+
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var way = claudeWay();
+  var direct = way === "direct";
+  var r, note;
+  if (!hp) {
+    r = st(ac, "Claude Code", "终端 CLI") + lk(ac) + st(ac, "官方 Anthropic", "claude.ai 登录");
+    note = '当前:官方直连 · 选一个供应商并点「启用」即注入中转';
+  } else if (direct) {
+    /* 通路:直连 —— Key 直注入,不经网关、无加速(两站) */
+    r = st(ac, "Claude Code", "注入式") + lk("var(--c-direct)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:直连(Key 直注入,不经网关、无加速)';
+  } else if (!accelOn) {
+    /* 通路:网关,加速关(三站) */
+    r = st(ac, "Claude Code", "注入式") + lk(ac) + st("var(--c-gw)", "网关", "127.0.0.1:8787") + lk(ac) + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关(注入式,不写 ~/.claude 配置)';
+  } else {
+    /* 通路:网关 + 加速(四站) */
+    r = st(ac, "Claude Code", "注入式") + lk(ac) + st("var(--c-gw)", "网关", "127.0.0.1:8787")
+      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关(注入式,不写 ~/.claude 配置)';
+  }
+  /* scope 提示条(与 Codex 同逻辑,agent=claude 时 scopeNote 语义同;直连无加速 → 不出条) */
+  var scopeHtml = "";
+  if (hp && !direct && accelOn && acc.scopeNote) {
+    scopeHtml = '<div style="margin:8px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ ' + esc(acc.scopeNote) + '</div>';
+  }
+  var usage = (acc.usage && acc.usage.ok) ? acc.usage : null;
+  if (hp && !direct && accelOn && usage && usage.degradedToDirect) {
+    scopeHtml += '<div style="margin:6px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ 官方加速配额已用满,已自动切换直连;可在 ⚙ 设置 → IP 管理 刷新凭证重试。</div>';
+  }
+  var selVal = hp ? hp.id : state.selId;
+  var opts = mine.map(function (x) {
+    return '<option value="' + esc(x.id) + '"' + (x.id === selVal ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
+  }).join("");
+  var p = lineOf(state.selId) || hp;
+
+  var html = '<section class="card"><h2>Claude Code · 主通道(注入式)</h2>'
+    + '<div class="detect">'
+    + '<span class="tag on">Claude Code · 注入式</span>'
+    + (started ? '<span class="tag" style="border-color:var(--c-claude);color:var(--c-claude)">已注入 · ' + esc(hp.name) + '</span>' : '<span class="tag">未注入</span>')
+    + '</div>'
+    + '<div class="route">' + r + '</div>'
+    + '<div class="route-mode"><span class="k" style="color:var(--c-claude)">●</span> ' + note + '</div>'
+    + scopeHtml
+    + claudeEnvHtml()
+    + '<div class="grid2">'
+    + '<div class="f"><label>通路方式</label><div class="seg">'
+    + '<button data-a="way" data-w="direct" aria-pressed="' + (direct) + '" style="--lc:var(--c-direct)">直连<small>Key 直注入</small></button>'
+    + '<button data-a="way" data-w="gateway" aria-pressed="' + (!direct) + '" style="--lc:var(--c-gw)">网关<small>经网关·可加速</small></button></div></div>'
+    + '<div class="f"><label>加速</label><div style="display:flex;gap:6px;align-items:center">'
+    + '<div class="seg" style="flex:1">'
+    + '<button data-a="accel" data-m="off" aria-pressed="' + (!accelOn) + '" style="--lc:var(--muted)"' + (direct ? " disabled" : "") + '>关</button>'
+    + '<button data-a="accel" data-m="on" aria-pressed="' + (accelOn) + '" style="--lc:var(--c-accel)"' + (direct ? " disabled" : "") + '>开<small>自动择优</small></button></div>'
+    + '</div><div class="sub" style="margin-top:2px">线路在 左下 ⚙ 设置 → IP 管理 里维护</div></div>'
+    + '<div class="f"><label>供应商(走哪家中转)</label><select id="provSel" data-a="prov">' + opts + '</select></div>'
+    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:' + (direct ? "var(--c-direct)" : "var(--c-gw)") + ';color:' + (direct ? "var(--c-direct)" : "var(--c-gw)") + '">' + (started ? (direct ? "直连 · 已注入" : "网关 · 已注入") : "未启动") + '</span></div></div>'
+    + '</div>'
+    + '<div class="btn-row">'
+    + (started
+      ? '<button class="btn" data-a="claude-stop"' + (state.busy === "claude-stop" ? " disabled" : "") + '>还原官方</button>'
+      : '<button class="btn primary" data-a="claude-start"' + (state.busy === "claude-start" ? " disabled" : "") + '>启动 Claude Code</button>')
+    + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
+    + '</div><div id="rtest"></div></section>';
+  if (p) html += providerDetailCard(p);
   if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
   return html;
 }
@@ -378,8 +552,13 @@ function diagCard(d) {
     + '</section>';
 }
 
-/* ── 历史会话视图 ── */
+/* ── 历史会话视图(Codex 现状;Claude 后端接口待定 → 占位)── */
 function historyHtml() {
+  if (state.agent === "claude") {
+    return '<section class="card" style="min-height:100%"><h2>历史会话 · Claude</h2>'
+      + '<div class="sub">Claude Code 的对话记录(~/.claude 统一保存);与 Codex 的会话分开管理。</div>'
+      + '<div style="margin-top:10px"><div class="hist-row"><b>Claude 会话即将接入</b><span class="meta" style="flex:1;color:var(--muted);font-size:11.5px">~/.claude 会话管理随后端接入一并上线 · 数据占位</span></div></div></section>';
+  }
   var s = state.sessions;
   var listHtml;
   if (state.sessionsRepairing) listHtml = '<div class="sub">正在对账会话…(先整库备份,再核对会话文件)</div>';
@@ -428,15 +607,6 @@ async function doSessionsRepair() {
   await loadSessions();
 }
 
-/* ── Claude 占位页 ── */
-function claudeHtml() {
-  return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px">'
-    + '<svg viewBox="0 0 24 24" width="36" height="36" fill="var(--c-claude)" aria-hidden="true"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
-    + '<h2 style="font-size:15px">Claude Code · 即将支持</h2>'
-    + '<div class="sub" style="max-width:440px">接入后与 Codex 同款体验:托管开关、网关注入 Key——但供应商列表完全独立:这里单独添加、单独管理,两边的供应商互相看不见。</div>'
-    + '<div class="btn-row" style="justify-content:center"><button class="btn" disabled>敬请期待</button></div></section>';
-}
-
 /* ── 编辑供应商弹窗 ── */
 function renderModelRows() {
   var tb = document.getElementById("modelRows"); if (!tb || !state.edit) return;
@@ -449,15 +619,17 @@ function renderModelRows() {
 }
 function openEdit(id) {
   var p = id ? lineOf(id) : null;
+  var isC = state.agent === "claude";
+  var defWire = isC ? "anthropic" : "responses";
   state.edit = p
-    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || "responses", models: (p.models || []).map(normModel) }
-    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: "responses", models: [] };
+    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, models: (p.models || []).map(normModel) }
+    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, models: [] };
   state.fieldErrors = {};
-  document.getElementById("editTitle").textContent = p ? "编辑供应商 · " + p.name : "新建供应商";
+  document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + (isC ? "Claude" : "Codex");
   document.getElementById("eName").value = state.edit.name;
   document.getElementById("eUrl").value = state.edit.baseUrl;
   document.getElementById("eKey").value = "";
-  document.getElementById("eKey").placeholder = state.edit.isNew ? "sk-..." : (p.apiKeyMasked ? "•••• 未改则留空" : "sk-...");
+  document.getElementById("eKey").placeholder = state.edit.isNew ? (isC ? "sk-ant-..." : "sk-...") : (p.apiKeyMasked ? "•••• 未改则留空" : (isC ? "sk-ant-..." : "sk-..."));
   document.getElementById("eModel").value = state.edit.model;
   renderModelRows();
   document.getElementById("editMask").style.display = "";
@@ -500,6 +672,7 @@ async function doSaveEdit() {
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
     wireApi: state.edit.wireApi, models: models,
     proxyUrl: "", timeoutSecs: null, notes: "", reasoning_levels: [],
+    agent: state.agent,
   };
   state.busy = "save"; render();
   try {
@@ -570,6 +743,52 @@ async function doUnhost() {
     showToast(r && r.restored ? "已还原(可从备份目录恢复)" : "当前未托管,无需还原", "ok");
   } catch (e) { showToast(e.message, "error"); await refreshDesktop(); }
   state.busy = null; render();
+}
+
+/* ── Claude 注入式托管(后端返回注入信息,前端展示/复制;停用=前端本地态)── */
+async function doClaudeStart(providerId) {
+  var pid = providerId || state.selId;
+  if (!pid) { showToast("请先选择或新建一个供应商", "error"); return; }
+  state.busy = "claude-start"; render();
+  try {
+    var r = await api.claudeStart(claudeWay());
+    state.claude = {
+      started: true,
+      way: r.way || claudeWay(),
+      providerId: r.providerId || pid,
+      providerName: r.providerName || (lineOf(r.providerId || pid) || {}).name || "",
+      env: r.env || {},
+      command: r.command || "",
+      model: r.model || "",
+    };
+    state.selId = state.claude.providerId;
+    showToast("已注入环境变量,在终端运行 claude 即可", "ok");
+  } catch (e) {
+    state.claude = null;
+    showToast("注入失败:" + e.message, "error");
+  }
+  state.busy = null; render();
+}
+function doClaudeStop() {
+  /* 后端无 claude-stop 接口(注入式无常驻进程):停用 = 清除前端注入态 */
+  state.claude = null;
+  state.busy = null;
+  render();
+  showToast("已停用注入", "ok");
+}
+function copyText(t) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(t).catch(function () { return fallbackCopy(t); });
+  }
+  return Promise.resolve(fallbackCopy(t));
+}
+function fallbackCopy(t) {
+  var ta = document.createElement("textarea");
+  ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); } catch (e) {}
+  document.body.removeChild(ta);
+  return true;
 }
 
 /* ── 加速(二态:off ↔ official;线路维护在 设置 → IP 管理)── */
@@ -725,6 +944,7 @@ async function doImport() {
         name: name, accessMode: "pure_api", baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
         model: models[0].name, models: models,
         reasoning_levels: Array.isArray(fm.reasoning_levels) ? fm.reasoning_levels : [],
+        agent: state.agent,
       });
       ok++;
     } catch (e) { fail.push((k.name || "Key") + ":" + e.message); }
@@ -910,8 +1130,13 @@ document.addEventListener("click", function (ev) {
   var a = t.dataset.a;
   if ((a === "settings-close" || a === "imp-close" || a === "login-close") && ev.target !== t) return; /* 点遮罩关闭,点内容不关 */
   switch (a) {
-    case "agent": state.agent = t.dataset.g; state.view = "dash"; state.diag = null; render(); break;
-    case "view": state.view = t.dataset.v; render(); if (state.view === "history") { loadSessions(); loadSessionsSettings(); } break;
+    case "agent":
+      state.agent = t.dataset.g; state.view = "dash"; state.diag = null; state.test = null; state.search = "";
+      render();
+      if (state.agent === "claude") refreshClaudeState().then(function () { render(); });
+      else state.claude = null;
+      break;
+    case "view": state.view = t.dataset.v; render(); if (state.view === "history" && state.agent === "codex") { loadSessions(); loadSessionsSettings(); } break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
     case "accel": doAccel(t.dataset.m); break;
     case "user-menu": state.menuOpen = !state.menuOpen; renderTopAuth(); break;
@@ -946,14 +1171,14 @@ document.addEventListener("click", function (ev) {
     case "del": {
       var delp = lineOf(t.dataset.id);
       if (!delp) break;
-      askConfirm("删除供应商「" + delp.name + "」?", "将移除该供应商的地址与 Key(仅从本软件移除,不影响你的 Codex 配置)。此操作不可撤销。").then(function (yes) {
+      askConfirm("删除供应商「" + delp.name + "」?", "将移除该供应商的地址与 Key(仅从本软件移除,不影响你的 " + (state.agent === "claude" ? "Claude" : "Codex") + " 配置)。此操作不可撤销。").then(function (yes) {
         if (!yes) return;
         api.deleteProvider(delp.id).then(function () {
-          if (hostedBy(delp.id)) return refreshDesktop();
+          if (hostedBy(delp.id)) return state.agent === "claude" ? refreshClaudeState() : refreshDesktop();
         }).then(function () {
           return refreshProviders();
         }).then(function () {
-          if (state.selId === delp.id) state.selId = state.providers.length ? state.providers[0].id : null;
+          if (state.selId === delp.id) state.selId = providersFor(state.agent).length ? providersFor(state.agent)[0].id : null;
           render();
           showToast("已删除「" + delp.name + "」", "ok");
         }).catch(function (e) { showToast(e.message, "error"); });
@@ -976,6 +1201,28 @@ document.addEventListener("click", function (ev) {
         if (yes) doUnhost();
       });
       break;
+    case "way":
+      state.claude = state.claude || {};
+      state.claude.way = t.dataset.w;
+      render();
+      break;
+    case "claude-copy": {
+      var cmd = state.claude && state.claude.command;
+      if (!cmd) { showToast("没有可复制的启动命令", "error"); break; }
+      copyText(cmd).then(function () { showToast("已复制启动命令,粘贴到终端运行", "ok"); })
+        .catch(function () { showToast("复制失败,请手动复制命令", "error"); });
+      break;
+    }
+    case "claude-start":
+      askConfirm("启动 Claude Code?", "注入环境变量(ANTHROPIC_BASE_URL 等)并生成注入式启动命令,不动 ~/.claude 配置。").then(function (yes) {
+        if (yes) doClaudeStart(t.dataset.id || state.selId);
+      });
+      break;
+    case "claude-stop":
+      askConfirm("停用注入?", "清除注入态,Claude Code 回到官方 Anthropic。").then(function (yes) {
+        if (yes) doClaudeStop();
+      });
+      break;
     case "diag": doDiag(); break;
     case "test": doTestConnection(); break;
     case "sess-continue": showToast("继续历史会话:请在桌面版 Codex 里打开对应对话", "ok"); break;
@@ -996,7 +1243,10 @@ document.addEventListener("change", function (ev) {
   if (sel && sel.value) {
     var id = sel.value;
     state.selId = id;
-    if (hosting()) doHost(id); /* 已托管:切供应商 = 网关热切换 */
+    if (state.agent === "claude") {
+      if (claudeStarted()) doClaudeStart(id); /* 已注入:切供应商 = 重新注入 */
+      else render();
+    } else if (hosting()) doHost(id); /* 已托管:切供应商 = 网关热切换 */
     else render();
     return;
   }

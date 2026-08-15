@@ -171,10 +171,11 @@ fn default_agent() -> String {
     "codex".to_string()
 }
 
-/// agent 白名单归一化:空 / 未知 → 默认 `"codex"`(本期仅 codex;接入 Claude 时在此扩展)。
+/// agent 白名单归一化:空 / 未知 → 默认 `"codex"`(本期允许 codex / claude;更多 agent 在此扩展)。
 fn normalize_agent(agent: &str) -> String {
     match agent.trim().to_ascii_lowercase().as_str() {
         "codex" => "codex".to_string(),
+        "claude" => "claude".to_string(),
         _ => default_agent(),
     }
 }
@@ -496,6 +497,34 @@ pub fn get_active(path: &Path) -> Option<Provider> {
     let data = load(path);
     let id = data.active_provider_id.as_ref()?;
     data.providers.into_iter().find(|p| &p.id == id)
+}
+
+/// 按 agent 取当前供应商(网关 `/v1/*` 与 `/anthropic/*` 共用;`active_provider_id` 仍全局单实例)。
+///
+/// **本期语义**(写死便于复核):
+/// - 若全局 `active_provider_id` 恰好归属该 agent → 用该供应商(UI「启用」+ 热切换语义保持不变);
+/// - 否则 → 取该 agent 下 `sort_index` 最小(list 顺序首个)的供应商兜底;
+/// - 该 agent 无任何供应商 → `None`(调用方报「请先选择 X 供应商」)。
+///
+/// 由此 Codex 与 Claude 的 active 互不串台:即便全局 active 是 codex,`/anthropic/*`
+/// 仍取 claude 供应商(claude 里首个);同理 `/v1/*` 只认 codex,绝不把 Codex 流量发给 claude 供应商。
+pub fn get_provider_for_agent(path: &Path, agent: &str) -> Option<Provider> {
+    let data = load(path);
+    let mut provs: Vec<Provider> = data
+        .providers
+        .into_iter()
+        .filter(|p| p.agent == agent)
+        .collect();
+    if provs.is_empty() {
+        return None;
+    }
+    if let Some(id) = data.active_provider_id.as_deref() {
+        if let Some(p) = provs.iter().find(|p| p.id == id) {
+            return Some(p.clone());
+        }
+    }
+    provs.sort_by_key(|p| p.sort_index);
+    provs.into_iter().next()
 }
 
 // ── 边界映射 / 兼容（供 server.rs，camelCase ↔ snake_case；M4 会以正式路由替代）──
@@ -1065,11 +1094,14 @@ mod tests {
 
     #[test]
     fn value_to_input_and_update_normalize_agent() {
-        // 缺省 / 空 / 非法(白名单外)→ codex
+        // 缺省 / 空 / 非法(白名单外)→ codex;白名单内 → 原样(codex / claude)
         assert_eq!(value_to_input(&json!({"name":"X","model":"m"})).agent, "codex");
         assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":""})).agent, "codex");
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"  Claude  "})).agent, "codex");
         assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"codex"})).agent, "codex");
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"  Claude  "})).agent, "claude");
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"CLAUDE"})).agent, "claude");
+        // 未知(白名单外)→ codex
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"gemini"})).agent, "codex");
         // update 对缺省 agent 输入归一化为 codex
         let path = tmp_path("agent_update");
         let mut i = sample_input("AU", AccessMode::Official);
@@ -1080,5 +1112,44 @@ mod tests {
         let p2 = update(&path, &p.id, keep).expect("update");
         assert_eq!(p2.agent, "codex");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn get_provider_for_agent_filters_by_agent() {
+        // 建 1 个 codex + 2 个 claude(先后 sort 顺序),active 指向 codex
+        let path = tmp_path("agent_select");
+        let mut i_c = sample_input("Cx", AccessMode::Official);
+        i_c.model = "m".into();
+        i_c.agent = "codex".into();
+        let p_c = create(&path, i_c).expect("create codex");
+
+        let mut i1 = sample_input("Cl1", AccessMode::Official);
+        i1.model = "m".into();
+        i1.agent = "claude".into();
+        let p1 = create(&path, i1).expect("create claude1");
+        let mut i2 = sample_input("Cl2", AccessMode::Official);
+        i2.model = "m".into();
+        i2.agent = "claude".into();
+        let p2 = create(&path, i2).expect("create claude2");
+
+        set_active(&path, &p_c.id); // 全局 active 是 codex
+
+        // active 归属 codex → codex 路径取 p_c
+        assert_eq!(get_provider_for_agent(&path, "codex").map(|p| p.id), Some(p_c.id.clone()));
+        // claude 路径:active 不是 claude → 取 claude 中 sort 首个(p1)
+        assert_eq!(get_provider_for_agent(&path, "claude").map(|p| p.id), Some(p1.id.clone()));
+
+        // 切 active 到 claude2 → claude 路径取 p2(active 优先),codex 路径仍取 p_c(active 归属 claude → 取 codex 首个)
+        set_active(&path, &p2.id);
+        assert_eq!(get_provider_for_agent(&path, "claude").map(|p| p.id), Some(p2.id.clone()));
+        assert_eq!(get_provider_for_agent(&path, "codex").map(|p| p.id), Some(p_c.id.clone()));
+
+        // 无该 agent → None
+        let empty = tmp_path("agent_select_empty");
+        std::fs::write(&empty, r#"{"schema_version":1,"providers":[]}"#).unwrap();
+        assert!(get_provider_for_agent(&empty, "claude").is_none());
+        assert!(get_provider_for_agent(&empty, "codex").is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&empty);
     }
 }
