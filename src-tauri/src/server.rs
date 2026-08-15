@@ -74,6 +74,9 @@ pub fn build_router(state: AppState) -> Router {
         // --- Backups & history ---
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
+        .route("/api/sessions", get(handle_sessions_list))
+        .route("/api/sessions/repair", post(handle_sessions_repair))
+        .route("/api/sessions/settings", get(handle_sessions_settings).post(handle_sessions_settings_set))
         .route("/api/config/snapshot", post(handle_config_snapshot))
         .route("/api/config/restore", post(handle_config_restore))
         .with_state(state)
@@ -496,6 +499,30 @@ async fn handle_backups(State(s): State<Arc<AppState>>) -> Response {
 async fn handle_history(State(s): State<Arc<AppState>>) -> Response {
     let result = crate::history::inspect(&s.codex_home);
     ok_json(result)
+}
+
+// ── 历史会话管理(阶段 3,任务书 §四)─────────────────────
+
+// GET /api/sessions?page=&size=&provider= → {total, items, db}
+async fn handle_sessions_list(State(s): State<Arc<AppState>>, query: axum::extract::Query<Value>) -> Response {
+    let page = query.get("page").and_then(|v| v.as_str()).and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+    let size = query.get("size").and_then(|v| v.as_str()).and_then(|v| v.parse::<usize>().ok()).unwrap_or(50);
+    let provider = query.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    ok_env(crate::sessions::list_sessions(&s.codex_home, page, size, &provider))
+}
+
+// POST /api/sessions/repair → {fixed, scanned}
+async fn handle_sessions_repair(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(crate::sessions::repair_sessions(&s.codex_home, &s.backup_dir))
+}
+
+// GET/POST /api/sessions/settings
+async fn handle_sessions_settings(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(crate::sessions::get_settings(&s.codex_home))
+}
+async fn handle_sessions_settings_set(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let v = body.get("autoRepairBeforeHost").and_then(|x| x.as_bool()).unwrap_or(true);
+    ok_env(crate::sessions::set_settings(&s.codex_home, v))
 }
 
 async fn handle_config_snapshot(State(s): State<Arc<AppState>>) -> Response {

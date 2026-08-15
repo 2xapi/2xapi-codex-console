@@ -172,6 +172,9 @@ pub fn host(
     provider_id: &str,
     way: &str,
 ) -> Result<Value, OpError> {
+    // host 前自动跑轻量 repair(任务书 §四 autoRepairBeforeHost,默认开;只对账不重建)
+    crate::sessions::auto_repair_if_enabled(codex_home, backup_dir);
+
     // direct 的 provider 段 Bearer 字段未实测(任务书 §1.4 探索),通过前一律拒绝
     if way != "gateway" {
         return Err((400, "E_DIRECT_UNAVAILABLE".into(), "直连方式即将支持,当前请使用网关方式".into()));

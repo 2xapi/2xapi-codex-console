@@ -110,6 +110,12 @@
     // 测试连接(阶段 2):{providerId} 或 {baseUrl, apiKey}
     preflight: (body) => request("POST", "/api/launcher/preflight", { body }),
 
+    // ── 历史会话管理(阶段 3,任务书 §四)──
+    sessions: (page, size, provider) => request("GET", "/api/sessions?page=" + (page || 1) + "&size=" + (size || 50) + "&provider=" + encodeURIComponent(provider || "")),
+    sessionsRepair: () => request("POST", "/api/sessions/repair"),
+    sessionsSettings: () => request("GET", "/api/sessions/settings"),
+    sessionsSetSettings: (autoRepair) => request("POST", "/api/sessions/settings", { body: { autoRepairBeforeHost: autoRepair } }),
+
     // ── 运维：备份/快照/恢复/历史诊断（旧路由，raw 响应）──
     backups: async () => rawJson("GET", "/api/backups"),
     snapshot: async () => rawJson("POST", "/api/config/snapshot", {}),
