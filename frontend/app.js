@@ -19,6 +19,12 @@ var state = {
   confirmBox: null,     // {msg, resolve}
   loginError: "",
   session: null,        // 2xapi 登录态
+  sessions: null,       // 历史会话列表(GET /api/sessions)
+  sessionsTotal: 0,
+  sessionsPage: 1,
+  sessionsProvider: "",
+  sessionsRepairing: false,
+  sessionsSettings: null, // {autoRepairBeforeHost}
 };
 
 var $ = function (s) { return document.querySelector(s); };
@@ -365,6 +371,85 @@ function editCard() {
 
 function mainPane() { return desktopCard() + cliBackupCard() + detailCard(); }
 
+/* ── 历史会话面板(阶段 3):列表/按供应商筛选/立刻修复/自动修复开关 ── */
+function fmtTime(ms) {
+  if (!ms) return "—";
+  var d = new Date(ms);
+  var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+  var today = new Date();
+  var sameDay = d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate();
+  var hh = pad(d.getHours()) + ":" + pad(d.getMinutes());
+  if (sameDay) return "今天 " + hh;
+  return (d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hh;
+}
+function historyPane() {
+  var s = state.sessions;
+  var listHtml;
+  if (state.sessionsRepairing) {
+    listHtml = '<div class="sub">正在对账会话…(先整库备份,再核对会话文件)</div>';
+  } else if (s === null) {
+    listHtml = '<div class="sub">加载中…</div>';
+  } else if (!s.length) {
+    listHtml = '<div class="sub">没有会话记录' + (state.sessionsProvider ? "(已按供应商筛选)" : "") + "</div>";
+  } else {
+    var rows = s.map(function (it) {
+      var tagColor = it.providerTag === "unknown" ? "" : 'style="border-color:var(--c-gw);color:var(--c-gw)"';
+      return '<div class="run"><div class="what"><b>' + esc(it.title || "(无标题)") + '</b>'
+        + '<span><span class="tag" ' + tagColor + '>' + esc(it.providerTag) + "</span>"
+        + (it.missing ? ' <span class="tag" style="border-color:var(--c-err);color:var(--c-err)">会话文件缺失</span>' : "")
+        + " · " + esc(fmtTime(it.updatedAt))
+        + (it.cwd ? " · " + esc(it.cwd) : "") + "</span></div>"
+        + '<button class="btn ghost" data-a="sess-continue" data-i="' + it.id + '">继续</button></div>';
+    }).join("");
+    listHtml = rows;
+  }
+  var providers = (state.providers || []).map(function (p) { return p.name; });
+  providers = providers.concat(["custom", "2xapi"]);
+  var unique = Array.from(new Set(providers));
+  var filterOpts = '<option value="">全部供应商</option>' + unique.map(function (n) {
+    return '<option value="' + esc(n) + '"' + (n === state.sessionsProvider ? " selected" : "") + ">" + esc(n) + "</option>";
+  }).join("");
+  var autoOn = !!(state.sessionsSettings && state.sessionsSettings.autoRepairBeforeHost);
+  return '<div class="sub" style="margin-bottom:4px">Codex 对话记录(~/.codex 统一保存):共 <b>' + state.sessionsTotal + "</b> 条。</div>"
+    + '<div style="display:flex;gap:8px;align-items:center;margin:0 0 10px;flex-wrap:wrap">'
+    + '<select data-a="sess-filter" style="flex:1;min-width:140px;padding:7px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:8px;color:var(--text);font-size:12.5px">' + filterOpts + "</select>"
+    + '<button class="btn ghost" data-a="sess-repair"' + (state.sessionsRepairing ? " disabled" : "") + '>' + (state.sessionsRepairing ? "修复中…" : "立刻修复") + "</button>"
+    + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer"><input type="checkbox" data-a="sess-autofix"' + (autoOn ? " checked" : "") + ">启动前自动修复</label>"
+    + "</div>"
+    + listHtml
+    + (state.sessionsPage > 1 ? '<div class="btn-row" style="margin-top:8px"><button class="btn ghost" data-a="sess-prev">← 上一页</button></div>' : "");
+}
+
+async function openHistoryModal() {
+  state.modal = { kind: "tool", t: "history" };
+  render();
+  await Promise.all([loadSessions(), api.sessionsSettings().then(function (d) { state.sessionsSettings = d; render(); }).catch(function () {})]);
+}
+
+async function loadSessions() {
+  try {
+    var d = await api.sessions(state.sessionsPage, 50, state.sessionsProvider);
+    state.sessions = d.items || [];
+    state.sessionsTotal = d.total || 0;
+  } catch (e) {
+    state.sessions = [];
+    showToast("获取会话失败:" + e.message, "error");
+  }
+  render();
+}
+
+async function doSessionsRepair() {
+  state.sessionsRepairing = true; render();
+  try {
+    var d = await api.sessionsRepair();
+    showToast("修复完成:对账 " + d.scanned + " 条,修正 " + d.fixed + " 条(已先备份)", "ok");
+  } catch (e) {
+    showToast("修复失败:" + e.message, "error");
+  }
+  state.sessionsRepairing = false;
+  await loadSessions();
+}
+
 /* ── 弹窗 ── */
 function confirmHtml() {
   return '<div class="mask" style="z-index:70" data-a="cno"><div class="box" style="width:330px"><div style="margin-bottom:16px">' + esc(state.confirmBox.msg) + '</div><div class="btn-row" style="margin:0"><button class="btn danger" data-a="cyes">删除</button><button class="btn ghost" data-a="cno">取消</button></div></div></div>';
@@ -413,7 +498,7 @@ function modalHtml() {
   }
   var body;
   if (m.t === "history") {
-    body = '<div class="notice">历史会话管理即将上线(阶段 3):统一列表、按供应商筛选、一键修复。</div>';
+    body = historyPane();
   } else {
     body = '<div class="kv"><div><div class="k">config.toml</div><div class="v mono">~/.codex(托管开启时仅一处 custom 段,零 Key)</div></div><div><div class="k">网关</div><div class="v mono">127.0.0.1:8787 · 托盘常驻</div></div></div>'
       + '<div class="f full" style="margin-top:12px"><label>我的加速节点(即将上线 · 仅本机保存)</label><input class="mono" placeholder="socks5://127.0.0.1:7890 或 http://用户:密码@你的VPS:8443" disabled><div class="hint">阶段 4 上线:自己的 VPS(跑 gost/squid)或本地代理客户端端口。官方加速专线由 2xapi 下发,无需填写。</div></div>';
@@ -725,7 +810,10 @@ document.addEventListener("click", function (ev) {
         state.session = null; render(); showToast("已登出", "ok");
       }).catch(function (e) { showToast(e.message, "error"); });
       break;
-    case "tool": state.modal = { kind: "tool", t: t.dataset.t }; render(); break;
+    case "tool": if (t.dataset.t === "history") { openHistoryModal(); } else { state.modal = { kind: "tool", t: t.dataset.t }; render(); } break;
+    case "sess-continue": showToast("继续历史会话:请在桌面版 Codex 里打开对应对话", "ok"); break;
+    case "sess-repair": doSessionsRepair(); break;
+    case "sess-prev": state.sessionsPage = Math.max(1, state.sessionsPage - 1); loadSessions(); break;
     case "mclose": state.modal = null; render(); break;
     case "cyes": { var c = state.confirmBox; state.confirmBox = null; render(); if (c) c.resolve(true); break; }
     case "cno": { var c2 = state.confirmBox; state.confirmBox = null; render(); if (c2) c2.resolve(false); break; }
@@ -743,6 +831,21 @@ document.addEventListener("change", function (ev) {
     } else {
       collectDraft(); state.selId = id; render();
     }
+    return;
+  }
+  var sfilter = ev.target.closest("[data-a='sess-filter']");
+  if (sfilter) {
+    state.sessionsProvider = sfilter.value;
+    state.sessionsPage = 1;
+    loadSessions();
+    return;
+  }
+  var sauto = ev.target.closest("[data-a='sess-autofix']");
+  if (sauto) {
+    var on = sauto.checked;
+    api.sessionsSetSettings(on).then(function () {
+      showToast(on ? "已开启启动前自动修复" : "已关闭启动前自动修复", "ok");
+    }).catch(function (e) { showToast(e.message, "error"); });
     return;
   }
   if (ev.target.closest("[data-f], [data-mf], [data-l]")) collectDraft();
