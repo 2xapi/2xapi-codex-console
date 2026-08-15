@@ -51,7 +51,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/key-groups", get(handle_key_groups))
         .route("/api/auth/api-keys", get(handle_auth_api_keys))
         .route("/api/auth/me", get(handle_auth_me))
-        .route("/api/auth/create-key", post(handle_auth_create_key))
         // --- Providers（04 契约）---
         .route("/api/providers", get(handle_providers_list).post(handle_providers_create))
         .route("/api/providers/active", get(handle_providers_active))
@@ -289,25 +288,6 @@ async fn handle_auth_me(State(s): State<Arc<AppState>>) -> Response {
     match crate::auth::fetch_me(&session.access_token).await {
         Ok(user) if !user.is_null() => ok_json(json!({ "user": user })),
         _ => ok_json(json!({ "user": session.user })), // 外呼失败退回快照(余额可能滞后)
-    }
-}
-
-// POST /api/auth/create-key {name} —— 页面内直接创建 Key(无 Key 客户的开箱路径)
-async fn handle_auth_create_key(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-    if name.is_empty() {
-        return err_json(StatusCode::BAD_REQUEST, "请填写 Key 名称");
-    }
-    let session = match crate::auth::load_session(&s.codex_home) {
-        Some(sess) => sess,
-        None => match crate::auth::refresh_session(&s.codex_home).await {
-            Some(sess) => sess,
-            None => return err_json(StatusCode::UNAUTHORIZED, "请先登录 2xapi 账号"),
-        },
-    };
-    match crate::auth::create_api_key(&session.access_token, name).await {
-        Ok(k) => ok_json(json!({ "key": k })),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("创建 Key 失败: {}", e)),
     }
 }
 

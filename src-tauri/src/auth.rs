@@ -215,10 +215,3 @@ pub async fn fetch_me(access_token: &str) -> Result<Value, String> {
     let result = xapi_request("/auth/me", reqwest::Method::GET, &json!({}), access_token).await?;
     Ok(result.get("data").cloned().unwrap_or(json!({})))
 }
-
-/// 创建 API Key(部署版 POST /keys,name 必填/group_id 可空默认分组;实测返回明文 key)。
-pub async fn create_api_key(access_token: &str, name: &str) -> Result<Value, String> {
-    let body = json!({ "name": name });
-    let result = xapi_request("/keys", reqwest::Method::POST, &body, access_token).await?;
-    Ok(result.get("data").cloned().unwrap_or(json!({})))
-}

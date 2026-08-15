@@ -73,7 +73,6 @@
     remember: async (email, password) => rawJson("POST", "/api/auth/remember", { email, password }),
     forget: async () => rawJson("POST", "/api/auth/forget", {}),
     apiKeys: async () => rawJson("GET", "/api/auth/api-keys"),
-    createKey: async (name) => rawJson("POST", "/api/auth/create-key", { name }),
     me: async () => rawJson("GET", "/api/auth/me"),
     keyGroups: async () => rawJson("GET", "/api/key-groups"),
 

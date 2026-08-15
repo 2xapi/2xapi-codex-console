@@ -345,21 +345,11 @@ function modalHtml() {
   }
   if (m.kind === "import") {
     var d = state.importData;
-    var createBox;
-    if (state.importCreateOpen) {
-      createBox = '<div class="f" style="margin:0 0 12px"><label>新 Key 名称 *</label>'
-        + '<div style="display:flex;gap:8px"><input data-l="newkey" placeholder="如:我的桌面版">'
-        + '<button class="btn primary" data-a="import-create"' + (state.importCreating ? " disabled" : "") + '>' + (state.importCreating ? "创建中…" : "创建并导入") + "</button>"
-        + '<button class="btn ghost" data-a="import-create-cancel"' + (state.importCreating ? " disabled" : "") + ">取消</button></div>"
-        + '<div class="hint">创建后自动导入为供应商(拉取模型列表、填默认模型)</div></div>';
-    } else {
-      createBox = '<div class="btn-row" style="margin:0 0 12px"><button class="btn ghost" data-a="import-create-open">＋ 在这里创建一个新 Key</button></div>';
-    }
     var body;
     if (!d) {
       body = '<div class="sub">正在获取你的 Key 列表…</div>';
     } else if (!d.keys.length) {
-      body = '<div class="sub" style="margin-bottom:4px">账号里还没有 Key。</div>';
+      body = '<div class="sub">账号里还没有 Key,去 2xapi 网站创建后再来导入。</div>';
     } else {
       var rowsHtml = d.keys.map(function (k, i) {
         var keyStr = String(k.key || "");
@@ -374,7 +364,7 @@ function modalHtml() {
       }).join("");
       body = '<div class="sub" style="margin-bottom:8px">选择一个 Key,自动创建供应商(拉取模型列表、填好默认模型,开箱即用)。</div>' + rowsHtml;
     }
-    return '<div class="mask" data-a="mclose"><div class="box" style="width:480px"><h2 style="margin:0 0 10px;font-size:15px">从 2xapi 账号导入 Key</h2>' + createBox + body
+    return '<div class="mask" data-a="mclose"><div class="box" style="width:480px"><h2 style="margin:0 0 10px;font-size:15px">从 2xapi 账号导入 Key</h2>' + body
       + '<div class="btn-row" style="margin-top:12px"><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
   }
   var body;
@@ -536,8 +526,6 @@ async function openImportModal() {
   state.modal = { kind: "import" };
   state.importData = null;
   state.importBusy = -1;
-  state.importCreateOpen = false;
-  state.importCreating = false;
   render();
   try {
     var d = await api.apiKeys();
@@ -552,21 +540,18 @@ async function openImportModal() {
 async function doImportKey(i) {
   var d = state.importData;
   if (!d || !d.keys[i]) return;
-  await doImportKeyObj(d.keys[i], d.baseUrl);
-}
-
-/* 导入一个 Key 对象:拉模型 → 建供应商(创建 Key 后可直接复用) */
-async function doImportKeyObj(k, baseUrl) {
-  if (!k || !k.key || !baseUrl) return;
+  var k = d.keys[i];
+  state.importBusy = i; render();
   try {
-    var fm = await api.fetchModels({ baseUrl: baseUrl, apiKey: k.key });
+    // 拉模型定默认模型(导入的供应商开箱即用)
+    var fm = await api.fetchModels({ baseUrl: d.baseUrl, apiKey: k.key });
     var models = (fm.models || []).map(normModel);
-    if (!models.length) { showToast("该 Key 拉不到模型列表,请先手动新建供应商填入", "error"); return; }
+    if (!models.length) { showToast("该 Key 拉不到模型列表,请先手动新建供应商填入", "error"); state.importBusy = -1; render(); return; }
     var name = (k.name && String(k.name).trim()) || ("2xapi-" + String(k.key || "").slice(-6));
     if (state.providers.some(function (p) { return p.name === name; })) name += " 2";
     var saved = await api.createProvider({
       name: name, accessMode: "pure_api",
-      baseUrl: baseUrl, apiKey: k.key, wireApi: "responses",
+      baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
       model: models[0].name, models: models,
     });
     await refreshProviders();
@@ -576,35 +561,7 @@ async function doImportKeyObj(k, baseUrl) {
   } catch (e) {
     showToast("导入失败:" + e.message, "error");
   }
-}
-
-/* 页面内创建 Key:创建成功直接导入(客户无 Key 时的开箱路径) */
-async function doCreateKey() {
-  var name = (document.querySelector('[data-l="newkey"]') || {}).value || "";
-  name = name.trim();
-  if (!name) { showToast("请先填写 Key 名称", "error"); return; }
-  state.importCreating = true; render();
-  try {
-    var r = await api.createKey(name);
-    var k = (r && r.key) || {};
-    var baseUrl = (state.importData && state.importData.baseUrl) || "";
-    showToast("Key「" + name + "」已创建" + (baseUrl ? ",正在导入…" : ""), "ok");
-    if (k.key && baseUrl) {
-      await doImportKeyObj(k, baseUrl);
-      // 导入失败(modal 仍开)时刷新列表,新 Key 可见、可手动导入
-      if (state.modal) {
-        try {
-          var d2 = await api.apiKeys();
-          state.importData = { keys: (d2 && d2.keys) || [], baseUrl: (d2 && d2.baseUrl) || baseUrl };
-        } catch (e2) { /* 列表刷新失败不掩盖原错误 */ }
-      }
-    }
-  } catch (e) {
-    showToast("创建失败:" + e.message, "error");
-  }
-  state.importCreating = false;
-  state.importCreateOpen = false;
-  render();
+  state.importBusy = -1; render();
 }
 
 /* ── 2xapi 登录(含腾讯滑块:站点开启验证码时弹出,人工完成后携带票据登录) ── */
@@ -715,10 +672,7 @@ document.addEventListener("click", function (ev) {
     }
     case "login": openLoginModal(); break;
     case "import": openImportModal(); break;
-    case "import-key": (function (i) { state.importBusy = i; render(); doImportKey(i).then(function () { state.importBusy = -1; }); })(Number(t.dataset.i)); break;
-    case "import-create-open": state.importCreateOpen = true; render(); break;
-    case "import-create-cancel": state.importCreateOpen = false; render(); break;
-    case "import-create": doCreateKey(); break;
+    case "import-key": doImportKey(Number(t.dataset.i)); break;
     case "do-login": doLogin(); break;
     case "logout":
       api.logout().catch(function () {}).then(function () {
