@@ -1,34 +1,38 @@
 "use strict";
-/* ── 2xapi Codex Console · 桌面版主通道形态(阶段 1,视觉规格 = 界面重设计原型) ──
- * 词汇规范:统一「供应商」;主动词不用于本卡(桌面版 = 开启托管/还原);「会话」仅指对话记录。
- * 交互规范:禁止内联 onclick(CSP),一律 data-a 事件委托;通路图断言 节点数=连线数+1。
+/* ── 2xapi Codex Console · 界面重构 v2(视觉 = 无滚动条布局演示,逐块对齐;数据 = api-client 接真) ──
+ * 词汇规范:统一「供应商」;主动词「开启托管 / 还原官方」;「会话」仅作名词;加速 seg「关 / 开·自动择优」。
+ * 交互规范:禁内联 onclick(CSP),一律 data-a 事件委托;通路图形状自检 节点数=连线数+1。
  */
 
 var state = {
-  providers: [],        // GET /api/providers
-  selId: null,          // 左栏/主卡当前选中供应商
-  mode: "view",         // view | edit
-  isNew: false,
-  draft: null,          // 编辑草稿(input change 时收集,防重绘丢失)
-  fieldErrors: {},
-  diag: null,           // 诊断结果(当前选中供应商)
-  dstate: null,         // GET /api/desktop/state {hasOfficial, hosting, gateway, codexHome}
-  busy: null,           // 进行中动作标记(按钮禁用)
-  modal: null,          // {kind:"login"|"snippet"|"tool", t:"history"|"settings"}
-  toast: null,          // {m, k}
-  confirmBox: null,     // {msg, resolve}
-  loginError: "",
-  session: null,        // 2xapi 登录态
-  sessions: null,       // 历史会话列表(GET /api/sessions)
+  agent: "codex",      // codex | claude
+  view: "dash",        // dash | history
+  selId: null,         // 当前选中供应商
+  providers: [],       // GET /api/providers(pure_api 过滤后)
+  dstate: null,        // GET /api/desktop/state {hasOfficial, gateway, hosting}
+  accel: null,         // GET /api/accel/state {mode, customNode, lines, scopeNote, usage}
+  session: null,       // GET /api/session
+  balance: null,       // GET /api/auth/me → user.balance
+  menuOpen: false,     // 账号菜单展开
+  search: "",          // 供应商栏筛选
+  setTab: "ip",        // 设置五分区
+  sessions: null,      // GET /api/sessions items
   sessionsTotal: 0,
-  sessionsPage: 1,
-  sessionsProvider: "",
+  sessionsSettings: null,
   sessionsRepairing: false,
-  sessionsSettings: null, // {autoRepairBeforeHost}
-  accel: null,            // GET /api/accel/state {mode, customNode, lines, scopeNote}
-  nodeInput: null,        // 本机设置「我的加速节点」输入框草稿(重绘防丢)
-  accelBusy: null,        // "mode" | "node-save" | "node-test"
-  accelTest: null,        // 节点连通测试:{busy:true} | {ok:true,latencyMs} | {ok:false,msg}
+  nodeDraft: null,     // IP 管理「我的代理」输入草稿(重绘防丢)
+  nodeTest: null,      // {busy} | {ok,latencyMs} | {err,msg}
+  importKeys: null,    // {keys, baseUrl}
+  importBusy: false,
+  edit: null,          // 编辑草稿 {id,isNew,name,baseUrl,apiKey,model,wireApi,models}
+  fieldErrors: {},
+  test: null,          // 测试连接结果
+  diag: null,          // 诊断结果 {forId, data}
+  busy: null,          // 进行中动作
+  loginEmail: "", loginPassword: "", loginError: "", remembered: false,
+  balShow: true,       // 顶栏实时余额开关(localStorage 持久)
+  confirmCb: null,
+  toastTimer: null,
 };
 
 var $ = function (s) { return document.querySelector(s); };
@@ -37,23 +41,57 @@ function esc(s) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
   });
 }
-function showToast(m, k) {
-  state.toast = { m: m, k: k || "" }; render();
-  setTimeout(function () { state.toast = null; render(); }, 2800);
-}
-function askConfirm(msg) {
-  return new Promise(function (resolve) { state.confirmBox = { msg: msg, resolve: resolve }; render(); });
-}
-function lineOf(id) { return state.providers.find(function (p) { return p.id === id; }) || null; }
-/* bytes → GB 两位小数(官方线路配额展示专用) */
-function fmtGb(bytes) { return (Number(bytes || 0) / 1073741824).toFixed(2); }
-function fmtQuotaTotalGb(bytes) { return String(Math.round(Number(bytes || 10737418240) / 1073741824)); }
-function hosting() { return (state.dstate && state.dstate.hosting) || null; }
-function hostedBy(id) { var h = hosting(); return !!h && h.way === "gateway" && (id ? h.providerId === id : true); }
 var CHIP_COLORS = ["var(--c-gw)", "var(--c-direct)", "var(--c-accel)", "var(--c-official)"];
 function chipColor(p, i) { return p.iconColor || CHIP_COLORS[i % CHIP_COLORS.length]; }
+function lineOf(id) { return state.providers.find(function (p) { return p.id === id; }) || null; }
+function hosting() {
+  var d = state.dstate;
+  return (d && d.hosting && d.hosting.way === "gateway") ? d.hosting : null;
+}
+function hostedBy(id) { var h = hosting(); return !!h && h.providerId === id; }
+function loggedIn() {
+  var s = state.session;
+  return !!(s && (s.authenticated || s.loggedIn || s.email || (s.user && s.user.email)));
+}
+function sessionEmail() {
+  var s = state.session || {};
+  return (s.user && s.user.email) || s.email || "";
+}
+function fmtTime(ms) {
+  if (!ms) return "—";
+  var d = new Date(ms);
+  var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+  var today = new Date();
+  var sameDay = d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate();
+  var hh = pad(d.getHours()) + ":" + pad(d.getMinutes());
+  if (sameDay) return "今天 " + hh;
+  return (d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hh;
+}
+function normModel(m) {
+  return { name: m.name || m.id || m.model || "", contextWindow: m.contextWindow || m.context_window || null };
+}
 
-// ── 数据加载 ──
+/* ── toast / confirm(页面内反馈,替换原生 alert/confirm)── */
+function showToast(msg, kind) {
+  var root = document.getElementById("toastRoot"); if (!root) return;
+  root.innerHTML = '<div class="toast ' + (kind || "") + '">' + esc(msg) + '</div>';
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(function () { root.innerHTML = ""; }, 2600);
+}
+function askConfirm(title, msg) {
+  return new Promise(function (resolve) {
+    document.getElementById("cfTitle").textContent = title;
+    document.getElementById("cfMsg").textContent = msg;
+    state.confirmCb = resolve;
+    document.getElementById("confirmMask").style.display = "";
+  });
+}
+function closeConfirm() {
+  document.getElementById("confirmMask").style.display = "none";
+  state.confirmCb = null;
+}
+
+/* ── 数据加载 ── */
 function normProviders(d) {
   var arr = (d && d.providers) || (Array.isArray(d) ? d : []);
   return arr.filter(function (p) { return p && p.accessMode !== "official"; });
@@ -70,16 +108,19 @@ async function refreshDesktop() {
   try { state.dstate = await api.desktopState(); } catch (e) { state.dstate = null; }
 }
 async function refreshAccel() {
-  try { state.accel = await api.accelState(); } catch (e) { state.accel = state.accel || { mode: "off", customNode: "", lines: [], scopeNote: "", usage: { ok: false, degradedToDirect: false } }; }
+  try {
+    state.accel = await api.accelState();
+  } catch (e) {
+    state.accel = state.accel || { mode: "off", customNode: "", lines: [], scopeNote: "", usage: { ok: false, degradedToDirect: false } };
+  }
 }
 async function refreshSession() {
   try { state.session = await api.session(); } catch (e) { state.session = null; }
-  // 实时余额(auth/me;未登录/失败静默——顶栏显示 …)
   state.balance = null;
-  if (state.session && (state.session.loggedIn || state.session.authenticated)) {
+  if (loggedIn()) {
     try {
       var me = await api.me();
-      var u = (me && me.user) || {};
+      var u = (me && me.user) || me || {}; // 兼容 {user:{balance}} 与顶层 {balance}
       if (typeof u.balance === "number") state.balance = u.balance;
     } catch (e) { /* 下次刷新再试 */ }
   }
@@ -88,81 +129,205 @@ async function refreshAll() {
   await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel()]);
 }
 
-// ── 渲染 ──
+/* ── 渲染 ── */
+function renderNav() {
+  var noRail = state.agent !== "codex" || state.view === "history";
+  document.getElementById("frame").classList.toggle("no-rail", noRail);
+  document.querySelectorAll(".nav-btn.agent").forEach(function (b) {
+    b.classList.toggle("on", b.dataset.g === state.agent);
+  });
+  var hb = document.getElementById("nv-history");
+  if (hb) hb.classList.toggle("on", state.view === "history");
+  /* 网关 chip:地址 + 存活灯 */
+  var gw = (state.dstate && state.dstate.gateway) || null;
+  var chip = document.getElementById("gwChip");
+  if (chip) {
+    var led = chip.querySelector(".led");
+    chip.lastChild.textContent = " " + ((gw && gw.addr) || "127.0.0.1:8787");
+    if (led) led.classList.toggle("off", !(gw && gw.alive));
+  }
+  /* 托管 chip */
+  var h = hosting();
+  var hc = document.getElementById("hostChip");
+  if (hc) hc.textContent = (state.agent === "codex" && h && h.providerName) ? "托管 · " + h.providerName : "未托管";
+}
+function renderRail() {
+  var el = document.getElementById("railList"); if (!el) return;
+  if (!state.providers.length) {
+    el.innerHTML =
+      '<div class="rail-head"><span class="eyebrow">供应商</span><span class="tag">0</span></div>'
+      + '<div class="sub" style="padding:8px 2px">还没有供应商。<br>' + (loggedIn() ? "登录后一键导入,或点下方「＋ 新建」。" : "登录 2xapi 一键导入,或点下方「＋ 新建」。") + '</div>'
+      + '<button class="btn ghost" data-a="new" style="width:100%;margin-top:8px">＋ 新建供应商</button>';
+    return;
+  }
+  el.innerHTML =
+    '<div class="rail-head"><span class="eyebrow">供应商</span><span class="tag">共 ' + state.providers.length + '</span></div>'
+    + '<input class="rail-search" data-a="search" placeholder="筛选名称或地址…" value="' + esc(state.search) + '">'
+    + '<div id="railRows"></div>'
+    + '<button class="btn ghost" data-a="new" style="width:100%;margin-top:8px">＋ 新建供应商</button>'
+    + '<div class="sub" style="margin:8px 2px 0">点选即切换;✎ 编辑;详情操作在右侧。</div>';
+  renderRailRows();
+}
+function railRowsHtml() {
+  var q = state.search;
+  var list = state.providers.filter(function (p) {
+    return !q || (p.name || "").toLowerCase().includes(q) || (p.baseUrl || "").toLowerCase().includes(q);
+  });
+  if (!list.length) return '<div class="sub" style="padding:8px 2px">没有匹配的供应商。</div>';
+  return list.map(function (p) {
+    var i = state.providers.indexOf(p);
+    return '<button class="line-row ' + (p.id === state.selId ? "sel" : "") + '" style="--lc:' + chipColor(p, i) + '" data-a="sel" data-id="' + esc(p.id) + '">'
+      + '<span class="line-chip">' + esc(p.icon || String(i + 1)) + '</span><span class="nm">' + esc(p.name) + '</span>'
+      + (hostedBy(p.id) ? '<span class="tag on">托管中</span>' : '')
+      + '<span class="mini-op" data-a="edit" data-id="' + esc(p.id) + '" title="编辑">✎</span></button>';
+  }).join("");
+}
+function renderRailRows() {
+  var r = document.getElementById("railRows"); if (r) r.innerHTML = railRowsHtml();
+}
+function renderContent() {
+  var c = document.getElementById("content"); if (!c) return;
+  if (state.agent === "claude") c.innerHTML = claudeHtml();
+  else if (state.view === "history") c.innerHTML = historyHtml();
+  else c.innerHTML = dashHtml();
+}
+function renderTopAuth() {
+  var el = document.getElementById("topAuth"); if (!el) return;
+  if (!loggedIn()) {
+    el.innerHTML = '<button class="btn primary" data-a="login">登录 2xapi</button>'
+      + '<span class="chip" style="margin-left:6px">登录即自动引导导入你的 API Key</span>';
+    return;
+  }
+  var email = sessionEmail();
+  var initial = (email || "?").slice(0, 1).toUpperCase();
+  var bal = state.balance;
+  var balHtml;
+  if (!state.balShow) balHtml = '余额 <b>…</b>';
+  else if (bal == null) balHtml = '余额 <b>…</b>';
+  else if (bal < 1) balHtml = '余额 <b style="color:var(--c-err)">$' + bal.toFixed(2) + '</b>';
+  else balHtml = '余额 <b style="color:var(--c-official)">$' + bal.toFixed(2) + '</b>';
+  el.innerHTML = '<div class="userbox">'
+    + '<button class="avatar" data-a="user-menu" title="账号菜单">' + esc(initial) + '</button>'
+    + (state.menuOpen
+      ? '<div class="user-menu">'
+        + '<div class="um-head"><div class="um-ava">' + esc(initial) + '</div><div><div class="um-mail">' + esc(email) + '</div><div class="um-bal">' + balHtml + '</div></div></div>'
+        + '<button class="um-item primary-item" data-a="import-keys">⇭ 一键导入 Key<span class="um-sub">自动拉取账号下的 Key 建成供应商</span></button>'
+        + '<button class="um-item" data-a="settings-open">⚙ 设置<span class="um-sub">IP 管理 · 通用 · 高级</span></button>'
+        + '<button class="um-item" data-a="site">↗ 2xapi 官网<span class="um-sub">充值 / 管理 Key</span></button>'
+        + '<div class="um-sep"></div>'
+        + '<button class="um-item um-logout" data-a="logout">登出</button>'
+      + '</div>'
+      : '')
+    + '</div>';
+}
 function render() {
-  $("#app").innerHTML =
-    '<header class="topbar">'
-    + '<span class="brand"><span class="mark">2×</span>2xapi Codex Console</span>'
-    + '<span class="spacer"></span>'
-    + topChips()
-    + loginBtn()
-    + '</header>'
-    + '<div class="frame"><nav class="rail">' + rail() + '</nav><main class="content">' + mainPane() + '</main></div>'
-    + '<div class="foot-note">desktop-channel · 桌面版主通道 · 终端注入式方案已保存备用</div>'
-    + (state.modal ? modalHtml() : "")
-    + (state.confirmBox ? confirmHtml() : "")
-    + (state.toast ? '<div class="toast ' + state.toast.k + '">' + esc(state.toast.m) + '</div>' : "");
+  if (state.providers.length && !lineOf(state.selId)) {
+    var h = hosting();
+    state.selId = (h && h.providerId && lineOf(h.providerId)) ? h.providerId : state.providers[0].id;
+  }
+  renderNav();
+  if (state.agent === "codex" && state.view !== "history") renderRail();
+  renderContent();
+  renderTopAuth();
   assertRouteShape();
 }
-
-/* 通路图形状自检:节点数 = 连线数 + 1(原型踩过的坑) */
+/* 通路图形状自检:节点数 = 连线数 + 1 */
 function assertRouteShape() {
-  var st = document.querySelectorAll("#app .route > .st").length;
-  var lk = document.querySelectorAll("#app .route > .lk").length;
-  if (st !== lk + 1) console.warn("通路图形状异常: 节点 " + st + " ≠ 连线 " + lk + " + 1");
+  var st = document.querySelectorAll("#content .route > .st").length;
+  var lk = document.querySelectorAll("#content .route > .lk").length;
+  if (st && st !== lk + 1) console.warn("通路图形状异常: 节点 " + st + " ≠ 连线 " + lk + " + 1");
 }
 
-function topChips() {
-  var gw = (state.dstate && state.dstate.gateway) || null;
+/* ── 主卡 dash ── */
+function dashHtml() {
+  if (!state.providers.length) {
+    return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
+      + '<div style="font-size:30px">🚀</div>'
+      + '<h2 style="font-size:15px">开始使用 Codex</h2>'
+      + '<div class="sub" style="max-width:380px">还没有供应商。' + (loggedIn() ? '点「导入 Key」自动生成供应商,' : '登录 2xapi 后一键导入 Key,') + '或手动添加一个中转站。</div>'
+      + '<div class="btn-row" style="justify-content:center">'
+      + (loggedIn() ? '<button class="btn primary" data-a="import-keys">⇭ 导入 Key</button>' : '<button class="btn primary" data-a="login">登录 2xapi</button>')
+      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>';
+  }
   var h = hosting();
-  var hasOff = state.dstate && state.dstate.hasOfficial;
-  var label;
-  if (h && h.way === "gateway") {
-    label = "桌面版:已托管 · " + (hasOff ? "混入" : "纯API") + " · " + esc(h.providerName || (lineOf(h.providerId) || {}).name || "");
-  } else if (hasOff) {
-    label = "桌面版:官方";
-  } else {
-    label = "桌面版:未配置";
-  }
-  return '<span class="gw-chip ' + (gw && gw.alive ? "alive" : "") + '"><span class="led"></span>gateway ' + (gw ? esc(gw.addr) : "127.0.0.1:8787") + '</span>'
-    + '<span class="gw-chip ' + (h && h.way === "gateway" ? "on" : "") + '">' + label + '</span>';
-}
-function loginBtn() {
-  var s = state.session;
-  // /api/session 形态:{authenticated, user:{email,...}}(兼容旧 loggedIn/email 顶层字段)
-  var logged = !!(s && (s.authenticated || s.loggedIn || s.email || (s.user && s.user.email)));
-  if (!logged) return '<button class="btn ghost" data-a="login">登录 2xapi</button>';
-  var dispEmail = (s.user && s.user.email) || s.email || "已登录";
-  // 余额 chip(实时,拉不到显示 …;低额警示色)
-  var bal = state.balance;
-  var balChip;
-  if (bal == null) {
-    balChip = '<span class="gw-chip">$…</span>';
-  } else {
-    var low = bal < 1;
-    balChip = '<span class="gw-chip" style="' + (low ? "border-color:var(--c-err);color:var(--c-err)" : "") + '" title="2xapi 账号余额">' + (bal < 0 ? "-" : "") + "$" + Math.abs(bal).toFixed(2) + "</span>";
-  }
-  return balChip
-    + '<button class="btn ghost" data-a="import">⇩ 导入 Key</button>'
-    + '<button class="btn ghost" data-a="logout">' + esc(dispEmail) + " · 登出</button>";
-}
+  var hp = h ? lineOf(h.providerId) : null;
+  var acc = state.accel || {};
+  var accelMode = acc.mode || "off";
+  var accelOn = accelMode !== "off";
+  var hasOff = !!(state.dstate && state.dstate.hasOfficial);
 
-function rail() {
-  var rows = state.providers.map(function (p, i) {
-    var isHost = hostedBy(p.id);
-    return '<button class="line-row ' + (p.id === state.selId ? "sel" : "") + '" style="--lc:' + chipColor(p, i) + '" data-a="sel" data-id="' + esc(p.id) + '">'
-      + '<span class="chip">' + esc(p.icon || String(i + 1)) + '</span><span class="nm">' + esc(p.name) + '</span>'
-      + (isHost
-        ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">托管中</span>'
-        : '<span class="tag">' + (p.wireApi === "chat_completions" ? "chat" : "responses") + '</span>')
-      + '</button>';
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var r, note;
+  if (!hp) {
+    r = st("var(--c-official)", "桌面版 Codex", "官方登录") + lk("var(--c-official)") + st("var(--c-official)", "官方 OpenAI", "chatgpt 登录");
+    note = '当前:官方直连 · 选一个供应商并「开启托管」即可走中转';
+  } else if (!accelOn) {
+    r = st("var(--c-gw)", "桌面版 Codex", "官方登录保留") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787") + lk("var(--c-gw)") + st(chipColor(hp, state.providers.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关(加速已关,直发上游) · 配置零 Key,Key 由网关注入';
+  } else {
+    r = st("var(--c-gw)", "桌面版 Codex", "官方登录保留") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787")
+      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, state.providers.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关 + 加速(已启用线路自动择优,失败自动切换) · 配置零 Key,Key 由网关注入';
+  }
+  /* scope 提示条(琥珀,后端给定文案) */
+  var scopeHtml = "";
+  if (hp && accelOn && acc.scopeNote) {
+    scopeHtml = '<div style="margin:8px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ ' + esc(acc.scopeNote) + '</div>';
+  }
+  var usage = (acc.usage && acc.usage.ok) ? acc.usage : null;
+  if (hp && accelOn && usage && usage.degradedToDirect) {
+    scopeHtml += '<div style="margin:6px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ 官方加速配额已用满,已自动切换直连;可在 ⚙ 设置 → IP 管理 刷新凭证重试。</div>';
+  }
+  var selVal = hp ? hp.id : state.selId;
+  var opts = state.providers.map(function (x) {
+    return '<option value="' + esc(x.id) + '"' + (x.id === selVal ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
   }).join("");
-  return '<div class="eyebrow">供应商</div>' + (rows || '<div class="sub" style="margin:4px 8px 10px">还没有供应商,点下方新建</div>')
-    + '<button class="btn ghost new" data-a="new">＋ 新建供应商</button>'
-    + '<div class="rail-foot"><a data-a="tool" data-t="history">历史会话</a><a data-a="tool" data-t="settings">本机设置</a></div>';
+  var p = lineOf(state.selId) || hp;
+
+  var html = '<section class="card"><h2>桌面版 Codex(ChatGPT.app)· 主通道</h2>'
+    + '<div class="detect">'
+    + (hasOff
+      ? '<span class="tag on">检测:官方登录 ✓ → 混入模式</span>'
+      : '<span class="tag">检测:未检出官方登录 → 纯 API 模式</span>')
+    + (hp ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">已托管 · ' + esc(hp.name) + '</span>' : '<span class="tag">未托管</span>')
+    + '</div>'
+    + '<div class="route">' + r + '</div>'
+    + '<div class="route-mode"><span class="k">●</span> ' + note + '</div>'
+    + scopeHtml
+    + '<div class="grid2">'
+    + '<div class="f"><label>通路方式</label><div class="seg"><button disabled style="--lc:var(--c-direct)">直连<small>即将支持</small></button><button aria-pressed="true" style="--lc:var(--c-gw)">网关 + 加速<small>零 Key(默认)</small></button></div></div>'
+    + '<div class="f"><label>加速</label><div style="display:flex;gap:6px;align-items:center">'
+    + '<div class="seg" style="flex:1">'
+    + '<button data-a="accel" data-m="off" aria-pressed="' + (!accelOn) + '" style="--lc:var(--muted)">关</button>'
+    + '<button data-a="accel" data-m="on" aria-pressed="' + (accelOn) + '" style="--lc:var(--c-accel)">开<small>自动择优</small></button></div>'
+    + '</div><div class="sub" style="margin-top:2px">线路在 左下 ⚙ 设置 → IP 管理 里维护</div></div>'
+    + '<div class="f"><label>供应商(走哪家中转)</label><select id="provSel" data-a="prov">' + opts + '</select></div>'
+    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">' + (hp ? "网关 · 配置零 Key" : "未托管") + '</span></div></div>'
+    + '</div>'
+    + '<div class="btn-row">'
+    + (hp ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>还原官方</button>'
+      : '<button class="btn primary" data-a="host-on"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
+    + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
+    + '</div><div id="rtest"></div></section>';
+  if (p) {
+    html += '<section class="card"><div class="eyebrow" style="margin:0 0 2px">供应商详情 · ' + esc(p.name) + (hostedBy(p.id) ? ' <span class="tag on">托管中</span>' : '') + '</div>'
+      + '<div class="kv">'
+      + '<div><div class="k">上游地址</div><div class="v mono">' + esc(p.baseUrl) + '</div></div>'
+      + '<div><div class="k">api key</div><div class="v mono">' + esc(p.apiKeyMasked || "—") + '</div></div>'
+      + '<div><div class="k">协议</div><div class="v mono">' + (p.wireApi === "chat_completions" ? "chat" : "responses") + '</div></div>'
+      + '<div><div class="k">默认模型</div><div class="v mono">' + esc(p.model || "—") + '</div></div>'
+      + '</div>'
+      + '<div class="btn-row"><button class="btn primary" data-a="edit" data-id="' + esc(p.id) + '">编辑</button><button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
+      + (hostedBy(p.id) ? '<button class="btn ghost" disabled>删除(托管中)</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>')
+      + '</div></section>';
+    if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
+  }
+  if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
+  return html;
 }
 
-/* 测试连接结果渲染(state.test: null | {busy:true} | {ok:true, data} | {ok:false, msg, field}) */
+/* 测试连接:三段 steps(密钥 / 协议 / 建议) */
 function testStepsHtml() {
   var t = state.test;
   var step = function (icon, text, meta, bad) {
@@ -172,28 +337,19 @@ function testStepsHtml() {
     return '<div id="rtest"><div class="steps" style="margin-top:12px">' + step("⟳", "测试连接进行中…", "密钥/协议/建议") + "</div></div>";
   }
   if (!t.ok) {
-    // 失败:人话提示 + 高亮来源(连接=地址字段,认证=Key 字段)
-    return '<div id="rtest"><div class="steps" style="margin-top:12px">'
-      + step("✗", t.msg || "测试连接失败", t.meta, true)
-      + "</div></div>";
+    return '<div id="rtest"><div class="steps" style="margin-top:12px">' + step("✗", t.msg || "测试连接失败", "", true) + "</div></div>";
   }
   var d = t.data;
   var steps = [];
-  steps.push(step(d.keyOk ? "✓" : "✗", d.keyOk ? "密钥有效" : "密钥无效", (d.keyOk ? (d.models.length + " 个模型") : "") + " · " + d.latencyMs + "ms", !d.keyOk));
+  steps.push(step(d.keyOk ? "✓" : "✗", d.keyOk ? "密钥有效" : "密钥无效", (d.keyOk ? ((d.models || []).length + " 个模型") : "") + " · " + (d.latencyMs != null ? d.latencyMs + "ms" : ""), !d.keyOk));
   var proto = d.responsesCompat ? "Responses 兼容" : (d.chatOk ? "仅 Chat(网关自动转换)" : "协议未测出");
   steps.push(step((d.responsesCompat || d.chatOk) ? "✓" : "✗", "协议判定:" + proto, d.responsesCompat ? "免转换" : (d.chatOk ? "需经网关转换" : ""), !(d.responsesCompat || d.chatOk)));
-  if (d.suggest === "gateway") {
-    steps.push(step("⚡", "建议方式:网关(推荐,零落盘)", "可一键开启托管"));
-  } else if (d.error) {
-    steps.push(step("✗", "无可用接入方式", d.error, true));
-  } else {
-    steps.push(step("⚡", "建议方式:网关", ""));
-  }
+  if (d.suggest === "gateway") steps.push(step("⚡", "建议方式:网关(推荐,零落盘)", "可一键开启托管"));
+  else if (d.error) steps.push(step("✗", "无可用接入方式", d.error, true));
+  else steps.push(step("⚡", "建议方式:网关", ""));
   return '<div id="rtest"><div class="steps" style="margin-top:12px">' + steps.join("") + "</div></div>";
 }
-
 async function doTestConnection() {
-  // 测当前选中供应商(未托管时主卡下拉即选中者;托管中测托管者)
   var pid = (hosting() && hosting().providerId) || state.selId;
   if (!pid) { showToast("请先选择或新建一个供应商", "error"); return; }
   state.test = { busy: true }; render();
@@ -201,273 +357,55 @@ async function doTestConnection() {
     var d = await api.preflight({ providerId: pid });
     state.test = { ok: true, data: d };
   } catch (e) {
-    state.test = { ok: false, msg: e.message, meta: "请求失败" };
+    state.test = { ok: false, msg: e.message };
   }
   render();
 }
 
-/* ── 桌面版主卡:账号状态自动检测 × 通路(网关 + 加速三态:关/官方线路/我的节点,阶段 4) ── */
-function desktopCard() {
-  var d = state.dstate || {};
-  var hasOff = !!d.hasOfficial;
-  var h = hosting();
-  var isHost = !!(h && h.way === "gateway");
-  var p = lineOf(state.selId) || lineOf(h && h.providerId);
-  var modeName = hasOff ? "混入模式" : "纯 API 模式";
-  var acctSub = hasOff ? "官方登录保留" : "纯 API · 无官方账号";
-
-  var acc = state.accel || {};
-  var accelMode = acc.mode || "off";                       // off | official | custom
-  var accelLabel = accelMode === "official" ? "官方线路" : "我的节点";
-  var accelOn = accelMode !== "off" && (accelMode === "official" || !!acc.customNode); // 是否走加速节点
-  var usage = (acc.usage && acc.usage.ok) ? acc.usage : null; // 每账号凭证用量;未换取成功/缺省(ok:false)→ 不显示
-
-  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
-  var lk = function (c, live) { return '<div class="lk ' + (live ? "live" : "") + '" style="--lc:' + c + '"></div>'; };
-
-  var route, note, mech;
-  if (!isHost) {
-    route = st("var(--c-official)", "桌面版 Codex", hasOff ? "官方登录" : "未配置")
-      + lk("var(--c-official)", false)
-      + st("var(--c-official)", hasOff ? "官方 OpenAI" : "不可用", hasOff ? "chatgpt 登录" : "无官方登录");
-    note = '<div class="route-mode"><span class="k" style="color:var(--c-official)">●</span>'
-      + (hasOff ? "当前:官方直连 · 点下方按钮开启走中转" : "当前:未配置(无官方登录,官方通道不可用)· 开启托管后走中转") + '</div>';
-    mech = hasOff
-      ? '<span>官方登录 · 官方额度</span><span>未做任何修改</span>'
-      : '<span>无官方登录</span><span>未做任何修改</span>';
-  } else {
-    route = st("var(--c-gw)", "桌面版 Codex", acctSub)
-      + lk("var(--c-gw)", true)
-      + st("var(--c-gw)", "网关", "127.0.0.1:8787")
-      + (accelOn
-        ? lk("var(--c-accel)", true) + st("var(--c-accel)", "加速节点", accelLabel) + lk("var(--c-accel)", true)
-        : lk("var(--c-gw)", true))
-      + st(p ? chipColor(p, state.providers.indexOf(p)) : "var(--c-gw)", esc(p ? p.name : "?"), "中转站");
-    note = '<div class="route-mode"><span class="k">●</span>通路二:网关' + (accelOn ? " + 加速(" + accelLabel + ")" : "(加速已关,直发上游)") + ' · 配置文件零 Key,Key 由网关注入 · ' + modeName + '</div>'
-      + (accelMode === "official" && acc.scopeNote ? '<div class="notice" style="margin:0 0 10px">' + esc(acc.scopeNote) + '</div>' : "")
-      + (usage && usage.degradedToDirect
-        ? '<div class="notice" style="margin:0 0 10px">⚠ 官方加速配额已用满,已自动切换直连;点「刷新凭证」重试或等待配额恢复</div>'
-        : "");
-    mech = (hasOff ? '<span>① 官方登录/插件保留</span>' : '<span>① 无需官方账号</span>')
-      + '<span>② 配置文件零 Key</span><span>③ 协议转换 · chat 中转可用</span>'
-      + '<span>④ 加速:' + (accelMode === "off" ? "关" : accelLabel) + '</span><span>依赖本 app 常驻</span>';
-  }
-
-  var opts = state.providers.map(function (x) {
-    return '<option value="' + esc(x.id) + '"' + (x.id === state.selId ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
-  }).join("");
-  var hostPid = isHost ? (h.providerId || state.selId) : state.selId;
-
-  return '<section class="card"><h2>桌面版 Codex(ChatGPT.app)· 主通道</h2>'
-    + '<div class="sub">一键走中转;账号状态自动检测(<b>有官方账号 → 混入模式,登录保留</b>;无账号 → 纯 API 模式),全程自动备份、一键还原。</div>'
-    + '<div style="display:flex;align-items:center;gap:8px;margin:0 0 10px">'
-    + '<span class="tag" style="' + (hasOff ? "border-color:var(--c-official);color:var(--c-official)" : "") + '">检测:官方登录 ' + (hasOff ? "✓" : "未检出") + ' → ' + modeName + '</span>'
-    + '</div>'
-    + '<div class="route">' + route + '</div>'
-    + note
-    + '<div class="mech">' + mech + '</div>'
-    + '<div class="grid">'
-    + '<div class="f full"><label>通路方式</label><div class="seg">'
-    + '<button data-a="way" data-w="direct" aria-pressed="false" style="--lc:var(--c-direct)" disabled>直连 API 端点<small>即将支持 · 不依赖本 app</small></button>'
-    + '<button data-a="way" data-w="gateway" aria-pressed="true" style="--lc:var(--c-gw)"' + (isHost ? "" : " disabled") + '>网关(推荐)<small>零落盘 · 加速可开关</small></button>'
-    + '</div>'
-    + (isHost
-      ? '<div class="seg" style="margin-top:8px;max-width:460px">'
-        + '<button data-a="accel" data-m="off" aria-pressed="' + (accelMode === "off") + '" style="--lc:var(--muted)">加速:关<small>网关直发上游</small></button>'
-        + '<button data-a="accel" data-m="official" aria-pressed="' + (accelMode === "official") + '" style="--lc:var(--c-accel)">官方线路<small>2xapi 站专用 · 自动可用</small></button>'
-        + '<button data-a="accel" data-m="custom" aria-pressed="' + (accelMode === "custom") + '" style="--lc:var(--c-accel)"' + (acc.customNode ? "" : " disabled") + '>我的节点<small>自己的 VPS / 本地代理</small></button>'
-        + '</div>'
-        + (accelMode === "official" && usage
-          ? '<div class="hint" style="margin:6px 0 0' + (usage.quotaPercent >= 0.9 ? ";color:var(--c-err)" : "") + '">官方线路用量 ' + fmtGb(usage.quotaUsedBytes) + " G / " + fmtQuotaTotalGb(usage.quotaTotalBytes) + " G</div>"
-          : "")
-      : "")
-    + '</div>'
-    + '<div class="f"><label>供应商(走哪家中转)</label><select data-a="lsel"' + (state.providers.length ? "" : " disabled") + '>'
-    + (opts || '<option value="">先新建供应商</option>') + '</select><div class="hint">切换即时生效,无需重启桌面版</div></div>'
-    + '<div class="f"><label>状态</label><div style="padding:9px 0;font-size:13px">'
-    + (isHost
-      ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">已托管 · ' + modeName + '</span> <span class="hint">网关 · 配置零 Key</span>'
-      : '<span class="tag">' + (hasOff ? "未托管 · 走官方" : "未托管 · 未配置") + '</span>')
-    + '</div></div>'
-    + '</div>'
-    + '<div class="btn-row" style="margin-top:14px">'
-    + (isHost
-      ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>' + (hasOff ? "还原官方" : "关闭托管(移除中转配置)") + (state.busy === "unhost" ? "…" : "") + '</button>'
-      : '<button class="btn primary" data-a="host"' + (!hostPid || state.busy === "host" ? " disabled" : "") + ' style="--lc:var(--c-gw)">开启:桌面版走中转' + (state.busy === "host" ? "…" : "") + '</button>')
-    + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? ' disabled' : '') + '>⚡ 测试连接</button>'
-    + '</div>'
-    + (state.test ? testStepsHtml() : '<div id="rtest"></div>')
-    + '</section>';
-}
-
-/* ── CLI 注入式:方案已保存,本版不启用 ── */
-function cliBackupCard() {
-  return '<section class="card"><details>'
-    + '<summary>终端注入式启动器(Codex CLI)· 方案已保存,本版暂不启用</summary>'
-    + '<div class="sub" style="margin-top:10px">点一下即开终端版 Codex:零写入、多供应商并行、可同时开多个。完整设计见方案 v3(-c 参数覆盖 / 真 home / 密钥即焚),界面与代码均已备,后续按需启用。</div>'
-    + '<button class="btn" disabled>▶ 启动 Codex(终端版)· 暂未启用</button>'
-    + '</details></section>';
-}
-
-/* ── 供应商详情 / 编辑 ── */
-function detailCard() {
-  if (state.mode === "edit") return editCard();
-  var p = lineOf(state.selId);
-  if (!p) return "";
-  var kv = function (k, v, mono) {
-    return '<div><div class="k">' + k + '</div><div class="v ' + (mono ? "mono" : "") + '">' + esc(v == null || v === "" ? "—" : v) + '</div></div>';
-  };
-  var isHost = hostedBy(p.id);
-  var html = '<section class="card"><div class="eyebrow" style="margin:0 0 8px">供应商详情 · ' + esc(p.name) + (isHost ? ' <span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">桌面版托管中</span>' : "") + '</div>'
-    + '<div class="kv">'
-    + kv("上游地址", p.baseUrl, true)
-    + kv("API Key", p.apiKeyMasked || "—", true)
-    + kv("协议", p.wireApi === "chat_completions" ? "chat(自动经网关转换)" : "responses", true)
-    + kv("默认模型", p.model, true)
-    + kv("模型数", (p.models || []).length || "—", true)
-    + kv("思考档位", (p.reasoning_levels || []).join(" / ") || "—", true)
-    + kv("备注", p.notes)
-    + "</div>"
-    + '<div class="btn-row">'
-    + (isHost ? '<button class="btn" disabled>✓ 桌面版正在使用</button>' : '<button class="btn primary" data-a="use-line">▶ 桌面版改用这条线</button>')
-    + '<button class="btn" data-a="edit">编辑</button>'
-    + '<button class="btn" data-a="diag">' + (state.diag ? "收起诊断" : "诊断") + '</button>'
-    + '<button class="btn ghost" data-a="snippet">复制 config 片段(进阶)</button>'
-    + '<button class="btn ghost danger" data-a="del">删除</button>'
-    + '</div>'
-    + '<div class="sub" style="margin:10px 0 0">「复制片段」给愿意手动配置的用户;普通用户点上方按钮即可,一切自动。</div>'
-    + "</section>";
-  if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
-  return html;
-}
-
 function diagCard(d) {
+  var ok = function (b) { return b ? "✓" : "✗"; };
+  var cls = function (b) { return b ? "" : " bad"; };
   if (!d) {
-    // 诊断进行中(diagnose 含真实网络请求,可达数秒):占位而非空卡
     return '<section class="card"><div class="eyebrow" style="margin:0 0 10px">诊断 / doctor</div><div class="steps" style="margin-top:0">'
       + '<div class="step">⟳ 诊断进行中…<span class="meta">连接测试 + 真实请求</span></div></div></section>';
   }
-  var ok = function (b) { return b ? "✓" : "✗"; };
-  var cls = function (b) { return b ? "" : " bad"; };
   var errs = (d.errors || []).map(function (e) { return esc(e.message || e.msg || String(e)); }).join(";");
   return '<section class="card"><div class="eyebrow" style="margin:0 0 10px">诊断 / doctor</div><div class="steps" style="margin-top:0">'
     + '<div class="step' + cls(d.configValid) + '">' + ok(d.configValid) + ' 配置校验<span class="meta">' + (d.configValid ? "pass" : "fail") + '</span></div>'
     + '<div class="step' + cls(d.reachable) + '">' + ok(d.reachable) + ' 连接测试<span class="meta">' + (d.reachable ? ((d.latencyMs != null ? d.latencyMs + "ms · " : "") + (d.models || []).length + " models") : "不通") + '</span></div>'
     + '<div class="step' + cls(d.testOk) + '">' + ok(d.testOk) + ' 真实请求<span class="meta">' + (d.testOk ? "pass" : "fail") + '</span></div>'
-    + '</div>'
-    + (errs ? '<div class="notice">' + errs + '</div>' : "")
+    + '</div>' + (errs ? '<div style="margin:8px 0 0;padding:8px 10px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.4);border-radius:8px;font-size:11.5px;color:#FFBAB4">' + errs + '</div>' : "")
     + '</section>';
 }
 
-function editCard() {
-  var d = state.draft;
-  var fe = function (f) { return state.fieldErrors[f] ? '<div class="err">' + esc(state.fieldErrors[f]) + '</div>' : ""; };
-  var fc = function (f) { return state.fieldErrors[f] ? " has-err" : ""; };
-  var rows = (d.models || []).map(function (x, i) {
-    return '<tr><td><input data-mf="name" data-mi="' + i + '" value="' + esc(x.name || "") + '"></td>'
-      + '<td><input data-mf="cw" data-mi="' + i + '" style="width:90px" value="' + esc(x.contextWindow || "") + '"></td>'
-      + '<td><button class="btn ghost danger" data-a="mrow-del" data-i="' + i + '">✕</button></td></tr>';
-  }).join("");
-  // 思考档位标签:探测到的档位;无则「—」
-  var rl = (d.reasoning_levels || []).filter(function (x) { return x; });
-  var rlBar = '<div class="rl-bar"><span class="k">思考档位</span>'
-    + (rl.length ? rl.map(function (x) { return '<span class="rl-tag">' + esc(x) + '</span>'; }).join("")
-      : '<span class="rl-muted">—</span>')
-    + '</div>';
-  var wireSel = d.wireApi === "chat_completions" ? "chat_completions" : "responses";
-  // 推理强度下拉:自动(跟随探测) + 五档;回显草稿里选中的档位
-  var rlCur = d.reasoningLevelSel || "";
-  var rlOpts = [["", "自动(跟随探测)"], ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"]]
-    .map(function (o) { return '<option value="' + o[0] + '"' + (rlCur === o[0] ? " selected" : "") + '>' + o[1] + '</option>'; }).join("");
-  return '<section class="card"><h2>' + (state.isNew ? "新建供应商" : "编辑供应商 · " + esc(d.name)) + '</h2>'
-    + '<div class="sub">填好地址和 Key,点「拉取模型」自动获取模型列表;Key 只存在本软件里,不写入任何配置文件。</div>'
-    + '<div class="grid">'
-    + '<div class="f full' + fc("name") + '"><label>名称 *</label><input data-f="name" value="' + esc(d.name || "") + '">' + fe("name") + '</div>'
-    + '<div class="f full' + fc("baseUrl") + '"><label>上游地址 *</label><input class="mono" data-f="baseUrl" value="' + esc(d.baseUrl || "") + '" placeholder="https://api.example.com">' + fe("baseUrl") + '</div>'
-    + '<div class="f full' + fc("apiKey") + '"><label>api key' + (state.isNew ? " *" : " · 留空不修改") + '</label><input type="password" class="mono" data-f="apiKey" placeholder="' + (state.isNew ? "sk-..." : (d.apiKeyMasked ? "•••• 未改则留空" : "sk-...")) + '" value="">' + fe("apiKey") + '</div>'
-    + '<div class="f' + fc("model") + '"><label>默认模型 *</label><input class="mono" data-f="model" value="' + esc(d.model || "") + '" placeholder="点「拉取模型」后自动填入">' + fe("model") + '</div>'
-    + "</div>"
-    + '<div class="eyebrow" style="margin:16px 0 6px">模型列表(「拉取模型」自动填写,一般无需手改)</div>'
-    + rlBar
-    + '<table class="mtable"><thead><tr><th>模型名</th><th>上下文</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>'
-    + '<div class="btn-row">'
-    + '<button class="btn ghost" data-a="mfetch"' + (state.busy === "mfetch" ? " disabled" : '') + '>' + (state.busy === "mfetch" ? "拉取中…" : "⤓ 拉取模型") + '</button>'
-    + '<button class="btn ghost" data-a="mrow-add">＋ 手动加一行</button>'
-    + '</div>'
-    + '<details style="margin-top:10px"><summary>高级(协议 · 代理 · 超时 · 推理强度 · 备注)· 不用动</summary><div class="grid" style="margin-top:10px">'
-    + '<div class="f"><label>协议</label><select data-f="wireSel"><option value="auto"' + (d.wireSelUi !== wireSel ? " selected" : "") + '>自动(拉取模型时检测)</option><option value="responses"' + (d.wireSelUi === "responses" ? " selected" : "") + '>Responses</option><option value="chat_completions"' + (d.wireSelUi === "chat_completions" ? " selected" : "") + '>ChatCompletions</option></select><div class="hint">不确定就保持「自动」</div></div>'
-    + '<div class="f"><label>推理强度</label><select data-f="reasoningLevel">' + rlOpts + '</select><div class="hint">选具体档位 = 该供应商默认思考档位;「自动」= 跟随探测</div></div>'
-    + '<div class="f"><label>HTTP 代理</label><input class="mono" data-f="proxyUrl" value="' + esc(d.proxyUrl || "") + '" placeholder="http://127.0.0.1:7890"></div>'
-    + '<div class="f"><label>超时(秒)</label><input type="number" data-f="timeoutSecs" value="' + esc(d.timeoutSecs || "") + '"></div>'
-    + '<div class="f full"><label>备注</label><input data-f="notes" value="' + esc(d.notes || "") + '"></div>'
-    + '</div></details>'
-    + '<div class="btn-row" style="margin-top:16px">'
-    + '<button class="btn primary" data-a="save"' + (state.busy === "save" ? " disabled" : "") + '>保存</button>'
-    + '<button class="btn ghost" data-a="cancel">取消</button>'
-    + '</div>'
-    + "</section>";
-}
-
-function mainPane() { return desktopCard() + cliBackupCard() + detailCard(); }
-
-/* ── 历史会话面板(阶段 3):列表/按供应商筛选/立刻修复/自动修复开关 ── */
-function fmtTime(ms) {
-  if (!ms) return "—";
-  var d = new Date(ms);
-  var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
-  var today = new Date();
-  var sameDay = d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate();
-  var hh = pad(d.getHours()) + ":" + pad(d.getMinutes());
-  if (sameDay) return "今天 " + hh;
-  return (d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hh;
-}
-function historyPane() {
+/* ── 历史会话视图 ── */
+function historyHtml() {
   var s = state.sessions;
   var listHtml;
-  if (state.sessionsRepairing) {
-    listHtml = '<div class="sub">正在对账会话…(先整库备份,再核对会话文件)</div>';
-  } else if (s === null) {
-    listHtml = '<div class="sub">加载中…</div>';
-  } else if (!s.length) {
-    listHtml = '<div class="sub">没有会话记录' + (state.sessionsProvider ? "(已按供应商筛选)" : "") + "</div>";
-  } else {
-    var rows = s.map(function (it) {
+  if (state.sessionsRepairing) listHtml = '<div class="sub">正在对账会话…(先整库备份,再核对会话文件)</div>';
+  else if (s === null) listHtml = '<div class="sub">加载中…</div>';
+  else if (!s.length) listHtml = '<div class="sub">没有会话记录。</div>';
+  else {
+    listHtml = s.map(function (it) {
       var tagColor = it.providerTag === "unknown" ? "" : 'style="border-color:var(--c-gw);color:var(--c-gw)"';
-      return '<div class="run"><div class="what"><b>' + esc(it.title || "(无标题)") + '</b>'
-        + '<span><span class="tag" ' + tagColor + '>' + esc(it.providerTag) + "</span>"
-        + (it.missing ? ' <span class="tag" style="border-color:var(--c-err);color:var(--c-err)">会话文件缺失</span>' : "")
-        + " · " + esc(fmtTime(it.updatedAt))
-        + (it.cwd ? " · " + esc(it.cwd) : "") + "</span></div>"
-        + '<button class="btn ghost" data-a="sess-continue" data-i="' + it.id + '">继续</button></div>';
+      return '<div class="hist-row"><b>' + esc(it.title || "(无标题)") + '</b>'
+        + '<span class="meta">' + esc(it.providerTag) + ' · ' + esc(fmtTime(it.updatedAt)) + (it.cwd ? " · " + esc(it.cwd) : "") + '</span>'
+        + '<span class="tag" ' + tagColor + '>' + esc(it.providerTag) + '</span>'
+        + '<button class="btn sm ghost" data-a="sess-continue" data-i="' + esc(it.id) + '">继续</button></div>';
     }).join("");
-    listHtml = rows;
   }
-  var providers = (state.providers || []).map(function (p) { return p.name; });
-  providers = providers.concat(["custom", "2xapi"]);
-  var unique = Array.from(new Set(providers));
-  var filterOpts = '<option value="">全部供应商</option>' + unique.map(function (n) {
-    return '<option value="' + esc(n) + '"' + (n === state.sessionsProvider ? " selected" : "") + ">" + esc(n) + "</option>";
-  }).join("");
   var autoOn = !!(state.sessionsSettings && state.sessionsSettings.autoRepairBeforeHost);
-  return '<div class="sub" style="margin-bottom:4px">Codex 对话记录(~/.codex 统一保存):共 <b>' + state.sessionsTotal + "</b> 条。</div>"
-    + '<div style="display:flex;gap:8px;align-items:center;margin:0 0 10px;flex-wrap:wrap">'
-    + '<select data-a="sess-filter" style="flex:1;min-width:140px;padding:7px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:8px;color:var(--text);font-size:12.5px">' + filterOpts + "</select>"
-    + '<button class="btn ghost" data-a="sess-repair"' + (state.sessionsRepairing ? " disabled" : "") + '>' + (state.sessionsRepairing ? "修复中…" : "立刻修复") + "</button>"
-    + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer"><input type="checkbox" data-a="sess-autofix"' + (autoOn ? " checked" : "") + ">启动前自动修复</label>"
-    + "</div>"
-    + listHtml
-    + (state.sessionsPage > 1 ? '<div class="btn-row" style="margin-top:8px"><button class="btn ghost" data-a="sess-prev">← 上一页</button></div>' : "");
+  return '<section class="card" style="min-height:100%"><h2>历史会话</h2>'
+    + '<div class="sub">Codex 对话记录(~/.codex 统一保存);修复前自动备份。共 <b>' + state.sessionsTotal + '</b> 条。</div>'
+    + '<div class="btn-row">'
+    + '<button class="btn ghost" data-a="sess-repair"' + (state.sessionsRepairing ? " disabled" : "") + '>' + (state.sessionsRepairing ? "修复中…" : "立刻修复历史会话") + '</button>'
+    + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;padding:3px 0"><input type="checkbox" data-a="sess-autofix"' + (autoOn ? " checked" : "") + '>启动前自动修复</label>'
+    + '</div>'
+    + '<div style="margin-top:10px">' + listHtml + '</div></section>';
 }
-
-async function openHistoryModal() {
-  state.modal = { kind: "tool", t: "history" };
-  render();
-  await Promise.all([loadSessions(), api.sessionsSettings().then(function (d) { state.sessionsSettings = d; render(); }).catch(function () {})]);
-}
-
 async function loadSessions() {
   try {
-    var d = await api.sessions(state.sessionsPage, 50, state.sessionsProvider);
+    var d = await api.sessions(1, 50, "");
     state.sessions = d.items || [];
     state.sessionsTotal = d.total || 0;
   } catch (e) {
@@ -476,284 +414,127 @@ async function loadSessions() {
   }
   render();
 }
-
+async function loadSessionsSettings() {
+  try { state.sessionsSettings = await api.sessionsSettings(); } catch (e) { state.sessionsSettings = null; }
+  render();
+}
 async function doSessionsRepair() {
   state.sessionsRepairing = true; render();
   try {
     var d = await api.sessionsRepair();
     showToast("修复完成:对账 " + d.scanned + " 条,修正 " + d.fixed + " 条(已先备份)", "ok");
-  } catch (e) {
-    showToast("修复失败:" + e.message, "error");
-  }
+  } catch (e) { showToast("修复失败:" + e.message, "error"); }
   state.sessionsRepairing = false;
   await loadSessions();
 }
 
-/* ── 弹窗 ── */
-function confirmHtml() {
-  return '<div class="mask" style="z-index:70" data-a="cno"><div class="box" style="width:330px"><div style="margin-bottom:16px">' + esc(state.confirmBox.msg) + '</div><div class="btn-row" style="margin:0"><button class="btn danger" data-a="cyes">删除</button><button class="btn ghost" data-a="cno">取消</button></div></div></div>';
-}
-function modalHtml() {
-  var m = state.modal;
-  if (m.kind === "login") {
-    return '<div class="mask" data-a="mclose"><div class="box" style="width:350px"><h2 style="margin:0 0 4px;font-size:15px">登录 2xapi 账号</h2>'
-      + '<div class="sub">登录后可一键导入你的 Key 和供应商</div>'
-      + (captchaCfg.enabled ? '<div class="hint" style="margin:0 0 6px;color:var(--c-direct)">该站点开启了登录验证,点「登录」后请完成滑块验证</div>' : "")
-      + '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail || "") + '"></div>'
-      + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password" value="' + esc(state.loginPassword || "") + '"></div>'
-      + '<label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer;margin:2px 0 8px"><input type="checkbox" data-l="remember" checked>记住我(保持登录,过期自动续期;滑块只需这一次)</label>'
-      + (state.loginError ? '<div class="err" style="color:var(--c-err);font-size:12px">' + esc(state.loginError) + '</div>' : "")
-      + '<div class="btn-row"><button class="btn primary" data-a="do-login">登录</button><button class="btn ghost" data-a="mclose">取消</button></div></div></div>';
-  }
-  if (m.kind === "snippet") {
-    return '<div class="mask" data-a="mclose"><div class="box"><h2 style="margin:0 0 4px;font-size:15px">config 片段(进阶,可选)</h2>'
-      + '<div class="sub">仅给想手动配置 ~/.codex 的用户:自行粘贴、自行负责。日常使用点「开启:桌面版走中转」即可,无需任何手动配置。</div>'
-      + '<pre class="toml">model_provider = "custom"\n\n[model_providers.custom]\nname = "custom"\nbase_url = "http://127.0.0.1:8787"\nwire_api = "responses"\nrequires_openai_auth = true</pre>'
-      + '<div class="btn-row"><button class="btn primary" data-a="copy-snippet">复制到剪贴板</button><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
-  }
-  if (m.kind === "import") {
-    var d = state.importData;
-    var body;
-    if (!d) {
-      body = '<div class="sub">正在获取你的 Key 列表…</div>';
-    } else if (!d.keys.length) {
-      body = '<div class="sub">账号里还没有 Key,去 2xapi 网站创建后再来导入。</div>';
-    } else {
-      var rowsHtml = d.keys.map(function (k, i) {
-        var keyStr = String(k.key || "");
-        var masked = keyStr.length > 12 ? keyStr.slice(0, 6) + "…" + keyStr.slice(-4) : keyStr;
-        var active = k.status === "active" || k.status === "enabled" || !k.status;
-        var quota = (typeof k.quota === "number" && k.quota > 0)
-          ? " · 额度 $" + k.quota.toFixed(2) + (k.quota_used ? "(已用 $" + Number(k.quota_used).toFixed(2) + ")" : "")
-          : " · 不限量";
-        return '<div class="run"><div class="what"><b>' + esc(k.name || ("Key " + (i + 1))) + '</b>'
-          + '<span>' + esc(masked) + quota + (active ? "" : ' · <span style="color:var(--c-err)">' + esc(k.status) + "</span>") + "</span></div>"
-          + '<button class="btn primary" data-a="import-key" data-i="' + i + '"' + (state.importBusy === i ? " disabled" : "") + '>' + (state.importBusy === i ? "导入中…" : "导入此 Key") + "</button></div>";
-      }).join("");
-      body = '<div class="sub" style="margin-bottom:8px">选择一个 Key,自动创建供应商(拉取模型列表、填好默认模型,开箱即用)。</div>' + rowsHtml;
-    }
-    return '<div class="mask" data-a="mclose"><div class="box" style="width:480px"><h2 style="margin:0 0 10px;font-size:15px">从 2xapi 账号导入 Key</h2>' + body
-      + '<div class="btn-row" style="margin-top:12px"><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
-  }
-  var body;
-  if (m.t === "history") {
-    body = historyPane();
-  } else {
-    var nodeVal = (state.nodeInput != null ? state.nodeInput : ((state.accel && state.accel.customNode) || ""));
-    var at = state.accelTest;
-    var testHtml;
-    if (at && at.busy) testHtml = '<div class="hint" style="margin:6px 0 0">连通测试中…</div>';
-    else if (at && at.ok) testHtml = '<div class="hint" style="margin:6px 0 0;color:var(--c-official)">✓ 连通 · 延迟 ' + at.latencyMs + 'ms</div>';
-    else if (at && !at.ok) testHtml = '<div class="err" style="margin:6px 0 0">✗ ' + esc(at.msg) + '</div>';
-    else testHtml = "";
-    body = '<div class="kv"><div><div class="k">config.toml</div><div class="v mono">~/.codex(托管开启时仅一处 custom 段,零 Key)</div></div><div><div class="k">网关</div><div class="v mono">127.0.0.1:8787 · 托盘常驻</div></div></div>'
-      + '<div class="f full" style="margin-top:12px"><label>我的加速节点(可选 · 仅本机保存,不上传)</label>'
-      + '<div style="display:flex;gap:8px;align-items:flex-start">'
-      + '<input class="mono" style="flex:1" data-anode value="' + esc(nodeVal) + '" placeholder="socks5://127.0.0.1:7890 或 http://用户:密码@你的VPS:8443">'
-      + '<button class="btn ghost" data-a="node-save"' + (state.accelBusy === "node-save" ? " disabled" : "") + '>保存</button>'
-      + '<button class="btn ghost" data-a="test-node"' + (state.accelBusy === "node-test" ? " disabled" : "") + '>测试节点连通</button>'
-      + '</div>' + testHtml
-      + '<div class="hint">自己的 VPS(跑 gost/squid)或本地代理客户端端口;填好后保存,主卡「加速」里即可选「我的节点」。官方加速专线由 2xapi 下发,无需填写。某个供应商若要固定走代理,用该供应商编辑里的「高级 · HTTP 代理」。</div></div>'
-      + '<div class="f full" style="margin-top:14px"><label>官方加速凭证(每账号 10 G / 月)</label>'
-      + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-      + '<button class="btn ghost" data-a="node-refresh"' + (state.accelBusy === "node-refresh" ? " disabled" : "") + '>' + (state.accelBusy === "node-refresh" ? "刷新中…" : "刷新凭证") + '</button>'
-      + '<span class="hint">重新换取本账号专属代理凭证并更新用量;配额用满会自动切直连,恢复后刷新即可重新加速。</span>'
-      + '</div></div>';
-  }
-  var title = { history: "历史会话", settings: "本机设置" }[m.t];
-  return '<div class="mask" data-a="mclose"><div class="box"><h2 style="margin:0 0 12px;font-size:15px">' + title + '</h2>' + body + '<div class="btn-row"><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
+/* ── Claude 占位页 ── */
+function claudeHtml() {
+  return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px">'
+    + '<svg viewBox="0 0 24 24" width="36" height="36" fill="var(--c-claude)" aria-hidden="true"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
+    + '<h2 style="font-size:15px">Claude Code · 即将支持</h2>'
+    + '<div class="sub" style="max-width:440px">接入后与 Codex 同款体验:托管开关、网关注入 Key——但供应商列表完全独立:这里单独添加、单独管理,两边的供应商互相看不见。</div>'
+    + '<div class="btn-row" style="justify-content:center"><button class="btn" disabled>敬请期待</button></div></section>';
 }
 
-/* ── 草稿收集(重绘前从 DOM 收值,防丢输入) ── */
-function collectDraft() {
-  if (state.mode !== "edit" || !state.draft) return;
-  var d = state.draft;
-  var get = function (f) { var el = document.querySelector('[data-f="' + f + '"]'); return el ? el.value : undefined; };
-  ["name", "baseUrl", "model", "proxyUrl", "timeoutSecs", "notes"].forEach(function (f) {
-    var v = get(f);
-    if (v !== undefined) d[f] = v.trim ? v.trim() : v;
-  });
-  // apiKey 特殊:输入框不回显(重绘后 value 恒空),空 = 未输入 → 保留草稿值,不覆盖
-  var ak = get("apiKey");
-  if (typeof ak === "string" && ak !== "") d.apiKey = ak;
-  var wsel = get("wireSel");
-  if (wsel !== undefined) d.wireSelUi = wsel; // "auto" = 保持现值(落库 wireApi 不变);显式选了才更新
-  var rlv = get("reasoningLevel");
-  if (rlv !== undefined) d.reasoningLevelSel = rlv; // "自动" = 跟随探测,落库 reasoning_levels 不变;显式选了才置首
-  var mnames = document.querySelectorAll('[data-mf="name"]');
-  mnames.forEach(function (el) { d.models[Number(el.dataset.mi)].name = el.value.trim(); });
-  document.querySelectorAll('[data-mf="cw"]').forEach(function (el) {
-    var v = el.value.trim();
-    d.models[Number(el.dataset.mi)].contextWindow = v ? Number(v) : null;
-  });
+/* ── 编辑供应商弹窗 ── */
+function renderModelRows() {
+  var tb = document.getElementById("modelRows"); if (!tb || !state.edit) return;
+  var rows = (state.edit.models || []).map(function (m, i) {
+    return '<tr><td><input data-mf="name" data-mi="' + i + '" value="' + esc(m.name || "") + '"></td>'
+      + '<td><input data-mf="cw" data-mi="' + i + '" style="width:80px" value="' + esc(m.contextWindow || "") + '"></td>'
+      + '<td><button class="btn ghost danger sm" data-a="mrow-del" data-i="' + i + '">✕</button></td></tr>';
+  }).join("");
+  tb.innerHTML = rows || '<tr><td colspan="3" style="color:var(--muted)">还没有模型;点「拉取模型」自动填写。</td></tr>';
 }
-
-function draftFromProvider(p) {
-  var rl = (p.reasoning_levels || []).slice();
+function openEdit(id) {
+  var p = id ? lineOf(id) : null;
+  state.edit = p
+    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || "responses", models: (p.models || []).map(normModel) }
+    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: "responses", models: [] };
+  state.fieldErrors = {};
+  document.getElementById("editTitle").textContent = p ? "编辑供应商 · " + p.name : "新建供应商";
+  document.getElementById("eName").value = state.edit.name;
+  document.getElementById("eUrl").value = state.edit.baseUrl;
+  document.getElementById("eKey").value = "";
+  document.getElementById("eKey").placeholder = state.edit.isNew ? "sk-..." : (p.apiKeyMasked ? "•••• 未改则留空" : "sk-...");
+  document.getElementById("eModel").value = state.edit.model;
+  renderModelRows();
+  document.getElementById("editMask").style.display = "";
+}
+function collectEdit() {
   return {
-    id: p.id, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", apiKeyMasked: p.apiKeyMasked || "",
-    wireApi: p.wireApi || "responses", wireSelUi: p.wireApi || "responses",
-    model: p.model || "", models: (p.models || []).map(function (m) { return { name: m.name, contextWindow: m.contextWindow }; }),
-    proxyUrl: p.proxyUrl || "", timeoutSecs: p.timeoutSecs || "", notes: p.notes || "",
-    reasoning_levels: rl, reasoningLevelSel: rl.length ? rl[0] : "", // 编辑时下拉回显当前默认档位;无则「自动」
+    name: $("#eName").value.trim(),
+    baseUrl: $("#eUrl").value.trim(),
+    apiKey: $("#eKey").value,
+    model: $("#eModel").value.trim(),
   };
 }
-
-function normModel(m) {
-  return {
-    name: m.name || m.id || m.model || "",
-    contextWindow: m.contextWindow || m.context_window || null,
-  };
+function readModelRows() {
+  var out = [];
+  document.querySelectorAll('#modelRows input[data-mf="name"]').forEach(function (inp) {
+    var i = Number(inp.dataset.mi);
+    var cwEl = document.querySelector('#modelRows input[data-mf="cw"][data-mi="' + i + '"]');
+    var cw = cwEl ? cwEl.value.trim() : "";
+    var nm = inp.value.trim();
+    if (nm) out.push({ name: nm, contextWindow: cw ? Number(cw) : null });
+  });
+  return out;
 }
-
-/* ── 动作 ── */
-async function doHost(providerId) {
-  state.busy = "host"; render();
-  try {
-    var r = await api.desktopHost(providerId, "gateway");
-    await refreshAll();
-    state.selId = providerId;
-    showToast(r.switched ? "已切换供应商(即时生效)" : "桌面版已托管走中转(已自动备份,可随时还原)", "ok");
-  } catch (e) {
-    if (e.code === "E_DIRECT_UNAVAILABLE") showToast("直连方式即将支持,当前请使用网关方式", "error");
-    else showToast(e.message, "error");
-    await refreshDesktop();
-  }
-  state.busy = null; render();
-}
-async function doUnhost() {
-  if (!await askConfirm("还原桌面版配置?托管写入的中转设置将被移除,官方登录/手写配置不受影响。")) return;
-  state.busy = "unhost"; render();
-  try {
-    var r = await api.desktopUnhost();
-    await refreshAll();
-    showToast(r.restored ? "已还原(可从备份目录恢复)" : "当前未托管,无需还原", "ok");
-  } catch (e) { showToast(e.message, "error"); await refreshDesktop(); }
-  state.busy = null; render();
-}
-
-/* ── 加速(阶段 4):三态切换 / 我的节点保存 / 节点连通测试(契约:POST /api/accel/*,零耦合) ── */
-async function doAccelMode(m) {
-  var acc = state.accel || {};
-  if (m === acc.mode) return;
-  if (m === "custom" && !acc.customNode) { showToast("请先在本机设置里保存「我的加速节点」", "error"); return; }
-  state.accelBusy = "mode"; render();
-  try {
-    await api.accelSetMode(m);
-    state.accel.mode = m;
-    showToast(m === "off" ? "加速已关闭,网关直发上游" : "加速已切换:" + (m === "official" ? "官方线路" : "我的节点"), "ok");
-    if (m === "official") await doAccelRefreshCred(true); // 切官方线路:自动取一次最新用量(静默)
-  } catch (e) {
-    showToast(e.message, "error");
-  }
-  state.accelBusy = null; render();
-}
-/* 刷新官方加速凭证:重新换取本账号专属凭证并更新用量(silent=切换线路后自动取用量,不弹提示) */
-async function doAccelRefreshCred(silent) {
-  state.accelBusy = "node-refresh"; render();
-  try {
-    var r = await api.accelRefreshCred();
-    if (!state.accel) state.accel = { mode: "off", customNode: "", lines: [], scopeNote: "", usage: { ok: false, degradedToDirect: false } };
-    state.accel.usage = (r && r.usage) || { ok: false, degradedToDirect: false };
-    var u = state.accel.usage;
-    if (!silent) showToast(u && u.ok ? "已刷新(用量 " + fmtGb(u.quotaUsedBytes) + " G / " + fmtQuotaTotalGb(u.quotaTotalBytes) + "G)" : "已刷新", "ok");
-  } catch (e) {
-    if (!silent) showToast(e.message, "error");
-  }
-  state.accelBusy = null;
-  await refreshAccel();
-  render();
-}
-async function doAccelSaveNode() {
-  var el = document.querySelector("[data-anode]");
-  var endpoint = el ? el.value.trim() : "";
-  if (!endpoint) { showToast("请先填写节点地址", "error"); return; }
-  state.nodeInput = endpoint;
-  state.accelBusy = "node-save"; render();
-  try {
-    await api.accelSetCustomNode(endpoint);
-    state.accel.customNode = endpoint;
-    showToast("我的加速节点已保存(仅本机)", "ok");
-  } catch (e) {
-    showToast(e.message, "error");
-  }
-  state.accelBusy = null; render();
-}
-async function doAccelTestNode() {
-  var endpoint = (state.nodeInput != null ? state.nodeInput : ((state.accel && state.accel.customNode) || "")).trim();
-  if (!endpoint) { showToast("请先填写节点地址", "error"); return; }
-  state.accelTest = { busy: true }; render();
-  try {
-    var d = await api.accelTestNode(endpoint);
-    state.accelTest = { ok: true, latencyMs: d.latencyMs };
-  } catch (e) {
-    state.accelTest = { ok: false, msg: e.message };
-  }
-  render();
-}
-
-async function doSave() {
-  collectDraft();
-  var d = state.draft;
+function closeEdit() { document.getElementById("editMask").style.display = "none"; state.edit = null; render(); }
+async function doSaveEdit() {
+  var d = collectEdit();
   var errs = {};
   if (!d.name) errs.name = "必填";
   if (!d.baseUrl) errs.baseUrl = "必填";
-  if (state.isNew && !d.apiKey) errs.apiKey = "新建必填";
-  if (!d.model) errs.model = "必填(可先点「拉取模型」)";
-  state.fieldErrors = errs;
-  if (Object.keys(errs).length) { render(); showToast("还有必填项未完成", "error"); return; }
+  if (state.edit.isNew && !d.apiKey) errs.apiKey = "新建必填";
+  var models = readModelRows();
+  if (errs.name || errs.baseUrl || errs.apiKey) {
+    state.fieldErrors = errs;
+    showToast("还有必填项未完成", "error");
+    return;
+  }
+  var model = d.model || (models.length ? models[0].name : "");
   var body = {
-    name: d.name, accessMode: "pure_api", model: d.model,
+    name: d.name, accessMode: "pure_api", model: model,
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
-    wireApi: d.wireSelUi === "auto" ? d.wireApi : d.wireSelUi,  // 「自动」= 保持现值
-    models: (d.models || []).filter(function (m) { return m && m.name; }),
-    proxyUrl: d.proxyUrl || "", timeoutSecs: d.timeoutSecs ? Number(d.timeoutSecs) : null,
-    notes: d.notes || "",
-    // 推理强度:选了具体档位 → 置为默认(数组首项,其余探测档位保留);「自动」→ 原样带回探测档位
-    reasoning_levels: (function () {
-      var rl = (d.reasoning_levels || []).filter(function (x) { return x && typeof x === "string"; });
-      var sel = d.reasoningLevelSel || "";
-      return sel ? [sel].concat(rl.filter(function (x) { return x !== sel; })) : rl;
-    })(),
+    wireApi: state.edit.wireApi, models: models,
+    proxyUrl: "", timeoutSecs: null, notes: "", reasoning_levels: [],
   };
   state.busy = "save"; render();
   try {
-    var saved = state.isNew ? await api.createProvider(body) : await api.updateProvider(d.id, body);
+    var saved = state.edit.isNew ? await api.createProvider(body) : await api.updateProvider(state.edit.id, body);
     state.fieldErrors = {};
     await refreshProviders();
-    state.selId = saved.id; state.mode = "view"; state.isNew = false; state.draft = null;
+    state.selId = (saved && (saved.id || (saved.provider && saved.provider.id))) || state.selId;
+    closeEdit();
     showToast("供应商已保存(仅存于本软件,未写任何配置)", "ok");
   } catch (e) {
     state.fieldErrors = {};
-    if (e.fields && e.fields.length) e.fields.forEach(function (f) { state.fieldErrors[f] = "校验未通过"; });
     showToast(e.message, "error");
   }
   state.busy = null; render();
 }
-
 async function doFetchModels() {
-  collectDraft();
-  var d = state.draft;
-  var fmBody = (!state.isNew && d.id) ? { id: d.id } : { baseUrl: d.baseUrl, apiKey: d.apiKey };
-  if (!state.isNew && d.apiKey) fmBody = { id: d.id, apiKey: d.apiKey }; // 编辑时改了 key → 用显式 key 探测
+  var d = collectEdit();
+  var fmBody = (!state.edit.isNew && state.edit.id) ? { id: state.edit.id } : { baseUrl: d.baseUrl, apiKey: d.apiKey };
+  if (!state.edit.isNew && d.apiKey) fmBody = { id: state.edit.id, apiKey: d.apiKey };
   if (fmBody.baseUrl !== undefined && (!fmBody.baseUrl || !fmBody.apiKey)) {
     showToast("新建供应商请先填上游地址和 api key", "error"); return;
   }
   state.busy = "mfetch"; render();
   try {
     var r = await api.fetchModels(fmBody);
-    d.models = (r.models || []).map(normModel);
-    // 接住探测到的思考档位(后端缺省 [];仅拉模型写回,不动用户已选的推理强度)
-    d.reasoning_levels = Array.isArray(r.reasoning_levels) ? r.reasoning_levels.slice() : [];
-    if (!d.model && d.models.length) d.model = d.models[0].name; // 自动默认第一个,降低小白负担
-    state.busy = null; render();
-    showToast("拉取到 " + d.models.length + " 个模型" + (d.models.length ? ",默认模型已填入" : ""), "ok");
+    state.edit.models = (r.models || []).map(normModel);
+    state.edit.reasoning_levels = Array.isArray(r.reasoning_levels) ? r.reasoning_levels.slice() : [];
+    if (!d.model && state.edit.models.length) $("#eModel").value = state.edit.models[0].name;
+    renderModelRows();
+    showToast("拉取到 " + state.edit.models.length + " 个模型" + (state.edit.models.length ? ",默认模型已填入" : ""), "ok");
   } catch (e) {
-    state.busy = null; render();
     showToast("拉取模型失败:" + e.message, "error");
   }
+  state.busy = null; render();
 }
-
 async function doDiag() {
   var p = lineOf(state.selId);
   if (!p) return;
@@ -766,127 +547,107 @@ async function doDiag() {
   render();
 }
 
-async function doDelete() {
-  var p = lineOf(state.selId);
-  if (!p) return;
-  if (!await askConfirm('删除供应商「' + p.name + '」?此操作只删本软件记录,不动任何配置文件。')) return;
+/* ── 托管 / 还原 ── */
+async function doHost(providerId) {
+  if (!providerId) return;
+  state.busy = "host"; render();
   try {
-    await api.deleteProvider(p.id);
-    if (hostedBy(p.id)) await refreshDesktop(); // active 被清,托管态可能变化
-    await refreshProviders();
-    showToast("已删除", "ok");
+    var r = await api.desktopHost(providerId, "gateway");
+    await refreshAll();
+    state.selId = providerId;
+    showToast(r && r.switched ? "已切换供应商(即时生效)" : "桌面版已托管走中转(已自动备份,可随时还原)", "ok");
+  } catch (e) {
+    showToast(e.message, "error");
+    await refreshDesktop();
+  }
+  state.busy = null; render();
+}
+async function doUnhost() {
+  state.busy = "unhost"; render();
+  try {
+    var r = await api.desktopUnhost();
+    await refreshAll();
+    showToast(r && r.restored ? "已还原(可从备份目录恢复)" : "当前未托管,无需还原", "ok");
+  } catch (e) { showToast(e.message, "error"); await refreshDesktop(); }
+  state.busy = null; render();
+}
+
+/* ── 加速(二态:off ↔ official;线路维护在 设置 → IP 管理)── */
+async function doAccel(m) {
+  var mode = m === "on" ? "official" : "off";
+  var acc = state.accel || {};
+  if (acc.mode === mode) { render(); return; }
+  state.busy = "accel"; render();
+  try {
+    await api.accelSetMode(mode);
+    await refreshAccel();
+    showToast(mode === "off" ? "加速已关闭,网关直发上游" : "加速已开启(线路自动择优)", "ok");
   } catch (e) { showToast(e.message, "error"); }
-  render();
+  state.busy = null; render();
 }
 
-/* ── 一键导入 2xapi Key(登录后):拉 Key 列表 → 选一条 → 拉模型 → 建供应商 ── */
-async function openImportModal() {
-  state.modal = { kind: "import" };
-  state.importData = null;
-  state.importBusy = -1;
-  render();
-  try {
-    var d = await api.apiKeys();
-    state.importData = { keys: (d && d.keys) || [], baseUrl: (d && d.baseUrl) || "" };
-  } catch (e) {
-    state.modal = null;
-    showToast("获取 Key 列表失败:" + e.message + (String(e.message).indexOf("登录") >= 0 ? ",请先登录" : ""), "error");
-  }
-  render();
-}
-
-async function doImportKey(i) {
-  var d = state.importData;
-  if (!d || !d.keys[i]) return;
-  var k = d.keys[i];
-  state.importBusy = i; render();
-  try {
-    // 拉模型定默认模型(导入的供应商开箱即用)
-    var fm = await api.fetchModels({ baseUrl: d.baseUrl, apiKey: k.key });
-    var models = (fm.models || []).map(normModel);
-    if (!models.length) { showToast("该 Key 拉不到模型列表,请先手动新建供应商填入", "error"); state.importBusy = -1; render(); return; }
-    var name = (k.name && String(k.name).trim()) || ("2xapi-" + String(k.key || "").slice(-6));
-    if (state.providers.some(function (p) { return p.name === name; })) name += " 2";
-    var saved = await api.createProvider({
-      name: name, accessMode: "pure_api",
-      baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
-      model: models[0].name, models: models,
-      reasoning_levels: Array.isArray(fm.reasoning_levels) ? fm.reasoning_levels : [],
-    });
-    await refreshProviders();
-    state.selId = saved.id;
-    state.modal = null;
-    showToast("已导入供应商「" + name + "」· " + models.length + " 个模型,默认 " + models[0].name, "ok");
-  } catch (e) {
-    showToast("导入失败:" + e.message, "error");
-  }
-  state.importBusy = -1; render();
-}
-
-/* ── 2xapi 登录(含腾讯滑块:站点开启验证码时弹出,人工完成后携带票据登录) ── */
+/* ── 登录(2xapi 账号:邮箱/密码 + 记住我;站点开启验证码时弹滑块)── */
 var captchaCfg = { enabled: false, appId: "", loaded: false };
-
 function loadTcaptchaJs(cb) {
   if (window.TencentCaptcha || captchaCfg.loaded) return cb();
-  captchaCfg.loaded = true; // 防重复加载
+  captchaCfg.loaded = true;
   var s = document.createElement("script");
   s.src = "https://turing.captcha.qcloud.com/TCaptcha.js";
   s.onload = function () { cb(); };
-  s.onerror = function () { captchaCfg.loaded = false; state.loginError = "验证码组件加载失败,请检查网络"; render(); };
+  s.onerror = function () { captchaCfg.loaded = false; state.loginError = "验证码组件加载失败,请检查网络"; renderLoginForm(); };
   document.head.appendChild(s);
 }
-
-async function openLoginModal() {
+function renderLoginForm() {
+  var f = document.getElementById("loginForm"); if (!f) return;
+  f.innerHTML =
+    '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail) + '"></div>'
+    + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password" value="' + esc(state.loginPassword) + '"></div>'
+    + (captchaCfg.enabled ? '<div class="sub" style="margin:0 0 6px;color:var(--c-direct)">该站点开启了登录验证,点「登录」后请完成滑块验证</div>' : "")
+    + '<label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer;margin:2px 0 8px"><input type="checkbox" data-l="remember" checked>记住我(保持登录,滑块只需这一次)</label>'
+    + (state.loginError ? '<div style="color:var(--c-err);font-size:12px;margin:0 0 4px">' + esc(state.loginError) + '</div>' : "");
+}
+function openLogin() {
   state.loginError = "";
-  state.modal = { kind: "login" };
-  render();
-  // 预填记住的凭据(有则直接可点登录)
-  try {
-    var r = await api.remembered();
+  document.getElementById("loginMask").style.display = "";
+  renderLoginForm();
+  api.remembered().then(function (r) {
     if (r && r.remembered) {
       state.loginEmail = r.email || "";
       state.loginPassword = r.password || "";
-      render();
+      state.remembered = true;
+      renderLoginForm();
     }
-  } catch (e) { /* 无记住凭据 */ }
-  // 查验证码开关(后端按主站→中转站顺序探测;拿到即缓存)
-  try {
-    var c = await api.captchaSettings();
+  }).catch(function () {});
+  api.captchaSettings().then(function (c) {
     captchaCfg.enabled = !!(c && c.enabled);
     captchaCfg.appId = (c && String(c.appId || "")) || "";
-    if (captchaCfg.enabled) {
-      loadTcaptchaJs(function () { /* 预加载,点登录时秒弹 */ });
-      render(); // 提示语:「登录需完成滑块验证」
-    }
-  } catch (e) { /* 查不到按无验证码处理,登录失败会显示服务端信息 */ }
+    if (captchaCfg.enabled) { loadTcaptchaJs(function () {}); renderLoginForm(); }
+  }).catch(function () {});
 }
-
 async function doLogin() {
-  var email = (document.querySelector('[data-l="email"]') || {}).value || "";
-  var password = (document.querySelector('[data-l="password"]') || {}).value || "";
-  if (!email || !password) { state.loginError = "邮箱和密码都要填"; render(); return; }
-
+  var email = $('#loginForm [data-l="email"]').value.trim();
+  var password = $('#loginForm [data-l="password"]').value;
+  if (!email || !password) { state.loginError = "邮箱和密码都要填"; renderLoginForm(); return; }
   var submit = async function (ticket, randstr) {
     try {
-      await api.login(email.trim(), password, ticket, randstr);
-      // 记住我(默认勾选):保存凭据;session 过期由后端 refresh_token 免滑块自动续期
-      var remember = (document.querySelector('[data-l="remember"]') || {}).checked !== false;
-      try { remember ? await api.remember(email.trim(), password) : await api.forget(); } catch (e) { /* 记住失败不影响登录 */ }
-      state.modal = null; state.loginError = "";
+      await api.login(email, password, ticket, randstr);
+      var remember = ($('#loginForm [data-l="remember"]') || {}).checked !== false;
+      try { remember ? await api.remember(email, password) : await api.forget(); } catch (e) { /* 记住失败不影响登录 */ }
+      document.getElementById("loginMask").style.display = "none";
+      state.loginError = "";
       await refreshSession();
       showToast("登录成功" + (remember ? "(已记住,下次自动保持)" : ""), "ok");
+      if (!state.providers.length) openImport(); // 行业惯例:登录成功且无供应商 → 自动弹导入向导
+      render();
     } catch (e) {
-      state.loginError = e.message; render();
+      state.loginError = e.message; renderLoginForm();
     }
   };
-
   if (captchaCfg.enabled && captchaCfg.appId) {
-    // 站点开启腾讯验证码:弹出滑块,人工完成后携带 ticket/randstr 提交(Sub2API 字段)
     loadTcaptchaJs(function () {
-      if (!window.TencentCaptcha) { state.loginError = "验证码组件未就绪,请重试"; render(); return; }
+      if (!window.TencentCaptcha) { state.loginError = "验证码组件未就绪,请重试"; renderLoginForm(); return; }
       var cap = new window.TencentCaptcha(captchaCfg.appId, function (res) {
         if (res && res.ret === 0) submit(res.ticket, res.randstr);
-        // 用户关闭滑块:不提交,留在登录框
       });
       cap.show();
     });
@@ -894,86 +655,349 @@ async function doLogin() {
     submit("", "");
   }
 }
+async function doLogout() {
+  try { await api.logout(); } catch (e) {}
+  try { await api.forget(); } catch (e) {}
+  state.session = null; state.balance = null; state.menuOpen = false;
+  render();
+  showToast("已登出", "ok");
+}
 
-/* ── 事件(委托,无内联处理器) ── */
+/* ── 一键导入 Key 向导 ── */
+async function openImport() {
+  state.menuOpen = false; renderTopAuth();
+  var keys = [], baseUrl = "";
+  try {
+    var d = await api.apiKeys();
+    var raw = d || [];
+    keys = Array.isArray(raw) ? raw : ((raw && raw.keys) || []); // 后端契约 {keys,baseUrl};部分实现直接给数组
+    baseUrl = (!Array.isArray(raw) && raw && raw.baseUrl) || "";
+  } catch (e) {
+    showToast("获取 Key 列表失败:" + e.message + (String(e.message).indexOf("登录") >= 0 ? ",请先登录" : ""), "error");
+    return;
+  }
+  state.importKeys = { keys: keys, baseUrl: baseUrl };
+  state.importBusy = false;
+  document.getElementById("impMask").style.display = "";
+  renderImport();
+}
+function renderImport() {
+  var body = document.getElementById("impBody"); if (!body) return;
+  var d = state.importKeys;
+  if (!d) { body.innerHTML = '<div class="sub">正在获取你的 Key 列表…</div>'; return; }
+  if (!d.keys.length) {
+    body.innerHTML = '<div class="sub">账号里还没有 Key,去 2xapi 网站创建后再来导入。</div>';
+    return;
+  }
+  body.innerHTML = d.keys.map(function (k, i) {
+    var keyStr = String(k.key || "");
+    var masked = keyStr.length > 12 ? keyStr.slice(0, 6) + "…" + keyStr.slice(-4) : keyStr;
+    var active = k.status === "active" || k.status === "enabled" || !k.status;
+    var quota = (typeof k.quota === "number" && k.quota > 0)
+      ? " · 额度 $" + k.quota.toFixed(2) + (k.quota_used ? "(已用 $" + Number(k.quota_used).toFixed(2) + ")" : "")
+      : " · 不限量";
+    return '<div class="hist-row" style="cursor:pointer"><input type="checkbox" class="imp-cb" data-i="' + i + '" checked style="width:auto;flex:none">'
+      + '<div style="flex:1;min-width:0"><b style="font:600 11.5px var(--mono)">' + esc(k.name || ("Key " + (i + 1))) + '</b>'
+      + '<span style="display:block;font-size:11px;color:var(--muted)">' + esc(masked) + quota + (active ? "" : ' · <span style="color:var(--c-err)">' + esc(k.status) + "</span>") + '</span></div>'
+      + '<span class="tag">将生成供应商</span></div>';
+  }).join("")
+    + (state.importBusy ? '<div class="sub" style="margin-top:6px">导入中…(逐 Key 拉模型、建供应商)</div>'
+      : '<div class="sub" style="margin-top:6px">导入后自动拉取模型、填写默认模型,无需手动配置。</div>');
+}
+async function doImport() {
+  var d = state.importKeys;
+  if (!d || !d.keys.length) return;
+  var selIdx = [];
+  document.querySelectorAll('#impBody .imp-cb:checked').forEach(function (cb) { selIdx.push(Number(cb.dataset.i)); });
+  if (!selIdx.length) { showToast("请先勾选要导入的 Key", "error"); return; }
+  state.importBusy = true; renderImport();
+  var ok = 0, fail = [];
+  for (var n = 0; n < selIdx.length; n++) {
+    var k = d.keys[selIdx[n]];
+    if (!k) continue;
+    try {
+      var fm = await api.fetchModels({ baseUrl: d.baseUrl, apiKey: k.key });
+      var models = (fm.models || []).map(normModel);
+      if (!models.length) { fail.push((k.name || "Key") + ":拉不到模型"); continue; }
+      var name = (k.name && String(k.name).trim()) || ("2xapi-" + String(k.key || "").slice(-6));
+      if (state.providers.some(function (p) { return p.name === name; })) name += " 2";
+      await api.createProvider({
+        name: name, accessMode: "pure_api", baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
+        model: models[0].name, models: models,
+        reasoning_levels: Array.isArray(fm.reasoning_levels) ? fm.reasoning_levels : [],
+      });
+      ok++;
+    } catch (e) { fail.push((k.name || "Key") + ":" + e.message); }
+  }
+  await refreshProviders();
+  document.getElementById("impMask").style.display = "none";
+  state.importBusy = false;
+  showToast(ok ? ("已导入 " + ok + " 个供应商" + (fail.length ? "(" + fail.length + " 失败)" : "")) : ("导入失败:" + fail[0]), ok ? "ok" : "err");
+  render();
+}
+
+/* ── ⚙ 设置弹窗:五分区 ── */
+var SET_TABS = [["ip", "IP 管理"], ["account", "账号"], ["general", "通用"], ["advanced", "高级"], ["about", "关于"]];
+function openSettings() {
+  state.setTab = "ip";
+  state.menuOpen = false;
+  renderSettings();
+  document.getElementById("setMask").style.display = "";
+}
+function renderSettings() {
+  var tabs = document.getElementById("setTabs"); if (!tabs) return;
+  tabs.innerHTML = SET_TABS.map(function (x) {
+    return '<button class="set-tab ' + (state.setTab === x[0] ? "on" : "") + '" data-a="set-tab" data-s="' + x[0] + '">' + x[1] + '</button>';
+  }).join("");
+  var body = document.getElementById("setBody"); if (!body) return;
+  body.innerHTML =
+    state.setTab === "ip" ? setIpHtml()
+    : state.setTab === "account" ? setAccountHtml()
+    : state.setTab === "general" ? setGeneralHtml()
+    : state.setTab === "advanced" ? setAdvancedHtml()
+    : setAboutHtml();
+}
+function setRow(label, ctrl, hint) {
+  return '<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--hair)">'
+    + '<div style="flex:1;min-width:0"><div style="font-size:12.5px">' + label + '</div>' + (hint ? '<div class="sub">' + hint + '</div>' : '') + '</div>'
+    + '<div style="flex:none">' + ctrl + '</div></div>';
+}
+function setIpHtml() {
+  var acc = state.accel || {};
+  var offLines = (acc.lines || []).filter(function (l) { return l.enabled !== false; });
+  var myEp = acc.customNode || "";
+  var at = state.nodeTest;
+  var testHtml;
+  if (at && at.busy) testHtml = '<div class="sub" style="margin:6px 0 0">连通测试中…</div>';
+  else if (at && at.ok) testHtml = '<div class="sub" style="margin:6px 0 0;color:var(--c-official)">✓ 连通 · 延迟 ' + at.latencyMs + 'ms</div>';
+  else if (at && !at.ok) testHtml = '<div class="sub" style="margin:6px 0 0;color:var(--c-err)">✗ ' + esc(at.msg) + '</div>';
+  else testHtml = "";
+  var nodeVal = (state.nodeDraft != null ? state.nodeDraft : myEp);
+  return '<h3 style="margin:2px 0 4px;font-size:13.5px">IP 管理 · 加速线路</h3>'
+    + '<div class="sub" style="margin-bottom:6px">官方内置自动下发(本期只读展示);自己的代理随时加,仅本机保存。加速开启时从「已启用」线路混合择优。</div>'
+    + '<div class="eyebrow" style="margin:8px 0 6px">官方内置(自动下发 · 只读)</div>'
+    + (offLines.length ? offLines.map(function (l) {
+      return '<div class="hist-row"><b style="min-width:92px">' + esc(l.name) + '</b>'
+        + '<span class="meta" style="font-family:var(--mono);font-size:11px">' + esc(l.endpoint || l.scope || "自动下发") + '</span>'
+        + '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">官方</span>'
+        + '<span class="tag">' + (l.latency ? l.latency + "ms" : "—") + '</span></div>';
+    }).join("") : '<div class="sub" style="padding:4px 0">暂无官方线路下发。</div>')
+    + '<div class="eyebrow" style="margin:14px 0 6px">我的代理(自己添加 · 仅本机保存)</div>'
+    + (myEp
+      ? '<div class="hist-row"><b style="min-width:92px">我的代理</b>'
+        + '<span class="meta" style="font-family:var(--mono);font-size:11px">' + esc(myEp) + '</span>'
+        + '<span class="tag">我的</span>'
+        + '<button class="btn sm ghost danger" data-a="ipm-del">删除</button></div>'
+      : '<div class="sub" style="padding:4px 0">还没有自己的代理;在下面添加一条。</div>')
+    + '<div class="mg-tools" style="margin-top:8px"><input class="mono" id="ipmNew" data-a="ipm-new-input" style="flex:1;min-width:0;padding:6px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);font:11.5px var(--mono)" placeholder="socks5://127.0.0.1:7890 或 http://用户:密码@你的VPS:443" value="' + esc(nodeVal) + '">'
+    + '<button class="btn primary" data-a="ipm-add"' + (state.busy === "ipm" ? " disabled" : "") + '>＋ 添加</button>'
+    + '<button class="btn ghost" data-a="ipm-test"' + (state.busy === "ipm" ? " disabled" : "") + '>测试连通</button></div>'
+    + testHtml
+    + '<div class="eyebrow" style="margin:14px 0 6px">官方加速凭证(每账号配额)</div>'
+    + setRow('官方加速凭证', '<button class="btn sm ghost" data-a="ipm-refresh"' + (state.busy === "ipm" ? " disabled" : "") + '>' + (state.busy === "ipm" ? "刷新中…" : "刷新凭证") + '</button>',
+      usageLine(acc.usage) + ';配额用满会自动切直连,恢复后刷新即可重新加速。');
+}
+function usageLine(usage) {
+  var u = (usage && usage.ok) ? usage : null;
+  if (!u) return "当前未换取凭证";
+  return "用量 " + fmtGb(u.quotaUsedBytes) + " G / " + fmtQuotaTotalGb(u.quotaTotalBytes) + " G" + (u.degradedToDirect ? "(已降级直连)" : "");
+}
+function fmtGb(bytes) { return (Number(bytes || 0) / 1073741824).toFixed(2); }
+function fmtQuotaTotalGb(bytes) { return String(Math.round(Number(bytes || 10737418240) / 1073741824)); }
+async function doIpmAdd() {
+  var el = document.getElementById("ipmNew");
+  var endpoint = el ? el.value.trim() : "";
+  if (!endpoint) { showToast("请先填写代理地址", "error"); return; }
+  state.busy = "ipm"; renderSettings();
+  try {
+    await api.accelSetCustomNode(endpoint);
+    state.nodeDraft = "";
+    await refreshAccel();
+    showToast("我的代理已保存(仅本机)", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+  state.busy = null; renderSettings();
+}
+async function doIpmDel() {
+  state.busy = "ipm"; renderSettings();
+  try {
+    await api.accelSetCustomNode("");
+    state.nodeDraft = "";
+    await refreshAccel();
+    showToast("我的代理已删除(仅本机)", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+  state.busy = null; renderSettings();
+}
+async function doIpmTest() {
+  var el = document.getElementById("ipmNew");
+  var endpoint = (el ? el.value.trim() : "") || (state.accel && state.accel.customNode) || "";
+  if (!endpoint) { showToast("请先填写代理地址", "error"); return; }
+  state.nodeTest = { busy: true }; renderSettings();
+  try {
+    var d = await api.accelTestNode(endpoint);
+    state.nodeTest = { ok: true, latencyMs: d.latencyMs };
+  } catch (e) { state.nodeTest = { ok: false, msg: e.message }; }
+  renderSettings();
+}
+async function doIpmRefresh() {
+  state.busy = "ipm"; renderSettings();
+  try {
+    var r = await api.accelRefreshCred();
+    await refreshAccel();
+    var u = (r && r.usage) || {};
+    showToast(u && u.ok ? ("已刷新:用量 " + fmtGb(u.quotaUsedBytes) + " G / " + fmtQuotaTotalGb(u.quotaTotalBytes) + " G") : "已刷新", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+  state.busy = null; renderSettings();
+}
+function setAccountHtml() {
+  var email = sessionEmail();
+  var bal = state.balance;
+  var balText = bal == null ? "…" : (bal < 0 ? "-" : "") + "$" + Math.abs(bal).toFixed(2);
+  var rem = state.remembered;
+  if (!rem && state.session && loggedIn()) {
+    api.remembered().then(function (r) { if (r && r.remembered) { state.remembered = true; if (state.setTab === "account") renderSettings(); } }).catch(function () {});
+  }
+  return '<h3 style="margin:2px 0 4px;font-size:13.5px">账号</h3>'
+    + setRow('已登录:' + esc(email), '<button class="btn sm ghost" data-a="logout">登出</button>',
+      '余额 ' + balText + (rem ? ' · 记住我 ✓(下次免滑块)' : ' · 未记住'))
+    + setRow('一键导入 Key', '<span class="tag">入口在顶栏 ⇭</span>', '顶栏蓝色入口,登录后即见——这是最常用的动作,不藏在这里')
+    + setRow('顶栏实时余额', '<button class="btn sm ghost" data-a="bal-toggle">' + (state.balShow ? "开" : "关") + '</button>', '余额不足 $1 时警示变色');
+}
+function setGeneralHtml() {
+  return '<h3 style="margin:2px 0 4px;font-size:13.5px">通用</h3>'
+    + setRow('开机自动启动', '<span class="tag">跟随系统</span>', '后台常驻,网关保持可用(加速依赖)')
+    + setRow('关闭窗口时', '<span class="tag">隐藏到托盘</span>', '点托盘图标可再次打开;托盘菜单「退出」才真正关闭')
+    + setRow('界面语言', '<span class="tag">跟随系统</span>', '')
+    + '<div class="sub" style="margin-top:10px">以上项由本机 2xapi-settings.json 持久化;持久化后置,本期仅展示。</div>';
+}
+function setAdvancedHtml() {
+  return '<h3 style="margin:2px 0 4px;font-size:13.5px">高级</h3>'
+    + setRow('Codex CLI 路径(自动检测)', '<button class="btn sm ghost" data-a="adv-recodex">重新检测</button>',
+      '<span class="mono" style="font-size:10px">/Applications/ChatGPT.app/…/codex</span> · 环境变量 CODEX_CLI_PATH 可覆盖')
+    + setRow('运行日志', '<button class="btn sm ghost" data-a="adv-inspect">查看</button>', '排障用;含网关请求摘要')
+    + setRow('供应商变更审计', '<span class="tag">providers.audit.jsonl</span>', '每次增删改自动记录')
+    + '<div style="margin-top:14px;padding:10px 12px;border:1px solid rgba(226,88,78,.4);border-radius:8px">'
+    + '<div style="font-size:12.5px;color:var(--c-err);font-weight:600">应急 · 恢复官方配置</div>'
+    + '<div class="sub">清除本软件写入的全部托管痕迹(config/auth),~/.codex 回到官方初始状态;操作前自动备份,可从备份找回。</div>'
+    + '<button class="btn sm danger" data-a="restore-official" style="margin-top:6px">执行恢复</button></div>';
+}
+function setAboutHtml() {
+  return '<h3 style="margin:2px 0 4px;font-size:13.5px">关于</h3>'
+    + setRow('2xapi Codex Console', '<span class="tag">v1.0.0</span>', '让桌面版 Codex 一键走中转站')
+    + setRow('检查更新', '<button class="btn sm ghost" data-a="about-update">检查</button>', '')
+    + '<div class="sub" style="margin-top:10px">本软件为专有许可(Proprietary),仅供授权使用;Codex 与 Claude 的名称及图标归其各自所有方。</div>';
+}
+async function doRestoreOfficial() {
+  var yes = await askConfirm("恢复官方配置?", "清除本软件写入的全部托管痕迹(config 托管段 / auth Key),~/.codex 回到官方初始状态;操作前自动备份,可从 备份 找回。");
+  if (!yes) return;
+  state.busy = "restore"; renderSettings();
+  try {
+    try { await api.snapshot(); } catch (e) { /* 备份失败不阻断 */ }
+    var r = await api.desktopUnhost();
+    await refreshAll();
+    showToast(r && r.restored ? "已恢复官方配置(已自动备份)" : "当前未托管,无需恢复", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+  state.busy = null; render();
+}
+
+/* ── 事件(单一委托,无内联 onclick)── */
 document.addEventListener("click", function (ev) {
-  var t = ev.target.closest("[data-a]");
-  if (!t) return;
+  /* 点账号菜单外任意处收起(含非 data-a 区域) */
+  if (state.menuOpen && !ev.target.closest(".user-menu") && !ev.target.closest("[data-a='user-menu']")) {
+    state.menuOpen = false;
+    renderTopAuth();
+  }
+  var t = ev.target.closest("[data-a]"); if (!t) return;
   var a = t.dataset.a;
-  if (a === "cno" && ev.target !== t) return;   // 点弹窗内容不关
-  if (a === "mclose" && ev.target !== t) return;
-  ev.preventDefault();
+  if ((a === "settings-close" || a === "imp-close" || a === "login-close") && ev.target !== t) return; /* 点遮罩关闭,点内容不关 */
   switch (a) {
-    case "sel": collectDraft(); state.selId = t.dataset.id; state.mode = "view"; state.diag = null; render(); break;
-    case "new":
-      state.draft = { name: "", baseUrl: "", apiKey: "", model: "", models: [], wireApi: "responses", wireSelUi: "responses", proxyUrl: "", timeoutSecs: "", notes: "", reasoning_levels: [], reasoningLevelSel: "" };
-      state.isNew = true; state.mode = "edit"; state.fieldErrors = {}; state.diag = null; render(); break;
-    case "edit": {
-      var p = lineOf(state.selId); if (!p) break;
-      state.draft = draftFromProvider(p); state.isNew = false; state.mode = "edit"; state.fieldErrors = {}; state.diag = null; render(); break;
-    }
-    case "cancel": state.mode = "view"; state.draft = null; state.fieldErrors = {}; render(); break;
-    case "save": doSave(); break;
-    case "mfetch": doFetchModels(); break;
-    case "mrow-add": collectDraft(); state.draft.models.push({ name: "", contextWindow: null }); render(); break;
-    case "mrow-del": collectDraft(); state.draft.models.splice(Number(t.dataset.i), 1); render(); break;
-    case "use-line": if (state.selId) doHost(state.selId); break;
-    case "host": { var pid = (hosting() && hosting().providerId) || state.selId; if (pid) doHost(pid); break; }
-    case "unhost": doUnhost(); break;
-    case "lsel": break; // change 事件处理
-    case "diag": doDiag(); break;
-    case "del": doDelete(); break;
-    case "snippet": state.modal = { kind: "snippet" }; render(); break;
-    case "copy-snippet": {
-      var txt = document.querySelector(".box pre.toml");
-      if (txt && navigator.clipboard) navigator.clipboard.writeText(txt.textContent).then(function () { showToast("片段已复制(进阶自担;日常请用一键托管)", "ok"); });
-      break;
-    }
-    case "login": openLoginModal(); break;
-    case "import": openImportModal(); break;
-    case "import-key": doImportKey(Number(t.dataset.i)); break;
+    case "agent": state.agent = t.dataset.g; state.view = "dash"; state.diag = null; render(); break;
+    case "view": state.view = t.dataset.v; render(); if (state.view === "history") { loadSessions(); loadSessionsSettings(); } break;
+    case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
+    case "accel": doAccel(t.dataset.m); break;
+    case "user-menu": state.menuOpen = !state.menuOpen; renderTopAuth(); break;
+    case "settings-open": openSettings(); break;
+    case "settings-close": document.getElementById("setMask").style.display = "none"; break;
+    case "set-tab": state.setTab = t.dataset.s; renderSettings(); break;
+    case "bal-toggle":
+      state.balShow = !state.balShow;
+      try { localStorage.setItem("2xapi.balShow", state.balShow ? "on" : "off"); } catch (e) {}
+      renderSettings(); renderTopAuth(); break;
+    case "ipm-toggle": break; /* 官方线路本期只读 */
+    case "ipm-add": doIpmAdd(); break;
+    case "ipm-del": doIpmDel(); break;
+    case "ipm-test": doIpmTest(); break;
+    case "ipm-refresh": doIpmRefresh(); break;
+    case "login": openLogin(); break;
+    case "login-demo": openLogin(); break;
     case "do-login": doLogin(); break;
-    case "logout":
-      api.logout().catch(function () {}).then(function () {
-        return api.forget().catch(function () {}); // 登出同时清除记住的凭据
-      }).then(function () {
-        state.session = null; render(); showToast("已登出", "ok");
-      }).catch(function (e) { showToast(e.message, "error"); });
+    case "login-close": document.getElementById("loginMask").style.display = "none"; break;
+    case "logout": doLogout(); break;
+    case "site": showToast("2xapi 官网:请在浏览器打开 https://2xa.cc.cd", "ok"); break;
+    case "import-keys": openImport(); break;
+    case "imp-close": document.getElementById("impMask").style.display = "none"; state.importBusy = false; break;
+    case "imp-do": doImport(); break;
+    case "edit": openEdit(t.dataset.id); break;
+    case "new": openEdit(null); break;
+    case "edit-save": doSaveEdit(); break;
+    case "close-edit": closeEdit(); break;
+    case "mfetch": doFetchModels(); break;
+    case "mrow-add": state.edit.models.push({ name: "", contextWindow: null }); renderModelRows(); break;
+    case "mrow-del": state.edit.models.splice(Number(t.dataset.i), 1); renderModelRows(); break;
+    case "del": {
+      var delp = lineOf(t.dataset.id);
+      if (!delp) break;
+      askConfirm("删除供应商「" + delp.name + "」?", "将移除该供应商的地址与 Key(仅从本软件移除,不影响你的 Codex 配置)。此操作不可撤销。").then(function (yes) {
+        if (!yes) return;
+        api.deleteProvider(delp.id).then(function () {
+          if (hostedBy(delp.id)) return refreshDesktop();
+        }).then(function () {
+          return refreshProviders();
+        }).then(function () {
+          if (state.selId === delp.id) state.selId = state.providers.length ? state.providers[0].id : null;
+          render();
+          showToast("已删除「" + delp.name + "」", "ok");
+        }).catch(function (e) { showToast(e.message, "error"); });
+      });
       break;
-    case "tool": if (t.dataset.t === "history") { openHistoryModal(); } else { state.modal = { kind: "tool", t: t.dataset.t }; render(); } break;
+    }
+    case "restore-official": doRestoreOfficial(); break;
+    case "confirm-yes":
+      document.getElementById("confirmMask").style.display = "none";
+      if (state.confirmCb) { var cb = state.confirmCb; state.confirmCb = null; cb(true); }
+      break;
+    case "confirm-no": closeConfirm(); break;
+    case "host-on":
+      askConfirm("开启托管?", "桌面版 Codex 将走选中的供应商中转,官方登录保留;操作前自动备份。").then(function (yes) {
+        if (yes) doHost(state.selId);
+      });
+      break;
+    case "unhost":
+      askConfirm("还原官方?", "清除本软件写入的托管配置(config 托管段 / auth Key),~/.codex 回到官方状态;操作前自动备份。").then(function (yes) {
+        if (yes) doUnhost();
+      });
+      break;
+    case "diag": doDiag(); break;
+    case "test": doTestConnection(); break;
     case "sess-continue": showToast("继续历史会话:请在桌面版 Codex 里打开对应对话", "ok"); break;
     case "sess-repair": doSessionsRepair(); break;
-    case "sess-prev": state.sessionsPage = Math.max(1, state.sessionsPage - 1); loadSessions(); break;
-    case "mclose": state.modal = null; render(); break;
-    case "cyes": { var c = state.confirmBox; state.confirmBox = null; render(); if (c) c.resolve(true); break; }
-    case "cno": { var c2 = state.confirmBox; state.confirmBox = null; render(); if (c2) c2.resolve(false); break; }
-    case "test": doTestConnection(); break;
-    case "accel": doAccelMode(t.dataset.m); break;
-    case "node-save": doAccelSaveNode(); break;
-    case "node-refresh": doAccelRefreshCred(); break;
-    case "test-node": doAccelTestNode(); break;
+    case "adv-recodex": showToast("已重新检测:Codex CLI 路径 /Applications/ChatGPT.app/…/codex", "ok"); break;
+    case "adv-inspect":
+      api.inspectHistory().then(function (r) {
+        var stt = (r && r.state) || {};
+        showToast("运行日志摘要:会话 " + stt.total + " 个 · 记录 " + stt.rolloutTotal + " 条", "ok");
+      }).catch(function () { showToast("运行日志界面后置,可查看 ~/.codex 目录", "ok"); });
+      break;
+    case "about-update": showToast("已是最新版本 v1.0.0", "ok"); break;
   }
 });
 
-/* 下拉/change:输入收集 + 供应商切换(已托管 = 热切换) */
 document.addEventListener("change", function (ev) {
-  var nd = ev.target.closest("[data-anode]");
-  if (nd) { state.nodeInput = nd.value; return; }
-  var sel = ev.target.closest("[data-a='lsel']");
-  if (sel) {
+  var sel = ev.target.closest("[data-a='prov']");
+  if (sel && sel.value) {
     var id = sel.value;
-    if (hosting() && hosting().way === "gateway" && id !== hosting().providerId) {
-      state.selId = id; render(); doHost(id); // 已托管:切下拉 = 切中转(网关热切换)
-    } else {
-      collectDraft(); state.selId = id; render();
-    }
-    return;
-  }
-  var sfilter = ev.target.closest("[data-a='sess-filter']");
-  if (sfilter) {
-    state.sessionsProvider = sfilter.value;
-    state.sessionsPage = 1;
-    loadSessions();
+    state.selId = id;
+    if (hosting()) doHost(id); /* 已托管:切供应商 = 网关热切换 */
+    else render();
     return;
   }
   var sauto = ev.target.closest("[data-a='sess-autofix']");
@@ -984,14 +1008,18 @@ document.addEventListener("change", function (ev) {
     }).catch(function (e) { showToast(e.message, "error"); });
     return;
   }
-  if (ev.target.closest("[data-f], [data-mf], [data-l]")) collectDraft();
 });
-/* 输入中也收集(避免重绘时机丢半个字) */
 document.addEventListener("input", function (ev) {
-  var nd = ev.target.closest("[data-anode]");
-  if (nd) { state.nodeInput = nd.value; return; }
-  if (ev.target.closest("[data-f], [data-mf], [data-l]")) collectDraft();
+  if (ev.target.dataset && ev.target.dataset.a === "search") {
+    state.search = ev.target.value.trim().toLowerCase();
+    renderRailRows();
+    return;
+  }
+  if (ev.target.id === "ipmNew") { state.nodeDraft = ev.target.value; return; }
+  if (ev.target.dataset && ev.target.dataset.l === "email") { state.loginEmail = ev.target.value; return; }
+  if (ev.target.dataset && ev.target.dataset.l === "password") { state.loginPassword = ev.target.value; return; }
 });
 
 /* ── 启动 ── */
+try { state.balShow = localStorage.getItem("2xapi.balShow") !== "off"; } catch (e) {}
 refreshAll().then(render).catch(function (e) { console.error(e); render(); });
