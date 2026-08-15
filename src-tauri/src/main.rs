@@ -8,6 +8,7 @@ mod desktop;
 mod providers;
 mod probe;
 mod sessions;
+mod claude_sessions;
 mod auth;
 mod backups;
 mod history;

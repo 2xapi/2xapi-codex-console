@@ -22,6 +22,10 @@ var state = {
   sessionsTotal: 0,
   sessionsSettings: null,
   sessionsRepairing: false,
+  claudeSessions: null,      // GET /api/claude/sessions items(null=未加载/加载中;只读展示,无修复/删除)
+  claudeSessionsTotal: 0,
+  claudeSessionsPage: 0,     // 已加载到第几页(50/页)
+  claudeSessionsLoading: false,
   nodeDraft: null,     // IP 管理「我的代理」输入草稿(重绘防丢)
   nodeTest: null,      // {busy} | {ok,latencyMs} | {err,msg}
   importKeys: null,    // {keys, baseUrl}
@@ -584,12 +588,29 @@ function diagCard(d) {
     + '</section>';
 }
 
-/* ── 历史会话视图(Codex 现状;Claude 后端接口待定 → 占位)── */
+/* ── 历史会话视图(Codex 走 db 列表+修复;Claude 走 ~/.claude jsonl 只读列表)── */
 function historyHtml() {
   if (state.agent === "claude") {
+    var cs = state.claudeSessions;
+    var clist;
+    if (cs === null) clist = '<div class="sub">加载中…</div>';
+    else if (!cs.length) clist = '<div class="sub">还没有 Claude 会话。</div>';
+    else {
+      clist = cs.map(function (it) {
+        return '<div class="hist-row"><b>' + esc(it.title || "(无标题)") + '</b>'
+          + '<span class="meta">' + esc(fmtTime(it.updatedAt)) + (it.cwd ? " · " + esc(it.cwd) : "") + '</span></div>';
+      }).join("");
+      /* 首屏 50 条 + 加载更多(50/页追加);还有下一页才出按钮 */
+      if (cs.length < state.claudeSessionsTotal) {
+        clist += '<button class="btn ghost" data-a="csess-more" style="width:100%;margin-top:8px"' + (state.claudeSessionsLoading ? " disabled" : "") + '>'
+          + (state.claudeSessionsLoading ? "加载中…" : "加载更多") + '</button>';
+      }
+    }
     return '<section class="card" style="min-height:100%"><h2>历史会话 · Claude</h2>'
-      + '<div class="sub">Claude Code 的对话记录(~/.claude 统一保存);与 Codex 的会话分开管理。</div>'
-      + '<div style="margin-top:10px"><div class="hist-row"><b>Claude 会话即将接入</b><span class="meta" style="flex:1;color:var(--muted);font-size:11.5px">~/.claude 会话管理随后端接入一并上线 · 数据占位</span></div></div></section>';
+      + '<div class="sub">Claude Code 的对话记录(~/.claude 统一保存),只读展示;与 Codex 的会话分开管理。'
+      + (cs !== null ? ' 共 <b>' + state.claudeSessionsTotal + '</b> 条。' : "") + '</div>'
+      + '<div class="btn-row"><button class="btn ghost" data-a="csess-refresh"' + (state.claudeSessionsLoading ? " disabled" : "") + '>刷新</button></div>'
+      + '<div style="margin-top:10px">' + clist + '</div></section>';
   }
   var s = state.sessions;
   var listHtml;
@@ -627,6 +648,25 @@ async function loadSessions() {
 }
 async function loadSessionsSettings() {
   try { state.sessionsSettings = await api.sessionsSettings(); } catch (e) { state.sessionsSettings = null; }
+  render();
+}
+/* Claude 会话列表(只读):reset=true 重拉首页;false 追加下一页(50/页) */
+async function loadClaudeSessions(reset) {
+  state.claudeSessionsLoading = true;
+  if (reset) { state.claudeSessions = null; state.claudeSessionsPage = 0; }
+  render();
+  var page = (state.claudeSessionsPage || 0) + 1;
+  try {
+    var d = await api.claudeSessions(page, 50);
+    var items = d.items || [];
+    state.claudeSessions = page === 1 ? items : (state.claudeSessions || []).concat(items);
+    state.claudeSessionsTotal = d.total || 0;
+    state.claudeSessionsPage = page;
+  } catch (e) {
+    if (reset) state.claudeSessions = [];
+    showToast("获取 Claude 会话失败:" + e.message, "error");
+  }
+  state.claudeSessionsLoading = false;
   render();
 }
 async function doSessionsRepair() {
@@ -1177,7 +1217,13 @@ document.addEventListener("click", function (ev) {
       if (state.agent === "claude") refreshClaudeState().then(function () { render(); });
       else state.claude = null;
       break;
-    case "view": state.view = t.dataset.v; render(); if (state.view === "history" && state.agent === "codex") { loadSessions(); loadSessionsSettings(); } break;
+    case "view":
+      state.view = t.dataset.v; render();
+      if (state.view === "history") {
+        if (state.agent === "codex") { loadSessions(); loadSessionsSettings(); }
+        else loadClaudeSessions(true);
+      }
+      break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
     case "accel": doAccel(t.dataset.m); break;
     case "user-menu": state.menuOpen = !state.menuOpen; renderTopAuth(); break;
@@ -1276,6 +1322,8 @@ document.addEventListener("click", function (ev) {
     case "test": doTestConnection(); break;
     case "sess-continue": showToast("继续历史会话:请在桌面版 Codex 里打开对应对话", "ok"); break;
     case "sess-repair": doSessionsRepair(); break;
+    case "csess-refresh": loadClaudeSessions(true); break;
+    case "csess-more": loadClaudeSessions(false); break;
     case "adv-recodex": showToast("已重新检测:Codex CLI 路径 /Applications/ChatGPT.app/…/codex", "ok"); break;
     case "adv-inspect":
       api.inspectHistory().then(function (r) {

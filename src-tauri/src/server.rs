@@ -106,6 +106,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sessions", get(handle_sessions_list))
         .route("/api/sessions/repair", post(handle_sessions_repair))
         .route("/api/sessions/settings", get(handle_sessions_settings).post(handle_sessions_settings_set))
+        // --- Claude 会话历史(R2:只读,~/.claude/projects 的 jsonl;handler 直取 HOME,无 AppState)---
+        .route("/api/claude/sessions", get(crate::claude_sessions::handle_list))
         // --- 加速线路(阶段 4,任务书 §五)---
         .route("/api/accel/state", get(handle_accel_state))
         .route("/api/accel/mode", post(handle_accel_mode))
