@@ -58,6 +58,15 @@ async function refreshDesktop() {
 }
 async function refreshSession() {
   try { state.session = await api.session(); } catch (e) { state.session = null; }
+  // 实时余额(auth/me;未登录/失败静默——顶栏显示 …)
+  state.balance = null;
+  if (state.session && (state.session.loggedIn || state.session.authenticated)) {
+    try {
+      var me = await api.me();
+      var u = (me && me.user) || {};
+      if (typeof u.balance === "number") state.balance = u.balance;
+    } catch (e) { /* 下次刷新再试 */ }
+  }
 }
 async function refreshAll() {
   await Promise.all([refreshProviders(), refreshDesktop(), refreshSession()]);
@@ -104,11 +113,22 @@ function topChips() {
 }
 function loginBtn() {
   var s = state.session;
-  var logged = !!(s && (s.loggedIn || s.email));
-  return logged
-    ? '<button class="btn ghost" data-a="import">⇩ 导入 Key</button>'
-      + '<button class="btn ghost" data-a="logout">' + esc(s.email || "已登录") + " · 登出</button>"
-    : '<button class="btn ghost" data-a="login">登录 2xapi</button>';
+  // /api/session 形态:{authenticated, user:{email,...}}(兼容旧 loggedIn/email 顶层字段)
+  var logged = !!(s && (s.authenticated || s.loggedIn || s.email || (s.user && s.user.email)));
+  if (!logged) return '<button class="btn ghost" data-a="login">登录 2xapi</button>';
+  var dispEmail = (s.user && s.user.email) || s.email || "已登录";
+  // 余额 chip(实时,拉不到显示 …;低额警示色)
+  var bal = state.balance;
+  var balChip;
+  if (bal == null) {
+    balChip = '<span class="gw-chip">$…</span>';
+  } else {
+    var low = bal < 1;
+    balChip = '<span class="gw-chip" style="' + (low ? "border-color:var(--c-err);color:var(--c-err)" : "") + '" title="2xapi 账号余额">' + (bal < 0 ? "-" : "") + "$" + Math.abs(bal).toFixed(2) + "</span>";
+  }
+  return balChip
+    + '<button class="btn ghost" data-a="import">⇩ 导入 Key</button>'
+    + '<button class="btn ghost" data-a="logout">' + esc(dispEmail) + " · 登出</button>";
 }
 
 function rail() {

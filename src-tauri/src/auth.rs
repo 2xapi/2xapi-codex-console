@@ -208,3 +208,9 @@ pub async fn fetch_relay_base_url() -> Result<String, String> {
     let raw = d.get("api_base_url").and_then(|v| v.as_str()).unwrap_or("https://2xa.cc.cd");
     Ok(raw.trim_end_matches('/').trim_end_matches("/v1").trim_end_matches('/').to_string())
 }
+
+/// 当前账号信息(Sub2API GET /auth/me,data 含实时 balance/frozen_balance)。
+pub async fn fetch_me(access_token: &str) -> Result<Value, String> {
+    let result = xapi_request("/auth/me", reqwest::Method::GET, &json!({}), access_token).await?;
+    Ok(result.get("data").cloned().unwrap_or(json!({})))
+}

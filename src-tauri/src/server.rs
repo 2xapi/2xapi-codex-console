@@ -50,6 +50,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/auth/forget", post(handle_auth_forget))
         .route("/api/key-groups", get(handle_key_groups))
         .route("/api/auth/api-keys", get(handle_auth_api_keys))
+        .route("/api/auth/me", get(handle_auth_me))
         // --- Providers（04 契约）---
         .route("/api/providers", get(handle_providers_list).post(handle_providers_create))
         .route("/api/providers/active", get(handle_providers_active))
@@ -272,6 +273,21 @@ async fn handle_key_groups(State(s): State<Arc<AppState>>) -> Response {
             Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("获取分组失败: {}", e)),
         },
         None => err_json(StatusCode::UNAUTHORIZED, "请先登录 2xapi 账号"),
+    }
+}
+
+// GET /api/auth/me —— 实时账号信息(余额);失败退回 session 快照
+async fn handle_auth_me(State(s): State<Arc<AppState>>) -> Response {
+    let session = match crate::auth::load_session(&s.codex_home) {
+        Some(sess) => sess,
+        None => match crate::auth::refresh_session(&s.codex_home).await {
+            Some(sess) => sess,
+            None => return err_json(StatusCode::UNAUTHORIZED, "请先登录 2xapi 账号"),
+        },
+    };
+    match crate::auth::fetch_me(&session.access_token).await {
+        Ok(user) if !user.is_null() => ok_json(json!({ "user": user })),
+        _ => ok_json(json!({ "user": session.user })), // 外呼失败退回快照(余额可能滞后)
     }
 }
 
