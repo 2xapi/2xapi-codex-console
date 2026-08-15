@@ -1140,7 +1140,10 @@ function setAdvancedHtml() {
 }
 function setAboutHtml() {
   return '<h3 style="margin:2px 0 4px;font-size:13.5px">关于</h3>'
-    + setRow('2xapi Codex Console', '<span class="tag">v1.0.0</span>', '让桌面版 Codex 一键走中转站')
+    + '<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--hair)">'
+    + '<img src="brand-logo.svg" alt="2xapi" style="width:48px;height:48px;border-radius:12px;object-fit:cover;flex:none">'
+    + '<div style="min-width:0"><div style="font-size:13.5px;font-weight:600">2xapi Codex Console <span class="tag">v1.0.0</span></div>'
+    + '<div class="sub" style="margin-top:2px">让桌面版 Codex 一键走中转站</div></div></div>'
     + setRow('检查更新', '<button class="btn sm ghost" data-a="about-update">检查</button>', '')
     + '<div class="sub" style="margin-top:10px">本软件为专有许可(Proprietary),仅供授权使用;Codex 与 Claude 的名称及图标归其各自所有方。</div>';
 }
