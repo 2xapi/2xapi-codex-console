@@ -7,6 +7,7 @@ mod config;
 mod desktop;
 mod providers;
 mod probe;
+mod sessions;
 mod auth;
 mod backups;
 mod history;
