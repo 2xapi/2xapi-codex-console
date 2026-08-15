@@ -139,22 +139,26 @@ pub async fn login(email: &str, password: &str, captcha_ticket: &str, captcha_ra
         return Err("requires 2fa".into());
     }
 
-    let access_token = result.get("access_token")
-        .or_else(|| result.get("accessToken"))
+    // Sub2API 响应为 {code, message, data:{access_token, refresh_token, expires_in, user}}(response.Success 封装)
+    // —— token 嵌套在 data 内;顶层查找仅作兜底
+    let payload = result.get("data").filter(|d| d.is_object()).unwrap_or(&result);
+
+    let access_token = payload.get("access_token")
+        .or_else(|| payload.get("accessToken"))
         .and_then(|v| v.as_str())
         .ok_or("登录响应未包含 access token")?
         .to_string();
 
-    let refresh_token = result.get("refresh_token")
+    let refresh_token = payload.get("refresh_token")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    let expires_in = result.get("expires_in")
+    let expires_in = payload.get("expires_in")
         .and_then(|v| v.as_i64())
         .unwrap_or(3600);
 
-    let user = result.get("user").cloned().unwrap_or(json!({}));
+    let user = payload.get("user").cloned().unwrap_or(json!({}));
 
     Ok(LoginResult { access_token, refresh_token, expires_in, user })
 }
