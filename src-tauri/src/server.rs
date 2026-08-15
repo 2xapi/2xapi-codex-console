@@ -43,6 +43,8 @@ pub struct AppState {
     pub health: std::sync::Arc<crate::acclines::HealthState>,
     /// 加速开关配置(mode + 自定义节点;内存态 + 2xapi-settings.json 持久化)。
     pub accel: std::sync::Arc<std::sync::Mutex<AccelCfg>>,
+    /// 每账号节点凭证表(星图 任务 B;启动时 load_store 装配,签发/降级时更新并落盘)。
+    pub nodecreds: std::sync::Arc<std::sync::RwLock<crate::nodecreds::Store>>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -104,6 +106,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/accel/mode", post(handle_accel_mode))
         .route("/api/accel/custom-node", post(handle_accel_custom_node))
         .route("/api/accel/test-node", post(handle_accel_test_node))
+        // --- 每账号节点凭证(星图 任务 B:usage 刷新)---
+        .route("/api/accel/refresh-cred", post(handle_accel_refresh_cred))
         .route("/api/config/snapshot", post(handle_config_snapshot))
         .route("/api/config/restore", post(handle_config_restore))
         .with_state(state)
@@ -574,7 +578,100 @@ fn err_accel(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "ok": false, "error": msg }))).into_response()
 }
 
-// GET /api/accel/state → {mode, customNode, lines, scopeNote}
+// ── 每账号节点凭证(星图 任务 B:usage 块 + refresh-cred)────────
+
+/// 节点签发服务地址:生产恒为 DEFAULT_ISSUE_BASE;测试经 set_issue_base_for_tests
+/// 整体替换为本地 mock(全局 + 串行,防并行用例互串)。gateway.rs 的凭证确保段共用。
+static ISSUE_BASE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn issue_base() -> String {
+    ISSUE_BASE
+        .read()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| crate::nodecreds::DEFAULT_ISSUE_BASE.to_string())
+}
+
+/// 测试辅助:替换签发地址;返回的 guard 持有期间生效,drop 自动还原;
+/// guard 同时持全局锁串行化所有依赖 override 的用例(并行测试安全)。
+#[cfg(test)]
+pub fn set_issue_base_for_tests(base: &str) -> IssueBaseGuard {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let g = SERIAL.lock().unwrap();
+    *ISSUE_BASE.write().unwrap() = Some(base.to_string());
+    IssueBaseGuard { _serial: g }
+}
+
+/// set_issue_base_for_tests 的 guard(drop 时还原 override 并释放串行锁)。仅测试用。
+/// 字段仅在存活期持有锁(不读),下划线前缀豁免 dead_code。
+#[cfg(test)]
+pub struct IssueBaseGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for IssueBaseGuard {
+    fn drop(&mut self) {
+        *ISSUE_BASE.write().unwrap() = None;
+    }
+}
+
+/// Key 脱敏:前 3 + … + 尾 4(契约:usage.keyMasked);过短 Key 只留省略号。
+fn mask_key(key: &str) -> String {
+    let n = key.chars().count();
+    if n >= 8 {
+        let head: String = key.chars().take(3).collect();
+        let tail: String = key.chars().skip(n - 4).collect();
+        format!("{head}…{tail}")
+    } else {
+        "…".to_string()
+    }
+}
+
+/// usage 块(契约一字不差):ok:true + keyMasked/quota/percent(4 位)/degraded/issuedAt。
+/// pass 永不输出(安全约定:usage 块只含 keyMasked)。
+fn usage_block(api_key: &str, cred: &crate::nodecreds::NodeCred) -> Value {
+    let percent = if cred.quota_total_bytes > 0 {
+        (cred.quota_used_bytes as f64 / cred.quota_total_bytes as f64 * 10_000.0).round() / 10_000.0
+    } else {
+        0.0
+    };
+    json!({
+        "ok": true,
+        "keyMasked": mask_key(api_key),
+        "quotaTotalBytes": cred.quota_total_bytes,
+        "quotaUsedBytes": cred.quota_used_bytes,
+        "quotaPercent": percent,
+        "degradedToDirect": cred.degraded_to_direct,
+        "issuedAt": cred.issued_at,
+    })
+}
+
+/// 未换取成功/非 official 的兜底 usage 块。
+fn usage_none() -> Value {
+    json!({ "ok": false, "degradedToDirect": false })
+}
+
+/// state 的 usage 计算(纯内存,不失败):mode=official 且 active provider 的 Key
+/// 在凭证表有项 → ok:true;否则 ok:false。任何缺省都不影响 state 主体。
+fn usage_for_state(state: &AppState, mode: &str) -> Value {
+    if mode != "official" {
+        return usage_none();
+    }
+    let Some(p) = crate::providers::get_active(&state.providers_path) else {
+        return usage_none();
+    };
+    if p.api_key.trim().is_empty() {
+        return usage_none();
+    }
+    let st = state.nodecreds.read().unwrap();
+    match st.get_for_key(&p.api_key) {
+        Some(c) => usage_block(&p.api_key, c),
+        None => usage_none(),
+    }
+}
+
+// GET /api/accel/state → {mode, customNode, lines, scopeNote, usage}
 async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
     let (mode, custom_node) = {
         let cfg = s.accel.lock().unwrap();
@@ -604,27 +701,97 @@ async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
         let ls = s.health.lines.lock().unwrap();
         compute_scope_note(&mode, active_base.as_deref(), &ls)
     };
+    // 星图 任务 B:顶层 usage 块(计算失败不致 state 500——纯内存查表,无 unwrap 于 Result)
+    let usage = usage_for_state(&s, &mode);
     ok_json(json!({
         "mode": mode,
         "customNode": custom_node,
         "lines": lines,
         "scopeNote": scope_note,
+        "usage": usage,
     }))
 }
 
 // POST /api/accel/mode {mode}
+// 星图 任务 B:切到 official 时 best-effort 预签发一次每账号凭证(成功落 store;
+// 失败忽略——不阻断切 mode;后续请求由网关凭证确保段兜底)。
 async fn handle_accel_mode(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if !matches!(mode.as_str(), "off" | "official" | "custom") {
         return err_accel(StatusCode::BAD_REQUEST, "mode 须为 off/official/custom");
     }
-    let mut cfg = s.accel.lock().unwrap();
-    if mode == "custom" && cfg.custom_node.trim().is_empty() {
-        return err_accel(StatusCode::BAD_REQUEST, "请先配置自定义加速节点");
+    {
+        let mut cfg = s.accel.lock().unwrap();
+        if mode == "custom" && cfg.custom_node.trim().is_empty() {
+            return err_accel(StatusCode::BAD_REQUEST, "请先配置自定义加速节点");
+        }
+        cfg.mode = mode.clone();
+        save_accel_cfg(&s.codex_home, &cfg);
+    } // 锁在 await 前释放(async fn 的后续 await 需要非阻塞占有)
+    if mode == "official" {
+        if let Some(p) = crate::providers::get_active(&s.providers_path) {
+            if !p.api_key.trim().is_empty() {
+                match crate::nodecreds::issue_node_cred(&issue_base(), &p.api_key).await {
+                    Ok(cred) => {
+                        let mut st = s.nodecreds.write().unwrap();
+                        st.set_for_key(&p.api_key, cred); // 新凭证自带 degraded=false
+                        let _ = crate::nodecreds::save_store(&s.codex_home, &st);
+                        eprintln!("[accel] 切 official:已预签发每账号凭证");
+                    }
+                    Err(_) => {
+                        eprintln!("[accel] 切 official:预签发失败(忽略,不阻断切 mode)");
+                    }
+                }
+            }
+        }
     }
-    cfg.mode = mode;
-    save_accel_cfg(&s.codex_home, &cfg);
     ok_json(json!({ "ok": true }))
+}
+
+// POST /api/accel/refresh-cred —— 手动重签每账号节点凭证(星图 任务 B 契约)。
+// 200 {ok:true,usage} / 400 未配供应商 / 401 Key 无效 / 403 配额满 / 502 节点不可达。
+async fn handle_accel_refresh_cred(State(s): State<Arc<AppState>>) -> Response {
+    let provider = match crate::providers::get_active(&s.providers_path) {
+        Some(p) => p,
+        None => return err_accel(StatusCode::BAD_REQUEST, "请先配置供应商"),
+    };
+    if provider.api_key.trim().is_empty() {
+        return err_accel(StatusCode::BAD_REQUEST, "请先配置供应商");
+    }
+    match crate::nodecreds::issue_node_cred(&issue_base(), &provider.api_key).await {
+        Ok(cred) => {
+            // 刷新成功:落 store(新凭证 degraded_to_direct=false,天然清除降级)+ 回 usage
+            let usage = {
+                let mut st = s.nodecreds.write().unwrap();
+                st.set_for_key(&provider.api_key, cred.clone());
+                let _ = crate::nodecreds::save_store(&s.codex_home, &st);
+                usage_block(&provider.api_key, &cred)
+            };
+            ok_json(json!({ "ok": true, "usage": usage }))
+        }
+        Err(crate::nodecreds::IssueErr::QuotaFull(snap)) => {
+            // 快照若带配额数字 → 更新 store 该 key 的用量(前端下次 state 可见)
+            if let Some(snap) = &snap {
+                let mut st = s.nodecreds.write().unwrap();
+                if let Some(e) = st.creds.get_mut(&crate::nodecreds::hash_key(&provider.api_key)) {
+                    if let Some(u) = snap.quota_used_bytes {
+                        e.quota_used_bytes = u;
+                    }
+                    if let Some(t) = snap.quota_total_bytes {
+                        e.quota_total_bytes = t;
+                    }
+                    let _ = crate::nodecreds::save_store(&s.codex_home, &st);
+                }
+            }
+            err_accel(StatusCode::FORBIDDEN, "该账号本月已用满 10G")
+        }
+        Err(crate::nodecreds::IssueErr::KeyInvalid) => {
+            err_accel(StatusCode::UNAUTHORIZED, "Key 无效或未充值")
+        }
+        Err(crate::nodecreds::IssueErr::Unreachable(_)) => {
+            err_accel(StatusCode::BAD_GATEWAY, "加速节点暂不可达,请稍后再试")
+        }
+    }
 }
 
 // POST /api/accel/custom-node {endpoint}
@@ -718,6 +885,7 @@ mod tests {
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
+            nodecreds: std::sync::Arc::new(std::sync::RwLock::new(crate::nodecreds::Store::empty())),
         }
     }
 
@@ -780,6 +948,7 @@ mod tests {
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
+            nodecreds: std::sync::Arc::new(std::sync::RwLock::new(crate::nodecreds::Store::empty())),
         };
         (state, root)
     }
@@ -1178,6 +1347,244 @@ mod tests {
         let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
         assert_eq!(v["scopeNote"], "该供应商不在官方线路范围,已直连");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 星图 任务 B:usage 块 / refresh-cred / mode 触发 ──
+
+    fn add_active_provider(state: &AppState, api_key: &str) {
+        let input = crate::providers::ProviderInput {
+            name: "T".into(),
+            base_url: "https://api.2xa.cc.cd".into(),
+            api_key: api_key.into(),
+            model: "m".into(),
+            sub2api_multiplier: 1.0,
+            ..Default::default()
+        };
+        let p = crate::providers::create(&state.providers_path, input).unwrap();
+        crate::providers::set_active(&state.providers_path, &p.id);
+    }
+
+    fn put_store_entry(state: &AppState, api_key: &str, cred: crate::nodecreds::NodeCred) {
+        state.nodecreds.write().unwrap().set_for_key(api_key, cred);
+    }
+
+    /// official + 有 entry → usage.ok:true + keyMasked(前3…尾4,断言不含整 Key)。
+    #[tokio::test]
+    async fn accel_state_usage_ok_when_official_with_entry() {
+        let (state, root) = accel_state("official", "", vec![]);
+        let key = format!("sk-live-{}", "2026abcd"); // 仅拼接,断言只用脱敏片段
+        add_active_provider(&state, &key);
+        let cred = test_node_cred("u", "p");
+        put_store_entry(&state, &key, cred.clone());
+
+        let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(v["usage"]["ok"], true, "usage 块应为 ok:true: {v}");
+        let km = v["usage"]["keyMasked"].as_str().unwrap().to_string();
+        assert!(km.starts_with("sk-") && km.contains('…') && km.ends_with("abcd"), "keyMasked 应为前3…尾4脱敏: {km}");
+        assert_eq!(v["usage"]["quotaTotalBytes"], 10_737_418_240u64);
+        assert_eq!(v["usage"]["quotaUsedBytes"], 1_073_741_824u64);
+        assert_eq!(v["usage"]["quotaPercent"], 0.1);
+        assert_eq!(v["usage"]["degradedToDirect"], false);
+        assert_eq!(v["usage"]["issuedAt"], cred.issued_at);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 非 official / official 无 entry / 无 active → usage.ok:false(兜底块)。
+    #[tokio::test]
+    async fn accel_state_usage_false_fallbacks() {
+        // ① mode=off(即使有 active + entry)→ false
+        let (state, root) = accel_state("off", "", vec![]);
+        let key = "sk-fallback-0001";
+        add_active_provider(&state, &key);
+        put_store_entry(&state, key, test_node_cred("u", "p"));
+        let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(v["usage"]["ok"], false);
+        assert_eq!(v["usage"]["degradedToDirect"], false);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // ② official + active 但 store 无该 key 项 → false
+        let (state, root) = accel_state("official", "", vec![]);
+        add_active_provider(&state, "sk-not-issued-0002");
+        let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(v["usage"]["ok"], false);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // ③ official 但无 active provider → false(整 state 不 500)
+        let (state, root) = accel_state("official", "", vec![]);
+        let v = accel_get(&build_router(state), "/api/accel/state").await;
+        assert_eq!(v["usage"]["ok"], false);
+        assert_eq!(v["mode"], "official");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// refresh-cred 200:签发成功 → 落 store + usage.ok:true,且清除降级位。
+    #[tokio::test]
+    async fn refresh_cred_ok_stores_and_clears_degraded() {
+        let base = spawn_issue_mock(
+            "200 OK",
+            r#"{"user":"fresh-u","pass":"fresh-p","quotaTotalBytes":100,"quotaUsedBytes":25,"proxyEndpoint":"http://n"}"#,
+        )
+        .await;
+        let _g = set_issue_base_for_tests(&base);
+        let (state, root) = accel_state("official", "", vec![]);
+        let key = "sk-refresh-0003";
+        add_active_provider(&state, key);
+        // 先放一个已降级的旧项(验证刷新清除 degraded_to_direct)
+        let mut degraded = test_node_cred("old", "old");
+        degraded.degraded_to_direct = true;
+        put_store_entry(&state, key, degraded);
+
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/refresh-cred", &json!({})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["usage"]["ok"], true);
+        assert_eq!(v["usage"]["quotaTotalBytes"], 100);
+        assert_eq!(v["usage"]["quotaUsedBytes"], 25);
+        assert_eq!(v["usage"]["quotaPercent"], 0.25);
+        // store 落项且降级被清除
+        let entry = state.nodecreds.read().unwrap().get_for_key(key).cloned().expect("刷新后 store 应有该 key 项");
+        assert!(!entry.degraded_to_direct, "刷新应清除 degraded_to_direct");
+        assert_eq!(entry.quota_used_bytes, 25);
+        // 落盘可见
+        assert!(state.codex_home.join("accel-credentials.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// refresh-cred 401(Key 无效)→ 401 + 人话 error。
+    #[tokio::test]
+    async fn refresh_cred_401_key_invalid() {
+        let base = spawn_issue_mock("401 Unauthorized", r#"{"error":"Key 无效或未充值"}"#).await;
+        let _g = set_issue_base_for_tests(&base);
+        let (state, root) = accel_state("official", "", vec![]);
+        add_active_provider(&state, "sk-bad-0004");
+        let (st, v) = accel_post(&build_router(state), "/api/accel/refresh-cred", &json!({})).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        assert_eq!(v["error"], "Key 无效或未充值");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// refresh-cred 403(配额满)→ 403 + 人话 error + 快照更新 store used。
+    #[tokio::test]
+    async fn refresh_cred_403_quota_full_updates_snapshot() {
+        let base = spawn_issue_mock(
+            "403 Forbidden",
+            r#"{"error":"该账号本月已用满 10G","quotaUsedBytes":999,"quotaTotalBytes":1000}"#,
+        )
+        .await;
+        let _g = set_issue_base_for_tests(&base);
+        let (state, root) = accel_state("official", "", vec![]);
+        let key = "sk-full-0005";
+        add_active_provider(&state, key);
+        put_store_entry(&state, key, test_node_cred("u", "p"));
+
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/refresh-cred", &json!({})).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert_eq!(v["error"], "该账号本月已用满 10G");
+        let entry = state.nodecreds.read().unwrap().get_for_key(key).cloned().unwrap();
+        assert_eq!(entry.quota_used_bytes, 999, "快照带 used → 应回写 store");
+        assert_eq!(entry.quota_total_bytes, 1000);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// refresh-cred 502(节点不可达)→ 502 + 人话 error。
+    #[tokio::test]
+    async fn refresh_cred_502_unreachable() {
+        let _g = set_issue_base_for_tests(DEAD_ISSUE_BASE);
+        let (state, root) = accel_state("official", "", vec![]);
+        add_active_provider(&state, "sk-any-0006");
+        let (st, v) = accel_post(&build_router(state), "/api/accel/refresh-cred", &json!({})).await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+        assert_eq!(v["error"], "加速节点暂不可达,请稍后再试");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// refresh-cred 400:无 active provider / key 为空 → 「请先配置供应商」。
+    #[tokio::test]
+    async fn refresh_cred_400_no_provider() {
+        let (state, root) = accel_state("official", "", vec![]);
+        let (st, v) = accel_post(&build_router(state), "/api/accel/refresh-cred", &json!({})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], "请先配置供应商");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 切 official 触发 best-effort 预签发:成功 → store 落项。
+    #[tokio::test]
+    async fn mode_official_best_effort_issue_success() {
+        let base = spawn_issue_mock(
+            "200 OK",
+            r#"{"user":"mu","pass":"mp","quotaTotalBytes":10,"quotaUsedBytes":1,"proxyEndpoint":"http://n"}"#,
+        )
+        .await;
+        let _g = set_issue_base_for_tests(&base);
+        let (state, root) = accel_state("off", "", vec![]);
+        let key = "sk-mode-ok-0007";
+        add_active_provider(&state, key);
+
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/mode", &json!({"mode": "official"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        assert!(state.nodecreds.read().unwrap().get_for_key(key).is_some(), "切 official 应 best-effort 预签发落 store");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 切 official 预签发失败(不可达)→ 忽略失败,mode 仍切换成功。
+    #[tokio::test]
+    async fn mode_official_best_effort_failure_does_not_block() {
+        let _g = set_issue_base_for_tests(DEAD_ISSUE_BASE);
+        let (state, root) = accel_state("off", "", vec![]);
+        add_active_provider(&state, "sk-mode-fail-0008");
+
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/mode", &json!({"mode": "official"})).await;
+        assert_eq!(st, StatusCode::OK, "预签发失败不得阻断切 mode");
+        assert_eq!(v["ok"], true);
+        let v = accel_get(&build_router(state), "/api/accel/state").await;
+        assert_eq!(v["mode"], "official");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ── 测试公共件:mock 节点签发服务(星图 任务 B;server/gateway 测试共用)──
+
+/// 可控 mock 签发服务:任意请求固定回 status_line + JSON body。
+/// 与 nodecreds.rs 的样板同构(该模块只读,不得复用其私有测试件)。
+#[cfg(test)]
+pub async fn spawn_issue_mock(status_line: &'static str, body: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { break };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await; // 消费请求(不求完整)
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// 必拒连地址(discard 端口):签发 Unreachable 分支用,无端口竞争。
+#[cfg(test)]
+pub const DEAD_ISSUE_BASE: &str = "http://127.0.0.1:9";
+
+#[cfg(test)]
+pub fn test_node_cred(user: &str, pass: &str) -> crate::nodecreds::NodeCred {
+    crate::nodecreds::NodeCred {
+        user: user.into(),
+        pass: pass.into(),
+        quota_total_bytes: 10_737_418_240,
+        quota_used_bytes: 1_073_741_824,
+        proxy_endpoint: crate::nodecreds::DEFAULT_ISSUE_BASE.into(),
+        issued_at: chrono::Utc::now().timestamp(),
+        degraded_to_direct: false,
     }
 }
 

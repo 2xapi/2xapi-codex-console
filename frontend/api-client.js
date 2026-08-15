@@ -120,7 +120,21 @@
         e.status = (p && p.status) || 0;
         throw e;
       }
-      return { mode: p.mode, customNode: p.customNode || "", lines: p.lines || [], scopeNote: p.scopeNote || "" };
+      // usage:每账号凭证用量(契约新增顶层块;旧后端/未换取成功时缺省 → 兜底 {ok:false})
+      return {
+        mode: p.mode, customNode: p.customNode || "", lines: p.lines || [], scopeNote: p.scopeNote || "",
+        usage: p.usage || { ok: false, degradedToDirect: false },
+      };
+    },
+    // refresh-cred 契约:200 {ok:true, usage:{...}} / 4xx {error:"人话"}(非信封,顶层字段;4xx 由 rawJson 抛 error)
+    accelRefreshCred: async () => {
+      const p = await rawJson("POST", "/api/accel/refresh-cred", {});
+      if (!p || p.ok !== true) {
+        const e = new Error((p && p.error) || "刷新凭证失败");
+        e.status = (p && p.status) || 0;
+        throw e;
+      }
+      return { ok: true, usage: p.usage || { ok: false, degradedToDirect: false } };
     },
     // mode/custom-node 契约走 04 信封 → {ok:true}
     accelSetMode: (mode) => request("POST", "/api/accel/mode", { body: { mode } }),

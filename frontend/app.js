@@ -45,6 +45,9 @@ function askConfirm(msg) {
   return new Promise(function (resolve) { state.confirmBox = { msg: msg, resolve: resolve }; render(); });
 }
 function lineOf(id) { return state.providers.find(function (p) { return p.id === id; }) || null; }
+/* bytes → GB 两位小数(官方线路配额展示专用) */
+function fmtGb(bytes) { return (Number(bytes || 0) / 1073741824).toFixed(2); }
+function fmtQuotaTotalGb(bytes) { return String(Math.round(Number(bytes || 10737418240) / 1073741824)); }
 function hosting() { return (state.dstate && state.dstate.hosting) || null; }
 function hostedBy(id) { var h = hosting(); return !!h && h.way === "gateway" && (id ? h.providerId === id : true); }
 var CHIP_COLORS = ["var(--c-gw)", "var(--c-direct)", "var(--c-accel)", "var(--c-official)"];
@@ -67,7 +70,7 @@ async function refreshDesktop() {
   try { state.dstate = await api.desktopState(); } catch (e) { state.dstate = null; }
 }
 async function refreshAccel() {
-  try { state.accel = await api.accelState(); } catch (e) { state.accel = state.accel || { mode: "off", customNode: "", lines: [], scopeNote: "" }; }
+  try { state.accel = await api.accelState(); } catch (e) { state.accel = state.accel || { mode: "off", customNode: "", lines: [], scopeNote: "", usage: { ok: false, degradedToDirect: false } }; }
 }
 async function refreshSession() {
   try { state.session = await api.session(); } catch (e) { state.session = null; }
@@ -217,6 +220,7 @@ function desktopCard() {
   var accelMode = acc.mode || "off";                       // off | official | custom
   var accelLabel = accelMode === "official" ? "官方线路" : "我的节点";
   var accelOn = accelMode !== "off" && (accelMode === "official" || !!acc.customNode); // 是否走加速节点
+  var usage = (acc.usage && acc.usage.ok) ? acc.usage : null; // 每账号凭证用量;未换取成功/缺省(ok:false)→ 不显示
 
   var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
   var lk = function (c, live) { return '<div class="lk ' + (live ? "live" : "") + '" style="--lc:' + c + '"></div>'; };
@@ -240,7 +244,10 @@ function desktopCard() {
         : lk("var(--c-gw)", true))
       + st(p ? chipColor(p, state.providers.indexOf(p)) : "var(--c-gw)", esc(p ? p.name : "?"), "中转站");
     note = '<div class="route-mode"><span class="k">●</span>通路二:网关' + (accelOn ? " + 加速(" + accelLabel + ")" : "(加速已关,直发上游)") + ' · 配置文件零 Key,Key 由网关注入 · ' + modeName + '</div>'
-      + (accelMode === "official" && acc.scopeNote ? '<div class="notice" style="margin:0 0 10px">' + esc(acc.scopeNote) + '</div>' : "");
+      + (accelMode === "official" && acc.scopeNote ? '<div class="notice" style="margin:0 0 10px">' + esc(acc.scopeNote) + '</div>' : "")
+      + (usage && usage.degradedToDirect
+        ? '<div class="notice" style="margin:0 0 10px">⚠ 官方加速配额已用满,已自动切换直连;点「刷新凭证」重试或等待配额恢复</div>'
+        : "");
     mech = (hasOff ? '<span>① 官方登录/插件保留</span>' : '<span>① 无需官方账号</span>')
       + '<span>② 配置文件零 Key</span><span>③ 协议转换 · chat 中转可用</span>'
       + '<span>④ 加速:' + (accelMode === "off" ? "关" : accelLabel) + '</span><span>依赖本 app 常驻</span>';
@@ -270,6 +277,9 @@ function desktopCard() {
         + '<button data-a="accel" data-m="official" aria-pressed="' + (accelMode === "official") + '" style="--lc:var(--c-accel)">官方线路<small>2xapi 站专用 · 自动可用</small></button>'
         + '<button data-a="accel" data-m="custom" aria-pressed="' + (accelMode === "custom") + '" style="--lc:var(--c-accel)"' + (acc.customNode ? "" : " disabled") + '>我的节点<small>自己的 VPS / 本地代理</small></button>'
         + '</div>'
+        + (accelMode === "official" && usage
+          ? '<div class="hint" style="margin:6px 0 0' + (usage.quotaPercent >= 0.9 ? ";color:var(--c-err)" : "") + '">官方线路用量 ' + fmtGb(usage.quotaUsedBytes) + " G / " + fmtQuotaTotalGb(usage.quotaTotalBytes) + " G</div>"
+          : "")
       : "")
     + '</div>'
     + '<div class="f"><label>供应商(走哪家中转)</label><select data-a="lsel"' + (state.providers.length ? "" : " disabled") + '>'
@@ -543,7 +553,12 @@ function modalHtml() {
       + '<button class="btn ghost" data-a="node-save"' + (state.accelBusy === "node-save" ? " disabled" : "") + '>保存</button>'
       + '<button class="btn ghost" data-a="test-node"' + (state.accelBusy === "node-test" ? " disabled" : "") + '>测试节点连通</button>'
       + '</div>' + testHtml
-      + '<div class="hint">自己的 VPS(跑 gost/squid)或本地代理客户端端口;填好后保存,主卡「加速」里即可选「我的节点」。官方加速专线由 2xapi 下发,无需填写。某个供应商若要固定走代理,用该供应商编辑里的「高级 · HTTP 代理」。</div></div>';
+      + '<div class="hint">自己的 VPS(跑 gost/squid)或本地代理客户端端口;填好后保存,主卡「加速」里即可选「我的节点」。官方加速专线由 2xapi 下发,无需填写。某个供应商若要固定走代理,用该供应商编辑里的「高级 · HTTP 代理」。</div></div>'
+      + '<div class="f full" style="margin-top:14px"><label>官方加速凭证(每账号 10 G / 月)</label>'
+      + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      + '<button class="btn ghost" data-a="node-refresh"' + (state.accelBusy === "node-refresh" ? " disabled" : "") + '>' + (state.accelBusy === "node-refresh" ? "刷新中…" : "刷新凭证") + '</button>'
+      + '<span class="hint">重新换取本账号专属代理凭证并更新用量;配额用满会自动切直连,恢复后刷新即可重新加速。</span>'
+      + '</div></div>';
   }
   var title = { history: "历史会话", settings: "本机设置" }[m.t];
   return '<div class="mask" data-a="mclose"><div class="box"><h2 style="margin:0 0 12px;font-size:15px">' + title + '</h2>' + body + '<div class="btn-row"><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
@@ -627,10 +642,27 @@ async function doAccelMode(m) {
     await api.accelSetMode(m);
     state.accel.mode = m;
     showToast(m === "off" ? "加速已关闭,网关直发上游" : "加速已切换:" + (m === "official" ? "官方线路" : "我的节点"), "ok");
+    if (m === "official") await doAccelRefreshCred(true); // 切官方线路:自动取一次最新用量(静默)
   } catch (e) {
     showToast(e.message, "error");
   }
   state.accelBusy = null; render();
+}
+/* 刷新官方加速凭证:重新换取本账号专属凭证并更新用量(silent=切换线路后自动取用量,不弹提示) */
+async function doAccelRefreshCred(silent) {
+  state.accelBusy = "node-refresh"; render();
+  try {
+    var r = await api.accelRefreshCred();
+    if (!state.accel) state.accel = { mode: "off", customNode: "", lines: [], scopeNote: "", usage: { ok: false, degradedToDirect: false } };
+    state.accel.usage = (r && r.usage) || { ok: false, degradedToDirect: false };
+    var u = state.accel.usage;
+    if (!silent) showToast(u && u.ok ? "已刷新(用量 " + fmtGb(u.quotaUsedBytes) + " G / " + fmtQuotaTotalGb(u.quotaTotalBytes) + "G)" : "已刷新", "ok");
+  } catch (e) {
+    if (!silent) showToast(e.message, "error");
+  }
+  state.accelBusy = null;
+  await refreshAccel();
+  render();
 }
 async function doAccelSaveNode() {
   var el = document.querySelector("[data-anode]");
@@ -918,6 +950,7 @@ document.addEventListener("click", function (ev) {
     case "test": doTestConnection(); break;
     case "accel": doAccelMode(t.dataset.m); break;
     case "node-save": doAccelSaveNode(); break;
+    case "node-refresh": doAccelRefreshCred(); break;
     case "test-node": doAccelTestNode(); break;
   }
 });

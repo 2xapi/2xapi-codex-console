@@ -15,6 +15,7 @@ mod gateway;
 mod gateway_conv;
 mod diagnose;
 mod acclines;
+mod nodecreds;
 
 use std::net::TcpListener;
 use tauri::{Manager, WebviewWindowBuilder};
@@ -48,6 +49,8 @@ fn main() {
     let lines = crate::acclines::load_lines(&codex_home);
     let health_state = std::sync::Arc::new(crate::acclines::HealthState::new(lines.lines));
     let accel_state = std::sync::Arc::new(std::sync::Mutex::new(server::load_accel_cfg(&codex_home)));
+    // 星图 任务 B:每账号节点凭证表(兼容迁移旧单对象 → legacy)
+    let nodecreds_store = std::sync::Arc::new(std::sync::RwLock::new(nodecreds::load_store(&codex_home)));
 
     let state = server::AppState {
         config_path: config_path.clone(),
@@ -57,6 +60,7 @@ fn main() {
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,
+        nodecreds: nodecreds_store,
     };
 
     let router = server::build_router(state);
