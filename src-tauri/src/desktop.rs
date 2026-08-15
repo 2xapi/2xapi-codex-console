@@ -309,6 +309,46 @@ fn build_unhosted_config(current: &Value) -> Value {
     cfg
 }
 
+/// 从 pre-host 快照恢复受控字段(§1.5-1):model_provider/model/model_catalog_json/custom 段
+/// 取快照值,其余字段保留当前。快照无某字段则移除之。
+fn restore_controlled_from_snapshot(current: &Value, snapshot: &Value) -> Value {
+    let mut cfg = current.clone();
+    let obj = cfg.as_object_mut().expect("config 不是 object");
+    for k in ["model_provider", "model", "model_catalog_json"] {
+        match snapshot.get(k) {
+            Some(v) if !v.is_null() => { obj.insert(k.into(), v.clone()); }
+            _ => { obj.remove(k); }
+        }
+    }
+    let mut mp = current.get("model_providers").cloned().unwrap_or(json!({}));
+    if let Some(m) = mp.as_object_mut() { m.remove("custom"); }
+    if let Some(sp) = snapshot.get("model_providers").and_then(|x| x.get("custom")) {
+        if let Some(m) = mp.as_object_mut() { m.insert("custom".into(), sp.clone()); }
+    }
+    let mp_empty = mp.as_object().map(|m| m.is_empty()).unwrap_or(true);
+    if mp_empty { obj.remove("model_providers"); } else { obj.insert("model_providers".into(), mp); }
+    cfg
+}
+
+/// 找 backup_dir 里用途为 pre-host 的最新快照(host 前 config)。无则 None。
+fn find_pre_host_snapshot(backup_dir: &Path) -> Option<Value> {
+    let mut candidates: Vec<(Option<std::time::SystemTime>, Value)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(backup_dir) {
+        for e in rd.flatten() {
+            let manifest = e.path();
+            let name = manifest.file_name()?.to_string_lossy();
+            if !name.ends_with(".manifest.json") { continue; }
+            let meta: Value = serde_json::from_str(&std::fs::read_to_string(&manifest).ok()?).ok()?;
+            if meta.get("purpose").and_then(|v| v.as_str()) != Some("pre-host") { continue; }
+            let toml_path = manifest.with_file_name(name.trim_end_matches(".manifest.json"));
+            let v = crate::config::read_toml(&toml_path); // 失败返回空对象,无害
+            candidates.push((e.metadata().and_then(|m| m.modified()).ok(), v));
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // 最新在前
+    candidates.into_iter().next().map(|(_, v)| v)
+}
+
 /// auth.json 里移除我们写入的 OPENAI_API_KEY(仅当值匹配最后一次托管供应商的 key;无 .bak 时的兜底)。
 fn remove_auth_key_if_ours(codex_home: &Path, api_key: &str) -> bool {
     let auth_p = codex_home.join("auth.json");
@@ -347,10 +387,14 @@ pub fn unhost(
         return Ok(json!({ "restored": true, "way": "official" }));
     }
 
-    // 无官方账号:移除托管痕迹
+    // 无官方账号:移除托管痕迹。优先从 pre-host 快照恢复受控字段(§1.5-1,opencode 等手写
+    // 用户的配置得以还原);无快照才清除。
     let active = crate::providers::get_active(providers_path);
     let current = read_toml(config_path);
-    let merged = build_unhosted_config(&current);
+    let merged = match find_pre_host_snapshot(backup_dir) {
+        Some(snapshot) => restore_controlled_from_snapshot(&current, &snapshot),
+        None => build_unhosted_config(&current),
+    };
     let new_toml = config_to_toml_string(&merged).map_err(io)?;
     let current_toml = config_to_toml_string(&current).unwrap_or_default();
     let config_written = if new_toml != current_toml {
@@ -704,6 +748,39 @@ mod tests {
         assert!(out["alreadyClean"].as_bool().unwrap());
         // 第三方段原样保留
         assert!(std::fs::read_to_string(&cfg).unwrap().contains("opencode.ai"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §1.5-1:存在 pre-host 快照时,unhost 应把受控字段恢复为快照值(opencode 等手写配置得以还原),
+    /// 而非清除。host 前 config 有 opencode custom 段 → host → unhost → 应回到 opencode 配置。
+    #[test]
+    fn unhost_restores_pre_host_snapshot_controlled_fields() {
+        let (root, cfg, bk, home, prov) = sandbox("unhost-restore");
+        // host 前:opencode 手写 custom 段(真实场景)
+        std::fs::write(
+            &cfg,
+            "model_provider = \"custom\"\nmodel = \"deepseek-v4-flash\"\n[model_providers.custom]\nbase_url = \"https://opencode.ai/zen/go/v1\"\nwire_api = \"responses\"\n",
+        )
+        .unwrap();
+        write_providers(&prov, vec![provider("p1", "A")]);
+
+        // host 产生 pre-host 快照
+        host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+        assert!(find_pre_host_snapshot(&bk).is_some(), "host 应留下 pre-host 快照");
+
+        // unhost → 受控字段恢复为快照(opencode 配置回来)
+        let out = unhost(&cfg, &bk, &home, &prov).unwrap();
+        assert_eq!(out["way"], "clean");
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(written.contains("opencode.ai"), "custom 段应恢复为快照值(opencode):\n{written}");
+        assert!(written.contains("model_provider = \"custom\""));
+        assert!(written.contains("deepseek-v4-flash"), "model 应恢复为快照值:\n{written}");
+        // host 期间的其他改动(若有)应保留——这里没加,只验受控字段回弹
+        assert!(crate::providers::load(&prov).active_provider_id.is_none());
+
+        // 幂等:二次 unhost → alreadyClean
+        let out2 = unhost(&cfg, &bk, &home, &prov).unwrap();
+        assert!(out2["alreadyClean"].as_bool().unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

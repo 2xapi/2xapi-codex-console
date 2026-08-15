@@ -146,6 +146,50 @@ function rail() {
     + '<div class="rail-foot"><a data-a="tool" data-t="history">历史会话</a><a data-a="tool" data-t="settings">本机设置</a></div>';
 }
 
+/* 测试连接结果渲染(state.test: null | {busy:true} | {ok:true, data} | {ok:false, msg, field}) */
+function testStepsHtml() {
+  var t = state.test;
+  var step = function (icon, text, meta, bad) {
+    return '<div class="step' + (bad ? " bad" : "") + '">' + icon + " " + text + (meta ? '<span class="meta">' + esc(meta) + "</span>" : "") + "</div>";
+  };
+  if (t.busy) {
+    return '<div id="rtest"><div class="steps" style="margin-top:12px">' + step("⟳", "测试连接进行中…", "密钥/协议/建议") + "</div></div>";
+  }
+  if (!t.ok) {
+    // 失败:人话提示 + 高亮来源(连接=地址字段,认证=Key 字段)
+    return '<div id="rtest"><div class="steps" style="margin-top:12px">'
+      + step("✗", t.msg || "测试连接失败", t.meta, true)
+      + "</div></div>";
+  }
+  var d = t.data;
+  var steps = [];
+  steps.push(step(d.keyOk ? "✓" : "✗", d.keyOk ? "密钥有效" : "密钥无效", (d.keyOk ? (d.models.length + " 个模型") : "") + " · " + d.latencyMs + "ms", !d.keyOk));
+  var proto = d.responsesCompat ? "Responses 兼容" : (d.chatOk ? "仅 Chat(网关自动转换)" : "协议未测出");
+  steps.push(step((d.responsesCompat || d.chatOk) ? "✓" : "✗", "协议判定:" + proto, d.responsesCompat ? "免转换" : (d.chatOk ? "需经网关转换" : ""), !(d.responsesCompat || d.chatOk)));
+  if (d.suggest === "gateway") {
+    steps.push(step("⚡", "建议方式:网关(推荐,零落盘)", "可一键开启托管"));
+  } else if (d.error) {
+    steps.push(step("✗", "无可用接入方式", d.error, true));
+  } else {
+    steps.push(step("⚡", "建议方式:网关", ""));
+  }
+  return '<div id="rtest"><div class="steps" style="margin-top:12px">' + steps.join("") + "</div></div>";
+}
+
+async function doTestConnection() {
+  // 测当前选中供应商(未托管时主卡下拉即选中者;托管中测托管者)
+  var pid = (hosting() && hosting().providerId) || state.selId;
+  if (!pid) { showToast("请先选择或新建一个供应商", "error"); return; }
+  state.test = { busy: true }; render();
+  try {
+    var d = await api.preflight({ providerId: pid });
+    state.test = { ok: true, data: d };
+  } catch (e) {
+    state.test = { ok: false, msg: e.message, meta: "请求失败" };
+  }
+  render();
+}
+
 /* ── 桌面版主卡:账号状态自动检测 × 通路(本期 gateway;direct 待字段实测,加速待阶段 4) ── */
 function desktopCard() {
   var d = state.dstate || {};
@@ -218,9 +262,9 @@ function desktopCard() {
     + (isHost
       ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>' + (hasOff ? "还原官方" : "关闭托管(移除中转配置)") + (state.busy === "unhost" ? "…" : "") + '</button>'
       : '<button class="btn primary" data-a="host"' + (!hostPid || state.busy === "host" ? " disabled" : "") + ' style="--lc:var(--c-gw)">开启:桌面版走中转' + (state.busy === "host" ? "…" : "") + '</button>')
-    + '<button class="btn ghost" data-a="test">⚡ 测试连接</button>'
+    + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? ' disabled' : '') + '>⚡ 测试连接</button>'
     + '</div>'
-    + '<div id="rtest"></div>'
+    + (state.test ? testStepsHtml() : '<div id="rtest"></div>')
     + '</section>';
 }
 
@@ -685,7 +729,7 @@ document.addEventListener("click", function (ev) {
     case "mclose": state.modal = null; render(); break;
     case "cyes": { var c = state.confirmBox; state.confirmBox = null; render(); if (c) c.resolve(true); break; }
     case "cno": { var c2 = state.confirmBox; state.confirmBox = null; render(); if (c2) c2.resolve(false); break; }
-    case "test": showToast("测试连接即将上线(下一阶段)", "ok"); break;
+    case "test": doTestConnection(); break;
   }
 });
 

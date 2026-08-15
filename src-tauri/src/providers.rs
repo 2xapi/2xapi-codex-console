@@ -220,17 +220,35 @@ pub fn load(path: &Path) -> ProviderData {
     data
 }
 
-fn save_atomic(path: &Path, data: &ProviderData) -> Result<(), String> {
+fn save_atomic(path: &Path, data: &ProviderData, op: &str) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(data).map_err(|e| format!("序列化失败: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &raw).map_err(|e| format!("写临时文件失败: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("重命名失败: {e}"))?;
+    // 审计(尽力而为,失败不影响主流程)——排查 providers.json 异常变动的唯一指望(§1.5-2)
+    append_audit(path, op, data);
     Ok(())
+}
+
+/// 每次 providers.json 写操作追加一行 JSONL 到同目录 providers.audit.jsonl。
+fn append_audit(providers_path: &Path, op: &str, data: &ProviderData) {
+    use std::io::Write;
+    let audit_path = providers_path.with_file_name("providers.audit.jsonl");
+    let line = json!({
+        "ts": chrono::Local::now().to_rfc3339(),
+        "op": op,
+        "active": data.active_provider_id,
+        "providers": data.providers.iter().map(|p| json!({"id": p.id, "name": p.name})).collect::<Vec<_>>(),
+        "count": data.providers.len(),
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&audit_path) {
+        let _ = writeln!(f, "{}", line);
+    }
 }
 
 /// 持久化 ProviderData（供 config.rs 的 activate 编排用）。
 pub fn store(path: &Path, data: &ProviderData) -> Result<(), String> {
-    save_atomic(path, data)
+    save_atomic(path, data, "store")
 }
 
 /// ProviderInput → Provider（id/created_at/sort_index 置空；供 preview 临时对象用）。
@@ -350,7 +368,7 @@ pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<Validat
         reasoning_levels: None,
     };
     data.providers.push(provider.clone());
-    save_atomic(path, &data).map_err(io_errs)?;
+    save_atomic(path, &data, "create").map_err(io_errs)?;
     Ok(provider)
 }
 
@@ -391,7 +409,7 @@ pub fn update(path: &Path, id: &str, input: ProviderInput) -> Result<Provider, V
     p.sub2api_multiplier = eff.sub2api_multiplier;
     p.custom_headers = eff.custom_headers;
     let updated = p.clone();
-    save_atomic(path, &data).map_err(io_errs)?;
+    save_atomic(path, &data, "update").map_err(io_errs)?;
     Ok(updated)
 }
 
@@ -402,7 +420,7 @@ pub fn delete(path: &Path, id: &str) {
     if data.active_provider_id.as_deref() == Some(id) {
         data.active_provider_id = None;
     }
-    let _ = save_atomic(path, &data);
+    let _ = save_atomic(path, &data, "delete");
 }
 
 /// FR-1.3 列表：按 sort_index 升序。
@@ -421,7 +439,7 @@ pub fn reorder(path: &Path, ids: &[String]) {
             p.sort_index = idx as i64;
         }
     }
-    let _ = save_atomic(path, &data);
+    let _ = save_atomic(path, &data, "reorder");
 }
 
 // ── active 管理（数据层；config 写入在 M2）──────────────────
@@ -430,14 +448,14 @@ pub fn reorder(path: &Path, ids: &[String]) {
 pub fn set_active(path: &Path, id: &str) {
     let mut data = load(path);
     data.active_provider_id = Some(id.to_string());
-    let _ = save_atomic(path, &data);
+    let _ = save_atomic(path, &data, "set_active");
 }
 
 #[allow(dead_code)] // activate-official（M2）会用到
 pub fn clear_active(path: &Path) {
     let mut data = load(path);
     data.active_provider_id = None;
-    let _ = save_atomic(path, &data);
+    let _ = save_atomic(path, &data, "clear_active");
 }
 
 pub fn get_active(path: &Path) -> Option<Provider> {
@@ -804,5 +822,50 @@ mod tests {
         assert_eq!(data.providers[0].name, "Old");
         assert!(matches!(data.providers[0].access_mode, AccessMode::PureApi));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// §1.5-2:每次写操作应在同目录 providers.audit.jsonl 追加一行(时间/操作/摘要)。
+    #[test]
+    fn audit_log_appended_on_write() {
+        // 专有隔离目录(避免与并行测试共享 /tmp 下任何路径)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("2xapi-audit-iso-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("providers.json");
+        let audit_path = root.join("providers.audit.jsonl");
+
+        // create 两次 + set_active 一次 → 3 行
+        let input = ProviderInput {
+            name: "AuditA".into(),
+            base_url: "https://a.test".into(),
+            api_key: "sk-a".into(),
+            model: "m".into(),
+            access_mode: AccessMode::PureApi,
+            sub2api_multiplier: 1.0,
+            ..Default::default()
+        };
+        let a = create(&path, input.clone()).unwrap();
+        let b = create(&path, input).unwrap();
+        set_active(&path, &a.id);
+
+        let raw = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 3, "三次写应有三条审计:\n{raw}");
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["op"], "create");
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["providers"][0]["name"], "AuditA");
+        let third: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(third["op"], "set_active");
+        assert_eq!(third["active"], a.id);
+        // 删除后审计记录 b 消失
+        let _ = delete(&path, &b.id);
+        let raw2 = std::fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(raw2.lines().filter(|l| !l.trim().is_empty()).count(), 4);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

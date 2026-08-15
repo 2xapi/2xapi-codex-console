@@ -63,6 +63,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/providers/diagnose", post(handle_providers_diagnose))
         .route("/api/providers/:id", put(handle_providers_update).delete(handle_providers_delete))
         // --- Codex 启动器（M7，直连版）---
+        .route("/api/launcher/preflight", post(handle_launcher_preflight))
         .route("/api/launcher/start", post(handle_launcher_start))
         .route("/api/launcher/stop", post(handle_launcher_stop))
         .route("/api/launcher/status", get(handle_launcher_status))
@@ -855,6 +856,49 @@ async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
 }
 
 // ── Codex 启动器（M7，直连版）──────────────────────────────
+
+// POST /api/launcher/preflight { providerId } | { baseUrl, apiKey } —— 测试连接(阶段 2,任务书 §三)
+async fn handle_launcher_preflight(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let (base_url, api_key, model_hint): (String, String, String) = {
+        let id = body.get("providerId").and_then(|v| v.as_str()).unwrap_or("");
+        if !id.is_empty() {
+            let data = crate::providers::load(&s.providers_path);
+            match data.providers.iter().find(|p| p.id == id) {
+                Some(p) => (p.base_url.clone(), p.api_key.clone(), p.model.clone()),
+                None => return err_env(StatusCode::NOT_FOUND, "E_NOT_FOUND", "供应商不存在", None),
+            }
+        } else {
+            let b = body.get("baseUrl").or_else(|| body.get("base_url")).and_then(|v| v.as_str()).unwrap_or("");
+            let k = body.get("apiKey").or_else(|| body.get("api_key")).and_then(|v| v.as_str()).unwrap_or("");
+            let m = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if b.is_empty() || k.is_empty() {
+                return err_env(StatusCode::BAD_REQUEST, "E_BAD_REQUEST", "需要 providerId,或 baseUrl+apiKey", None);
+            }
+            (b.to_string(), k.to_string(), m.to_string())
+        }
+    };
+
+    let r = crate::probe::preflight(&base_url, &api_key, &model_hint).await;
+
+    // 人话错误映射(任务书 §三):timeout/auth/notfound
+    let human_error: Option<&str> = match r.error {
+        Some("timeout") => Some("连不上:检查地址或网络"),
+        Some("auth") => Some("Key 无效或未充值"),
+        Some("notfound") => Some("地址不对,或该站不支持这个协议"),
+        _ => None,
+    };
+
+    ok_env(json!({
+        "keyOk": r.key_ok,
+        "models": r.models.iter().map(|(n, c)| json!({ "name": n, "contextWindow": c })).collect::<Vec<_>>(),
+        "responsesCompat": r.responses_compat,
+        "chatOk": r.chat_ok,
+        "latencyMs": r.latency_ms,
+        "suggest": r.suggest,
+        "error": r.error,          // 机器码:timeout|auth|notfound|null
+        "message": human_error,    // 人话提示(前端展示;失败时高亮具体字段)
+    }))
+}
 
 // POST /api/launcher/start { providerId?, baseUrl?, apiKey?, model?, projectDir, wireApi? }
 async fn handle_launcher_start(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
