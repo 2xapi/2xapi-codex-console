@@ -315,6 +315,7 @@ function detailCard() {
     + kv("协议", p.wireApi === "chat_completions" ? "chat(自动经网关转换)" : "responses", true)
     + kv("默认模型", p.model, true)
     + kv("模型数", (p.models || []).length || "—", true)
+    + kv("思考档位", (p.reasoning_levels || []).join(" / ") || "—", true)
     + kv("备注", p.notes)
     + "</div>"
     + '<div class="btn-row">'
@@ -357,7 +358,17 @@ function editCard() {
       + '<td><input data-mf="cw" data-mi="' + i + '" style="width:90px" value="' + esc(x.contextWindow || "") + '"></td>'
       + '<td><button class="btn ghost danger" data-a="mrow-del" data-i="' + i + '">✕</button></td></tr>';
   }).join("");
+  // 思考档位标签:探测到的档位;无则「—」
+  var rl = (d.reasoning_levels || []).filter(function (x) { return x; });
+  var rlBar = '<div class="rl-bar"><span class="k">思考档位</span>'
+    + (rl.length ? rl.map(function (x) { return '<span class="rl-tag">' + esc(x) + '</span>'; }).join("")
+      : '<span class="rl-muted">—</span>')
+    + '</div>';
   var wireSel = d.wireApi === "chat_completions" ? "chat_completions" : "responses";
+  // 推理强度下拉:自动(跟随探测) + 五档;回显草稿里选中的档位
+  var rlCur = d.reasoningLevelSel || "";
+  var rlOpts = [["", "自动(跟随探测)"], ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"]]
+    .map(function (o) { return '<option value="' + o[0] + '"' + (rlCur === o[0] ? " selected" : "") + '>' + o[1] + '</option>'; }).join("");
   return '<section class="card"><h2>' + (state.isNew ? "新建供应商" : "编辑供应商 · " + esc(d.name)) + '</h2>'
     + '<div class="sub">填好地址和 Key,点「拉取模型」自动获取模型列表;Key 只存在本软件里,不写入任何配置文件。</div>'
     + '<div class="grid">'
@@ -367,13 +378,15 @@ function editCard() {
     + '<div class="f' + fc("model") + '"><label>默认模型 *</label><input class="mono" data-f="model" value="' + esc(d.model || "") + '" placeholder="点「拉取模型」后自动填入">' + fe("model") + '</div>'
     + "</div>"
     + '<div class="eyebrow" style="margin:16px 0 6px">模型列表(「拉取模型」自动填写,一般无需手改)</div>'
+    + rlBar
     + '<table class="mtable"><thead><tr><th>模型名</th><th>上下文</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>'
     + '<div class="btn-row">'
     + '<button class="btn ghost" data-a="mfetch"' + (state.busy === "mfetch" ? " disabled" : '') + '>' + (state.busy === "mfetch" ? "拉取中…" : "⤓ 拉取模型") + '</button>'
     + '<button class="btn ghost" data-a="mrow-add">＋ 手动加一行</button>'
     + '</div>'
-    + '<details style="margin-top:10px"><summary>高级(协议 · 代理 · 超时 · 备注)· 不用动</summary><div class="grid" style="margin-top:10px">'
+    + '<details style="margin-top:10px"><summary>高级(协议 · 代理 · 超时 · 推理强度 · 备注)· 不用动</summary><div class="grid" style="margin-top:10px">'
     + '<div class="f"><label>协议</label><select data-f="wireSel"><option value="auto"' + (d.wireSelUi !== wireSel ? " selected" : "") + '>自动(拉取模型时检测)</option><option value="responses"' + (d.wireSelUi === "responses" ? " selected" : "") + '>Responses</option><option value="chat_completions"' + (d.wireSelUi === "chat_completions" ? " selected" : "") + '>ChatCompletions</option></select><div class="hint">不确定就保持「自动」</div></div>'
+    + '<div class="f"><label>推理强度</label><select data-f="reasoningLevel">' + rlOpts + '</select><div class="hint">选具体档位 = 该供应商默认思考档位;「自动」= 跟随探测</div></div>'
     + '<div class="f"><label>HTTP 代理</label><input class="mono" data-f="proxyUrl" value="' + esc(d.proxyUrl || "") + '" placeholder="http://127.0.0.1:7890"></div>'
     + '<div class="f"><label>超时(秒)</label><input type="number" data-f="timeoutSecs" value="' + esc(d.timeoutSecs || "") + '"></div>'
     + '<div class="f full"><label>备注</label><input data-f="notes" value="' + esc(d.notes || "") + '"></div>'
@@ -550,6 +563,8 @@ function collectDraft() {
   if (typeof ak === "string" && ak !== "") d.apiKey = ak;
   var wsel = get("wireSel");
   if (wsel !== undefined) d.wireSelUi = wsel; // "auto" = 保持现值(落库 wireApi 不变);显式选了才更新
+  var rlv = get("reasoningLevel");
+  if (rlv !== undefined) d.reasoningLevelSel = rlv; // "自动" = 跟随探测,落库 reasoning_levels 不变;显式选了才置首
   var mnames = document.querySelectorAll('[data-mf="name"]');
   mnames.forEach(function (el) { d.models[Number(el.dataset.mi)].name = el.value.trim(); });
   document.querySelectorAll('[data-mf="cw"]').forEach(function (el) {
@@ -559,11 +574,13 @@ function collectDraft() {
 }
 
 function draftFromProvider(p) {
+  var rl = (p.reasoning_levels || []).slice();
   return {
     id: p.id, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", apiKeyMasked: p.apiKeyMasked || "",
     wireApi: p.wireApi || "responses", wireSelUi: p.wireApi || "responses",
     model: p.model || "", models: (p.models || []).map(function (m) { return { name: m.name, contextWindow: m.contextWindow }; }),
     proxyUrl: p.proxyUrl || "", timeoutSecs: p.timeoutSecs || "", notes: p.notes || "",
+    reasoning_levels: rl, reasoningLevelSel: rl.length ? rl[0] : "", // 编辑时下拉回显当前默认档位;无则「自动」
   };
 }
 
@@ -660,6 +677,12 @@ async function doSave() {
     models: (d.models || []).filter(function (m) { return m && m.name; }),
     proxyUrl: d.proxyUrl || "", timeoutSecs: d.timeoutSecs ? Number(d.timeoutSecs) : null,
     notes: d.notes || "",
+    // 推理强度:选了具体档位 → 置为默认(数组首项,其余探测档位保留);「自动」→ 原样带回探测档位
+    reasoning_levels: (function () {
+      var rl = (d.reasoning_levels || []).filter(function (x) { return x && typeof x === "string"; });
+      var sel = d.reasoningLevelSel || "";
+      return sel ? [sel].concat(rl.filter(function (x) { return x !== sel; })) : rl;
+    })(),
   };
   state.busy = "save"; render();
   try {
@@ -688,6 +711,8 @@ async function doFetchModels() {
   try {
     var r = await api.fetchModels(fmBody);
     d.models = (r.models || []).map(normModel);
+    // 接住探测到的思考档位(后端缺省 [];仅拉模型写回,不动用户已选的推理强度)
+    d.reasoning_levels = Array.isArray(r.reasoning_levels) ? r.reasoning_levels.slice() : [];
     if (!d.model && d.models.length) d.model = d.models[0].name; // 自动默认第一个,降低小白负担
     state.busy = null; render();
     showToast("拉取到 " + d.models.length + " 个模型" + (d.models.length ? ",默认模型已填入" : ""), "ok");
@@ -754,6 +779,7 @@ async function doImportKey(i) {
       name: name, accessMode: "pure_api",
       baseUrl: d.baseUrl, apiKey: k.key, wireApi: "responses",
       model: models[0].name, models: models,
+      reasoning_levels: Array.isArray(fm.reasoning_levels) ? fm.reasoning_levels : [],
     });
     await refreshProviders();
     state.selId = saved.id;
@@ -848,7 +874,7 @@ document.addEventListener("click", function (ev) {
   switch (a) {
     case "sel": collectDraft(); state.selId = t.dataset.id; state.mode = "view"; state.diag = null; render(); break;
     case "new":
-      state.draft = { name: "", baseUrl: "", apiKey: "", model: "", models: [], wireApi: "responses", wireSelUi: "responses", proxyUrl: "", timeoutSecs: "", notes: "" };
+      state.draft = { name: "", baseUrl: "", apiKey: "", model: "", models: [], wireApi: "responses", wireSelUi: "responses", proxyUrl: "", timeoutSecs: "", notes: "", reasoning_levels: [], reasoningLevelSel: "" };
       state.isNew = true; state.mode = "edit"; state.fieldErrors = {}; state.diag = null; render(); break;
     case "edit": {
       var p = lineOf(state.selId); if (!p) break;
