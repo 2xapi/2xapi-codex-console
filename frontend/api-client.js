@@ -112,8 +112,17 @@
     preflight: (body) => request("POST", "/api/launcher/preflight", { body }),
 
     // ── 加速(阶段 4,任务书 §…):mode off|official|custom;customNode 仅本机保存 ──
-    // GET /api/accel/state → {mode, customNode, lines[], scopeNote};POST mode/custom-node → {ok:true}
-    accelState: () => request("GET", "/api/accel/state"),
+    // GET /api/accel/state 返回非信封 {mode,customNode,lines[],scopeNote}(字段在顶层),失败时可能 {ok:false,error};用 rawJson 解顶层字段
+    accelState: async () => {
+      const p = await rawJson("GET", "/api/accel/state");
+      if (p && p.ok === false) {
+        const e = new Error((p && p.error) || "获取加速状态失败");
+        e.status = (p && p.status) || 0;
+        throw e;
+      }
+      return { mode: p.mode, customNode: p.customNode || "", lines: p.lines || [], scopeNote: p.scopeNote || "" };
+    },
+    // mode/custom-node 契约走 04 信封 → {ok:true}
     accelSetMode: (mode) => request("POST", "/api/accel/mode", { body: { mode } }),
     accelSetCustomNode: (endpoint) => request("POST", "/api/accel/custom-node", { body: { endpoint } }),
     // test-node 契约是 {ok:true, latencyMs:123} / {ok:false, error:"人话"}——字段在顶层不走 data 信封,故用 rawJson
