@@ -1148,18 +1148,23 @@ mod tests {
         assert!(cfg_after_switch.contains("base_url = \"http://127.0.0.1:8787\""), "custom 段(网关指向)不变");
         assert!(cfg_after_switch.contains("model = \"m-b\""), "model 同步为新供应商(真机故障修复)");
 
-        // direct 未开放：400 + E_DIRECT_UNAVAILABLE
+        // direct 已放开（UI 对齐批，仅无官方账号）：custom 直指供应商 + key 落盘 bearer 字段
         let app = build_router(state.clone());
-        let resp = app
-            .oneshot(
+        let v = body_json(
+            app.oneshot(
                 Request::builder().method("POST").uri("/api/desktop/host").header("content-type", "application/json")
                     .body(Body::from(json!({"providerId": id2, "way": "direct"}).to_string())).unwrap(),
             )
             .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v = body_json(resp).await;
-        assert_eq!(v["error"], "E_DIRECT_UNAVAILABLE");
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(v["data"]["hosted"], true);
+        assert_eq!(v["data"]["hosting"]["way"], "direct");
+        let cfg_direct = std::fs::read_to_string(&state.config_path).unwrap();
+        assert!(cfg_direct.contains("base_url = \"https://b.test\""), "custom 应直指供应商:\n{cfg_direct}");
+        assert!(cfg_direct.contains("experimental_bearer_token = \"sk-2\""), "direct=Key 落盘:\n{cfg_direct}");
+        assert!(cfg_direct.contains("requires_openai_auth = false"));
 
         // unhost：回到干净态
         let app = build_router(state.clone());

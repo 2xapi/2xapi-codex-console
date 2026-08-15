@@ -9,6 +9,13 @@
 //! 与 config.rs(M2)的关系:复用其 toml 读写/备份/catalog 原语,但合并逻辑独立——
 //! M2 的 Mixed 会写 experimental_bearer_token 且 requires_openai_auth 恒 true,
 //! 与任务书 §1.1(b) 契约(零 bearer、按账号态取值)不同,M2 行为保持不动。
+//!
+//! direct 通路(UI 对齐批放开,仅限无官方账号):custom 段直指供应商,供应商 key 以
+//! `experimental_bearer_token` 写入 config.toml——阶段 1 已实测该字段即 direct 的 provider
+//! 段 Bearer 字段(codex 二进制 18 字段清单 + 隔离环境 `codex exec` 上游收到
+//! `Authorization: Bearer <该字段值>`)。与网关的「零 Key」卖点相反,key 落盘是阶段 1
+//! 定稿的差异,UI 文案由前端区分,后端只管写入。有官方账号时维持 4xx 拒绝
+//! (token/bearer 优先级待阶段 5 实测后再放开)。
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -62,43 +69,49 @@ pub fn has_official(codex_home: &Path) -> bool {
 
 /// 当前 config.toml 是否处于本软件托管态。
 /// - custom.base_url 指向网关 → gateway(providerId 用 providers.json active 交叉印证)
+/// - custom 段存在 `experimental_bearer_token` 键 → direct(受控标记,见下)
 /// - 其余(无 custom 段 / 用户手写的第三方 custom)→ null
 ///
-/// 注:direct 判定本期不启用(任务书 §1.1(b) direct host 返回 E_DIRECT_UNAVAILABLE,
-/// 软件不可能产生 direct 托管态;真机实测用户手写 custom 与某 active 供应商地址相同时会被
-/// 误判为「已托管 direct」且 unhost 会误删手写配置——见交接日志待 Cowork 事项)。
-/// direct 实现时应配合可靠标记(而非仅地址匹配)再恢复判定。
+/// direct 判定依据(UI2 已定「detect_hosting 禁止地址匹配」——手写 custom 地址撞上某 active
+/// 供应商时,地址匹配会把用户手写配置误判为托管、unhost 再误删,真机暴露过):
+/// 该键**仅本软件 host direct 会写**(gateway 托管零 Key 不写,M2 Mixed 虽写但 base_url
+/// 恒指网关、先走 gateway 分支),手写用户几乎不会带此实验性键,故以其存在性为受控标记。
+/// 阶段 1 备注的更完备方案(旁写 2xapi 标记键或独立 state 文件)留待后续批次。
 pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
     let cfg = read_toml(config_path);
-    let base_url = cfg
+    let custom = cfg
         .get("model_providers")
-        .and_then(|m| m.get("custom"))
-        .and_then(|c| c.get("base_url"))
-        .and_then(|v| v.as_str());
-    let Some(base_url) = base_url else {
+        .and_then(|m| m.get("custom"));
+    let Some(custom) = custom else {
         return Value::Null;
     };
-    if base_url.contains(GATEWAY_ADDR) {
-        let data = crate::providers::load(providers_path);
-        // 无任何供应商 → 未托管:config 残留网关 custom 段也不表达托管(空状态必须 hosting=null)
-        if data.providers.is_empty() {
-            return Value::Null;
-        }
-        let (id, name) = match &data.active_provider_id {
-            Some(id) => {
-                let name = data
-                    .providers
-                    .iter()
-                    .find(|p| &p.id == id)
-                    .map(|p| json!(p.name))
-                    .unwrap_or(Value::Null);
-                (json!(id), name)
-            }
-            None => (Value::Null, Value::Null),
-        };
-        return json!({ "providerId": id, "providerName": name, "way": "gateway" });
+    let base_url = custom.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+    // 网关判定优先:M2 Mixed 形态(网关地址 + bearer)也归 gateway(流量实际走网关)
+    let way = if base_url.contains(GATEWAY_ADDR) {
+        "gateway"
+    } else if custom.get("experimental_bearer_token").is_some() {
+        "direct"
+    } else {
+        return Value::Null; // 第三方手写 custom(地址匹配禁止)→ 未托管
+    };
+    let data = crate::providers::load(providers_path);
+    // 无任何供应商 → 未托管:config 残留托管 custom 段也不表达托管(空状态必须 hosting=null)
+    if data.providers.is_empty() {
+        return Value::Null;
     }
-    Value::Null
+    let (id, name) = match &data.active_provider_id {
+        Some(id) => {
+            let name = data
+                .providers
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| json!(p.name))
+                .unwrap_or(Value::Null);
+            (json!(id), name)
+        }
+        None => (Value::Null, Value::Null),
+    };
+    json!({ "providerId": id, "providerName": name, "way": way })
 }
 
 pub fn gateway_alive() -> bool {
@@ -135,6 +148,34 @@ fn build_hosted_config(current: &Value, provider: &Provider, catalog_path: &str,
     custom.insert("base_url".into(), json!(GATEWAY_BASE_URL));
     custom.insert("wire_api".into(), json!("responses"));
     custom.insert("requires_openai_auth".into(), json!(requires_openai_auth));
+    let mp = obj.entry("model_providers").or_insert(json!({}));
+    if let Some(m) = mp.as_object_mut() {
+        m.insert("custom".into(), Value::Object(custom));
+    }
+    cfg
+}
+
+/// 合并出 direct 托管态 config(仅无官方账号,门控在 host() 开头)。
+/// custom 段直指供应商,key 以 `experimental_bearer_token` 落盘——阶段 1 实测该字段即
+/// direct 的 provider 段 Bearer 字段(codex 18 字段清单 + 隔离环境 `codex exec` 上游收到
+/// `Authorization: Bearer <该字段值>`)。与 gateway 零 Key 契约相反,UI 文案由前端区分。
+/// 不写 model_catalog_json / auth.json:direct 不经网关,bearer 已在 config,auth 无需动。
+fn build_direct_hosted_config(current: &Value, provider: &Provider) -> Value {
+    let mut cfg = current.clone();
+    let obj = cfg.as_object_mut().expect("config 不是 object");
+    obj.insert("model_provider".into(), json!("custom"));
+    if !provider.model.is_empty() {
+        obj.insert("model".into(), json!(provider.model));
+    }
+    let mut custom = serde_json::Map::new();
+    custom.insert("name".into(), json!("custom"));
+    custom.insert("base_url".into(), json!(provider.base_url));
+    custom.insert(
+        "wire_api".into(),
+        serde_json::to_value(provider.wire_api).unwrap_or(json!("responses")),
+    );
+    custom.insert("requires_openai_auth".into(), json!(false));
+    custom.insert("experimental_bearer_token".into(), json!(provider.api_key));
     let mp = obj.entry("model_providers").or_insert(json!({}));
     if let Some(m) = mp.as_object_mut() {
         m.insert("custom".into(), Value::Object(custom));
@@ -179,9 +220,13 @@ pub fn host(
     // host 前自动跑轻量 repair(任务书 §四 autoRepairBeforeHost,默认开;只对账不重建)
     crate::sessions::auto_repair_if_enabled(codex_home, backup_dir);
 
-    // direct 的 provider 段 Bearer 字段未实测(任务书 §1.4 探索),通过前一律拒绝
-    if way != "gateway" {
-        return Err((400, "E_DIRECT_UNAVAILABLE".into(), "直连方式即将支持,当前请使用网关方式".into()));
+    if way != "gateway" && way != "direct" {
+        return Err((400, "E_BAD_WAY".into(), "未知托管方式,仅支持 gateway / direct".into()));
+    }
+    // direct 门控 hasOfficial(UI 对齐批):无官方账号放开;有官方 → 维持 4xx 拒绝
+    // (官方 token 与 experimental_bearer_token 的优先级待阶段 5 实测后再放开)
+    if way == "direct" && has_official(codex_home) {
+        return Err((400, "E_DIRECT_UNAVAILABLE".into(), "官方登录下直连暂不支持".into()));
     }
     let data = crate::providers::load(providers_path);
     let provider = data
@@ -196,6 +241,33 @@ pub fn host(
     }
 
     let io = |e: String| -> OpError { (500, "E_IO".to_string(), e) };
+
+    // direct 托管(仅无官方账号,门控在函数开头):字段级合并 + 备份,写完即托管态。
+    // 幂等:已 direct 托管同供应商时合并结果与现值相同 → 不写盘 no-op 200;
+    // 换路(gateway↔direct)/换供应商 → 重写 custom 段;备份 purpose 用 pre-switch
+    // (不新增 pre-host 快照,保住最初 pre-host 供 unhost 还原到首次托管前)。
+    if way == "direct" {
+        let already = detect_hosting(config_path, providers_path);
+        let current = read_toml(config_path);
+        let merged = build_direct_hosted_config(&current, &provider);
+        let new_toml = config_to_toml_string(&merged).map_err(io)?;
+        let current_toml = config_to_toml_string(&current).unwrap_or_default();
+        let config_written = if new_toml != current_toml {
+            let purpose = if already.is_null() { "pre-host" } else { "pre-switch" };
+            backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
+            write_toml(config_path, &merged).map_err(io)?;
+            true
+        } else {
+            false
+        };
+        crate::providers::set_active(providers_path, &provider.id);
+        return Ok(json!({
+            "hosted": true, "switched": !already.is_null(),
+            "hasOfficial": false,
+            "hosting": detect_hosting(config_path, providers_path),
+            "changed": { "config": config_written, "auth": false },
+        }));
+    }
 
     // 已处于 gateway 托管(含换供应商):custom 段不动(网关热切换),set_active;
     // 真机故障补充(2026-08-15,交接日志):同步 model 字段与 catalog——不同步会让新供应商
@@ -257,7 +329,10 @@ pub fn host(
     let new_toml = config_to_toml_string(&merged).map_err(io)?;
     let current_toml = config_to_toml_string(&current).unwrap_or_default();
     let config_written = if new_toml != current_toml {
-        backup_file(config_path, backup_dir, "config-apply", "pre-host").map_err(io)?;
+        // 直连批前 already 在此恒为 null;direct 出现后可能为 direct(换路 gateway),
+        // 此时用 pre-switch,不新增 pre-host 快照(保住最初 pre-host 供 unhost 还原)
+        let purpose = if already.is_null() { "pre-host" } else { "pre-switch" };
+        backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
         write_toml(config_path, &merged).map_err(io)?;
         true
     } else {
@@ -611,16 +686,169 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// UI 对齐批:direct 已放开(无账号),此测试只保留两类 4xx——未知 way 与未知 provider;
+    /// 有账号 direct 拒绝见 host_direct_rejected_with_official。
     #[test]
-    fn host_rejects_direct_and_unknown_provider() {
+    fn host_rejects_unknown_way_and_provider() {
         let (root, cfg, bk, home, prov) = sandbox("host-err");
         write_providers(&prov, vec![provider("p1", "2xapi")]);
-        let err = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap_err();
-        assert_eq!(err.1, "E_DIRECT_UNAVAILABLE");
+        let err = host(&cfg, &bk, &home, &prov, "p1", "nonsense").unwrap_err();
+        assert_eq!(err.0, 400);
+        assert_eq!(err.1, "E_BAD_WAY");
         assert!(!err.2.is_empty(), "4xx 消息须为人话,不可为空");
         let err2 = host(&cfg, &bk, &home, &prov, "nope", "gateway").unwrap_err();
         assert_eq!(err2.1, "E_PROVIDER_NOT_FOUND");
         assert_eq!(err2.2, "找不到该供应商", "providerId 不存在的 4xx 须为人话(UI2 空状态兜底)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── host(direct,UI 对齐批放开:仅无官方账号)──
+
+    /// ① 无账号 host direct:custom 直指供应商,key 以 experimental_bearer_token 落盘
+    /// (阶段 1 实测 Bearer 字段),requires_openai_auth=false,active 生效,不动 auth.json。
+    #[test]
+    fn host_direct_writes_expected_config() {
+        let (root, cfg, bk, home, prov) = sandbox("host-direct");
+        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+
+        let out = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
+        assert!(out["hosted"].as_bool().unwrap());
+        assert!(!out["hasOfficial"].as_bool().unwrap());
+        assert_eq!(out["hosting"]["way"], "direct");
+        assert_eq!(out["hosting"]["providerId"], "p1");
+
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(written.contains("model_provider = \"custom\""));
+        assert!(written.contains("model = \"gpt-demo\""), "默认模型应写入:\n{written}");
+        assert!(written.contains("base_url = \"https://up.example.com\""), "custom 应直指供应商:\n{written}");
+        assert!(written.contains("wire_api = \"responses\""));
+        assert!(written.contains("requires_openai_auth = false"));
+        assert!(
+            written.contains("experimental_bearer_token = \"sk-test-secret\""),
+            "direct=Key 落盘(阶段 1 定稿差异,与网关零 Key 相反):\n{written}"
+        );
+        assert!(!written.contains("127.0.0.1:8787"), "direct 不经网关:\n{written}");
+        assert!(written.contains("my_custom_setting"), "用户字段应保留:\n{written}");
+        assert_eq!(crate::providers::load(&prov).active_provider_id, Some("p1".into()));
+        // direct 不动 auth(bearer 已在 config):不创建 auth.json、不留备份
+        assert!(!home.join("auth.json").exists());
+        assert!(!home.join(AUTH_OFFICIAL_BAK).exists());
+        // 首次 direct 托管留 pre-host 快照(unhost 据此还原)
+        assert!(find_pre_host_snapshot(&bk).is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ② 幂等:重复 host 同供应商 + direct → no-op 200,config 不变。
+    #[test]
+    fn host_direct_idempotent_same_provider() {
+        let (root, cfg, bk, home, prov) = sandbox("host-direct-idem");
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        let r1 = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
+        assert!(r1["changed"]["config"].as_bool().unwrap());
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        let r2 = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
+        assert!(r2["hosted"].as_bool().unwrap(), "重复 host 应 200 no-op");
+        assert!(!r2["changed"]["config"].as_bool().unwrap(), "config 不应重写");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before, "config 不应变化");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ③ 有官方账号 host direct → 4xx E_DIRECT_UNAVAILABLE,config 一字不落(阶段 5 实测后再放开)。
+    #[test]
+    fn host_direct_rejected_with_official() {
+        let (root, cfg, bk, home, prov) = sandbox("host-direct-official");
+        std::fs::write(home.join("auth.json"), r#"{"tokens":{"id_token":"official"}}"#).unwrap();
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        let err = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap_err();
+        assert_eq!(err.0, 400);
+        assert_eq!(err.1, "E_DIRECT_UNAVAILABLE");
+        assert!(!err.2.is_empty(), "4xx 消息须为人话,不可为空");
+        assert!(!cfg.exists(), "被拒的 host 不应写 config");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 反向换路:direct 托管 → host gateway → unhost 仍还原到最初 pre-host
+    /// (gateway 全量写在已托管态用 pre-switch 备份,不把 direct 态快照成 pre-host,
+    /// 否则 unhost 会"还原"回带 key 的 direct 配置、托管态解不开)。
+    #[test]
+    fn host_gateway_from_direct_keeps_pre_host_snapshot() {
+        let (root, cfg, bk, home, prov) = sandbox("direct-back");
+        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
+        let r = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+        assert_eq!(detect_hosting(&cfg, &prov)["way"], "gateway");
+
+        unhost(&cfg, &bk, &home, &prov).unwrap();
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after.contains("my_custom_setting"), "应还原到最初 pre-host 而非 direct 态:\n{after}");
+        assert!(!after.contains("experimental_bearer_token"));
+        assert!(!after.contains("[model_providers.custom]"));
+        assert!(detect_hosting(&cfg, &prov).is_null(), "unhost 后不应残留托管态:\n{}", detect_hosting(&cfg, &prov));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ④ state 检测:direct 托管后 hosting={way:"direct", providerId, providerName}。
+    #[test]
+    fn state_reports_direct_hosting() {
+        let (root, cfg, bk, home, prov) = sandbox("state-direct");
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
+        let s = state(&cfg, &prov, &home);
+        assert!(!s["hasOfficial"].as_bool().unwrap());
+        assert_eq!(s["hosting"]["way"], "direct", "state 应报 direct:\n{s}");
+        assert_eq!(s["hosting"]["providerId"], "p1");
+        assert_eq!(s["hosting"]["providerName"], "2xapi");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⑤ unhost 清理 direct 托管:experimental_bearer_token 随 custom 段一并清除,幂等。
+    #[test]
+    fn unhost_cleans_direct_hosting() {
+        let (root, cfg, bk, home, prov) = sandbox("unhost-direct");
+        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
+
+        let out = unhost(&cfg, &bk, &home, &prov).unwrap();
+        assert!(out["restored"].as_bool().unwrap());
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(!written.contains("experimental_bearer_token"), "bearer 应随 custom 段清理:\n{written}");
+        assert!(!written.contains("[model_providers.custom]"));
+        assert!(!written.contains("model_provider ="));
+        assert!(!written.contains("sk-test-secret"), "key 不应残留:\n{written}");
+        assert!(written.contains("my_custom_setting"), "用户字段应保留:\n{written}");
+        assert!(crate::providers::load(&prov).active_provider_id.is_none());
+        // 幂等
+        let out2 = unhost(&cfg, &bk, &home, &prov).unwrap();
+        assert!(out2["alreadyClean"].as_bool().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 换路:gateway 托管 → host direct → custom 段切到供应商直连;unhost 仍还原到
+    /// 最初 pre-host 快照(pre-switch 备份不污染快照链)。
+    #[test]
+    fn host_direct_switch_from_gateway_and_unhost_restores() {
+        let (root, cfg, bk, home, prov) = sandbox("direct-switch");
+        std::fs::write(&cfg, "my_custom_setting = \"keep_me\"\n").unwrap();
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
+        assert_eq!(detect_hosting(&cfg, &prov)["way"], "gateway");
+
+        let r = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap();
+        assert!(r["switched"].as_bool().unwrap(), "已托管态换路应报 switched");
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(written.contains("base_url = \"https://up.example.com\""), "custom 应切到供应商直连:\n{written}");
+        assert!(written.contains("experimental_bearer_token = \"sk-test-secret\""));
+        assert_eq!(detect_hosting(&cfg, &prov)["way"], "direct");
+
+        // unhost 还原到最初 pre-host(用户原始字段回来,bearer 不残留)
+        unhost(&cfg, &bk, &home, &prov).unwrap();
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after.contains("my_custom_setting"), "应还原到最初 pre-host:\n{after}");
+        assert!(!after.contains("experimental_bearer_token"));
+        assert!(!after.contains("[model_providers.custom]"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -714,12 +942,20 @@ mod tests {
         // 第三方 custom(opencode 形态)→ null
         std::fs::write(&cfg, "[model_providers.custom]\nbase_url = \"https://opencode.ai/zen/go/v1\"\n").unwrap();
         assert!(detect_hosting(&cfg, &prov).is_null(), "第三方 custom 不应误判为托管");
-        // 真机暴露场景:用户手写 custom 地址恰与 active 供应商地址相同 → 仍应 null
-        // (direct 托管本期未开放,软件不可能产生 direct 态;判出必为用户手写,不能被 unhost 误删)
+        // 真机暴露场景:用户手写 custom 地址恰与 active 供应商地址相同但无 bearer 标记键
+        // → 仍应 null(UI2 已定:detect 禁止地址匹配,仅有我们写入的
+        // experimental_bearer_token 键才算 direct 托管)
         write_providers(&prov, vec![provider("p1", "A")]);
         std::fs::write(&cfg, "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://up.example.com\"\n").unwrap();
         crate::providers::set_active(&prov, "p1");
         assert!(detect_hosting(&cfg, &prov).is_null(), "地址撞 active 供应商也不应判 direct");
+        // M2 Mixed 形态(网关地址 + experimental_bearer_token)→ 归 gateway(网关判定优先)
+        std::fs::write(
+            &cfg,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\nexperimental_bearer_token = \"sk-m2\"\n",
+        )
+        .unwrap();
+        assert_eq!(detect_hosting(&cfg, &prov)["way"], "gateway", "网关地址优先于 bearer 标记");
         // gateway 托管 + active
         std::fs::write(&cfg, "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\n").unwrap();
         crate::providers::set_active(&prov, "p1");
