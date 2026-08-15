@@ -14,6 +14,7 @@ mod history;
 mod gateway;
 mod gateway_conv;
 mod diagnose;
+mod acclines;
 
 use std::net::TcpListener;
 use tauri::{Manager, WebviewWindowBuilder};
@@ -43,12 +44,19 @@ fn main() {
     launcher::sweep_orphans();
     launcher::spawn_monitor(launcher_state.clone());
 
+    // 阶段 4:加速线路装配——启动即加载线路填入健康状态;accel 配置从 2xapi-settings.json 读入
+    let lines = crate::acclines::load_lines(&codex_home);
+    let health_state = std::sync::Arc::new(crate::acclines::HealthState::new(lines.lines));
+    let accel_state = std::sync::Arc::new(std::sync::Mutex::new(server::load_accel_cfg(&codex_home)));
+
     let state = server::AppState {
         config_path: config_path.clone(),
         backup_dir: backup_dir.clone(),
         providers_path: providers_path.clone(),
         codex_home: codex_home.clone(),
         launcher: launcher_state,
+        health: health_state.clone(),
+        accel: accel_state,
     };
 
     let router = server::build_router(state);
@@ -58,6 +66,9 @@ fn main() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            // 阶段 4:后台健康探测循环(每 30s 快照 HealthState.lines 探测;线路可经 set_lines 更新)。
+            // spawn_health_loop 内部自行 tokio::spawn,此处直接调用即可。
+            crate::acclines::spawn_health_loop(health_state.clone(), std::time::Duration::from_secs(30));
             axum::serve(listener, router).await.unwrap();
         });
     });
