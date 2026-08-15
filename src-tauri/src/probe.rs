@@ -284,6 +284,15 @@ mod tests {
         assert!(!r.key_ok && !r.responses_compat && !r.chat_ok);
         assert_eq!(r.error, Some("timeout"));
     }
+
+    /// 真机暴露(DeepSeek 坏 key 无 model 时误报 timeout):model 为空须用 /models 状态分类 auth。
+    #[tokio::test]
+    async fn preflight_bad_key_no_model_classifies_auth() {
+        let base = spawn_mock_router("all").await; // 无 model → 流探测跳过 → 走 /models 状态辅助
+        let r = preflight(&base, "wrong-key", "").await;
+        assert!(!r.key_ok);
+        assert_eq!(r.error, Some("auth"), "无 model 时坏 key 应分类为 auth,而非 timeout");
+    }
 }
 
 // ── 阶段 2:preflight 测试连接(任务书 §三)──────────────────────
@@ -322,6 +331,21 @@ pub async fn probe_chat(base_url: &str, api_key: &str, model: &str) -> StreamPro
         }
     }
     StreamProbe { status: None, got_sse: false }
+}
+
+/// 仅探测 /models 的 HTTP 状态(用于 model 为空时区分 timeout/auth/notfound;
+/// 返回 (base 带 /models, /v1/models) 各自状态,None=连接失败)。
+async fn probe_models_http_status(base_url: &str, api_key: &str) -> (Option<u16>, Option<u16>) {
+    let base = base_url.trim_end_matches('/');
+    let mut s1 = None;
+    let mut s2 = None;
+    if let Ok(r) = client().get(format!("{base}/models")).header("Authorization", format!("Bearer {api_key}")).send().await {
+        s1 = Some(r.status().as_u16());
+    }
+    if let Ok(r) = client().get(format!("{base}/v1/models")).header("Authorization", format!("Bearer {api_key}")).send().await {
+        s2 = Some(r.status().as_u16());
+    }
+    (s1, s2)
 }
 
 /// 单次探测:返回 Some(结果) 表示拿到了 HTTP 响应(不再换后缀);None = 连接失败(换下一后缀)。
@@ -389,11 +413,18 @@ pub async fn preflight(base_url: &str, api_key: &str, model_hint: &str) -> Prefl
     let responses_compat = resp_probe.got_sse;
     let chat_ok = chat_probe.status == Some(200);
 
-    // 错误分类(优先级:连不上 > 认证 > 地址/协议)
-    let error = if resp_probe.status.is_none() && chat_probe.status.is_none() && !key_ok {
+    // 错误分类(优先级:连不上 > 认证 > 地址/协议)。
+    // 注意:model 为空时流探测全部跳过(status=None),此时须依据 /models 的 HTTP 状态
+    // 辅助分类(实测:DeepSeek 坏 key 时 /models 返回 401,先前误报 timeout——真机暴露修复)。
+    let (probe1, probe2) = if resp_probe.status.is_none() && chat_probe.status.is_none() && !key_ok {
+        probe_models_http_status(base_url, api_key).await
+    } else {
+        (resp_probe.status, chat_probe.status)
+    };
+    let error = if probe1.is_none() && probe2.is_none() && !key_ok {
         Some("timeout")
-    } else if resp_probe.status == Some(401) || chat_probe.status == Some(401)
-        || resp_probe.status == Some(403) || chat_probe.status == Some(403)
+    } else if probe1 == Some(401) || probe2 == Some(401)
+        || probe1 == Some(403) || probe2 == Some(403)
     {
         Some("auth")
     } else if !key_ok && !responses_compat && !chat_ok {

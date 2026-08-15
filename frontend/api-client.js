@@ -107,7 +107,8 @@
       err.status = resp.status;
       throw err;
     },
-    // 预留:阶段 2 preflight(POST /api/launcher/preflight),先占位不实现
+    // 测试连接(阶段 2):{providerId} 或 {baseUrl, apiKey}
+    preflight: (body) => request("POST", "/api/launcher/preflight", { body }),
 
     // ── 运维：备份/快照/恢复/历史诊断（旧路由，raw 响应）──
     backups: async () => rawJson("GET", "/api/backups"),
