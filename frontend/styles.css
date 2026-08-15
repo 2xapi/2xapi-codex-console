@@ -115,6 +115,12 @@ pre.toml { background: #0C1015; border: 1px solid var(--hair); border-radius: 8p
 .mtable td { border-top: 1px solid var(--hair); padding: 5px 6px; }
 .mtable input { width: 100%; padding: 5px 7px; background: var(--raised); border: 1px solid var(--hair); border-radius: 6px; color: var(--text); font: 12px var(--mono); }
 
+/* 思考档位(推理强度)标签条:探测到的档位;无则「—」 */
+.rl-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 0 0 8px; }
+.rl-bar .k { font: 600 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.rl-tag { font: 11px var(--mono); padding: 2px 8px; border-radius: 999px; border: 1px solid var(--hair); color: var(--c-gw); background: var(--raised); }
+.rl-muted { font: 11px var(--mono); color: var(--muted); }
+
 /* 弹窗 / toast / 提示 */
 .mask { position: fixed; inset: 0; background: rgba(6,9,12,.6); display: flex; align-items: center; justify-content: center; z-index: 60; }
 .box { background: var(--panel); border: 1px solid var(--hair); border-radius: 12px; padding: 18px; width: 460px; max-width: 92vw; max-height: 80vh; overflow: auto; }
