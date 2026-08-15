@@ -311,7 +311,8 @@ function modalHtml() {
       + '<div class="sub">登录后可一键导入你的 Key 和供应商</div>'
       + (captchaCfg.enabled ? '<div class="hint" style="margin:0 0 6px;color:var(--c-direct)">该站点开启了登录验证,点「登录」后请完成滑块验证</div>' : "")
       + '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail || "") + '"></div>'
-      + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password"></div>'
+      + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password" value="' + esc(state.loginPassword || "") + '"></div>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);cursor:pointer;margin:2px 0 8px"><input type="checkbox" data-l="remember" checked>记住我(保持登录,过期自动续期;滑块只需这一次)</label>'
       + (state.loginError ? '<div class="err" style="color:var(--c-err);font-size:12px">' + esc(state.loginError) + '</div>' : "")
       + '<div class="btn-row"><button class="btn primary" data-a="do-login">登录</button><button class="btn ghost" data-a="mclose">取消</button></div></div></div>';
   }
@@ -492,6 +493,15 @@ async function openLoginModal() {
   state.loginError = "";
   state.modal = { kind: "login" };
   render();
+  // 预填记住的凭据(有则直接可点登录)
+  try {
+    var r = await api.remembered();
+    if (r && r.remembered) {
+      state.loginEmail = r.email || "";
+      state.loginPassword = r.password || "";
+      render();
+    }
+  } catch (e) { /* 无记住凭据 */ }
   // 查验证码开关(后端按主站→中转站顺序探测;拿到即缓存)
   try {
     var c = await api.captchaSettings();
@@ -512,9 +522,12 @@ async function doLogin() {
   var submit = async function (ticket, randstr) {
     try {
       await api.login(email.trim(), password, ticket, randstr);
+      // 记住我(默认勾选):保存凭据;session 过期由后端 refresh_token 免滑块自动续期
+      var remember = (document.querySelector('[data-l="remember"]') || {}).checked !== false;
+      try { remember ? await api.remember(email.trim(), password) : await api.forget(); } catch (e) { /* 记住失败不影响登录 */ }
       state.modal = null; state.loginError = "";
       await refreshSession();
-      showToast("登录成功", "ok");
+      showToast("登录成功" + (remember ? "(已记住,下次自动保持)" : ""), "ok");
     } catch (e) {
       state.loginError = e.message; render();
     }
@@ -571,7 +584,13 @@ document.addEventListener("click", function (ev) {
     }
     case "login": openLoginModal(); break;
     case "do-login": doLogin(); break;
-    case "logout": api.logout().then(function () { state.session = null; render(); showToast("已登出", "ok"); }).catch(function (e) { showToast(e.message, "error"); }); break;
+    case "logout":
+      api.logout().catch(function () {}).then(function () {
+        return api.forget().catch(function () {}); // 登出同时清除记住的凭据
+      }).then(function () {
+        state.session = null; render(); showToast("已登出", "ok");
+      }).catch(function (e) { showToast(e.message, "error"); });
+      break;
     case "tool": state.modal = { kind: "tool", t: t.dataset.t }; render(); break;
     case "mclose": state.modal = null; render(); break;
     case "cyes": { var c = state.confirmBox; state.confirmBox = null; render(); if (c) c.resolve(true); break; }

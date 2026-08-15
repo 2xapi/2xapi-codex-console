@@ -29,6 +29,35 @@ pub fn load_session(codex_home: &Path) -> Option<Session> {
     Some(s)
 }
 
+/// 「保存登录」核心:session 过期时用 refresh_token 免验证码续期
+/// (Sub2API POST /auth/refresh {refresh_token} → data:{access_token, refresh_token, expires_in})。
+/// 成功则原地更新 session 文件并返回新 session;refresh_token 也失效则 None(需重新登录)。
+pub async fn refresh_session(codex_home: &Path) -> Option<Session> {
+    let raw = std::fs::read_to_string(session_path(codex_home)).ok()?;
+    let old: Session = serde_json::from_str(&raw).ok()?;
+    if old.refresh_token.is_empty() {
+        return None;
+    }
+    let body = json!({ "refresh_token": old.refresh_token });
+    let result = xapi_request("/auth/refresh", reqwest::Method::POST, &body, "").await.ok()?;
+    let d = result.get("data").filter(|v| v.is_object()).unwrap_or(&result);
+    let access_token = d.get("access_token")?.as_str()?.to_string();
+    let refresh_token = d
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&old.refresh_token)
+        .to_string();
+    let expires_in = d.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+    let session = Session {
+        access_token,
+        refresh_token,
+        expires_at: chrono::Local::now().timestamp_millis() + expires_in * 1000,
+        user: old.user.clone(),
+    };
+    let _ = std::fs::write(session_path(codex_home), serde_json::to_string_pretty(&session).unwrap_or_default());
+    Some(session)
+}
+
 pub fn save_session(codex_home: &Path, result: &LoginResult) {
     let session = Session {
         access_token: result.access_token.clone(),

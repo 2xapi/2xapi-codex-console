@@ -203,8 +203,12 @@ async fn handle_gateway_health(State(s): State<Arc<AppState>>) -> Response {
 }
 
 async fn handle_session(State(s): State<Arc<AppState>>) -> Response {
-    match crate::auth::load_session(&s.codex_home) {
-        Some(session) => ok_json(json!({ "authenticated": true, "user": session.user })),
+    if let Some(session) = crate::auth::load_session(&s.codex_home) {
+        return ok_json(json!({ "authenticated": true, "user": session.user }));
+    }
+    // 过期:refresh_token 免验证码自动续期(「保存登录」;滑块登录只需一次)
+    match crate::auth::refresh_session(&s.codex_home).await {
+        Some(session) => ok_json(json!({ "authenticated": true, "user": session.user, "refreshed": true })),
         None => ok_json(json!({ "authenticated": false })),
     }
 }
