@@ -81,6 +81,7 @@ async fn xapi_request(path: &str, method: reqwest::Method, body: &Value, access_
     let mut last_err = String::new();
     for base in &urls {
         let url = format!("{}{}", base.trim_end_matches('/'), path);
+        let host = base.trim_start_matches("https://").split('/').next().unwrap_or(base);
         let mut req = api_client().request(method.clone(), &url);
         if !access_token.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", access_token));
@@ -97,9 +98,9 @@ async fn xapi_request(path: &str, method: reqwest::Method, body: &Value, access_
                 }
                 let err = json.get("error").or_else(|| json.get("message"))
                     .and_then(|e| e.as_str()).unwrap_or("unknown error");
-                last_err = err.to_string();
+                last_err = format!("[{}] {}", host, err);
             }
-            Err(e) => last_err = e.to_string(),
+            Err(e) => last_err = format!("[{}] 连接失败: {}", host, e),
         }
     }
     Err(last_err)
