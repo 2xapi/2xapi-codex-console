@@ -309,6 +309,7 @@ function modalHtml() {
   if (m.kind === "login") {
     return '<div class="mask" data-a="mclose"><div class="box" style="width:350px"><h2 style="margin:0 0 4px;font-size:15px">登录 2xapi 账号</h2>'
       + '<div class="sub">登录后可一键导入你的 Key 和供应商</div>'
+      + (captchaCfg.enabled ? '<div class="hint" style="margin:0 0 6px;color:var(--c-direct)">该站点开启了登录验证,点「登录」后请完成滑块验证</div>' : "")
       + '<div class="f" style="margin:8px 0"><label>邮箱</label><input data-l="email" value="' + esc(state.loginEmail || "") + '"></div>'
       + '<div class="f" style="margin:8px 0"><label>密码</label><input type="password" data-l="password"></div>'
       + (state.loginError ? '<div class="err" style="color:var(--c-err);font-size:12px">' + esc(state.loginError) + '</div>' : "")
@@ -474,17 +475,63 @@ async function doDelete() {
   render();
 }
 
+/* ── 2xapi 登录(含腾讯滑块:站点开启验证码时弹出,人工完成后携带票据登录) ── */
+var captchaCfg = { enabled: false, appId: "", loaded: false };
+
+function loadTcaptchaJs(cb) {
+  if (window.TencentCaptcha || captchaCfg.loaded) return cb();
+  captchaCfg.loaded = true; // 防重复加载
+  var s = document.createElement("script");
+  s.src = "https://turing.captcha.qcloud.com/TCaptcha.js";
+  s.onload = function () { cb(); };
+  s.onerror = function () { captchaCfg.loaded = false; state.loginError = "验证码组件加载失败,请检查网络"; render(); };
+  document.head.appendChild(s);
+}
+
+async function openLoginModal() {
+  state.loginError = "";
+  state.modal = { kind: "login" };
+  render();
+  // 查验证码开关(后端按主站→中转站顺序探测;拿到即缓存)
+  try {
+    var c = await api.captchaSettings();
+    captchaCfg.enabled = !!(c && c.enabled);
+    captchaCfg.appId = (c && String(c.appId || "")) || "";
+    if (captchaCfg.enabled) {
+      loadTcaptchaJs(function () { /* 预加载,点登录时秒弹 */ });
+      render(); // 提示语:「登录需完成滑块验证」
+    }
+  } catch (e) { /* 查不到按无验证码处理,登录失败会显示服务端信息 */ }
+}
+
 async function doLogin() {
   var email = (document.querySelector('[data-l="email"]') || {}).value || "";
   var password = (document.querySelector('[data-l="password"]') || {}).value || "";
   if (!email || !password) { state.loginError = "邮箱和密码都要填"; render(); return; }
-  try {
-    await api.login(email, password);
-    state.modal = null; state.loginError = "";
-    await refreshSession();
-    showToast("登录成功", "ok");
-  } catch (e) {
-    state.loginError = e.message; render();
+
+  var submit = async function (ticket, randstr) {
+    try {
+      await api.login(email.trim(), password, ticket, randstr);
+      state.modal = null; state.loginError = "";
+      await refreshSession();
+      showToast("登录成功", "ok");
+    } catch (e) {
+      state.loginError = e.message; render();
+    }
+  };
+
+  if (captchaCfg.enabled && captchaCfg.appId) {
+    // 站点开启腾讯验证码:弹出滑块,人工完成后携带 ticket/randstr 提交(Sub2API 字段)
+    loadTcaptchaJs(function () {
+      if (!window.TencentCaptcha) { state.loginError = "验证码组件未就绪,请重试"; render(); return; }
+      var cap = new window.TencentCaptcha(captchaCfg.appId, function (res) {
+        if (res && res.ret === 0) submit(res.ticket, res.randstr);
+        // 用户关闭滑块:不提交,留在登录框
+      });
+      cap.show();
+    });
+  } else {
+    submit("", "");
   }
 }
 
@@ -522,7 +569,7 @@ document.addEventListener("click", function (ev) {
       if (txt && navigator.clipboard) navigator.clipboard.writeText(txt.textContent).then(function () { showToast("片段已复制(进阶自担;日常请用一键托管)", "ok"); });
       break;
     }
-    case "login": state.loginError = ""; state.modal = { kind: "login" }; render(); break;
+    case "login": openLoginModal(); break;
     case "do-login": doLogin(); break;
     case "logout": api.logout().then(function () { state.session = null; render(); showToast("已登出", "ok"); }).catch(function (e) { showToast(e.message, "error"); }); break;
     case "tool": state.modal = { kind: "tool", t: t.dataset.t }; render(); break;

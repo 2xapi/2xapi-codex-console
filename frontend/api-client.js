@@ -61,7 +61,13 @@
 
     // ── 2xapi 登录子系统（契约外，key 获取入口；这些路由是 raw 响应，不走 04 信封）──
     session: async () => rawJson("GET", "/api/session"),
-    login: async (email, password) => rawJson("POST", "/api/auth/login", { email, password }),
+    captchaSettings: async () => rawJson("GET", "/api/auth/captcha"),
+    login: async (email, password, captchaTicket, captchaRandstr) =>
+      rawJson("POST", "/api/auth/login", {
+        email, password,
+        captchaTicket: captchaTicket || "",
+        captchaRandstr: captchaRandstr || "",
+      }),
     logout: async () => rawJson("POST", "/api/auth/logout", {}),
     keyGroups: async () => rawJson("GET", "/api/key-groups"),
 

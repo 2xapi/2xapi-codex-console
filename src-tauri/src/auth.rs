@@ -106,16 +106,33 @@ async fn xapi_request(path: &str, method: reqwest::Method, body: &Value, access_
     Err(last_err)
 }
 
+/// 验证码设置(Sub2API settings/public 为扁平字段:tencent_captcha_enabled / tencent_captcha_app_id)。
+/// 旧实现按嵌套 captcha 段读,恒得 enabled=false —— 已按 Sub2API 实际结构修正。
 pub async fn fetch_captcha_settings() -> Result<Value, String> {
     let result = xapi_request("/settings/public?timezone=UTC", reqwest::Method::GET, &json!({}), "").await?;
-    let captcha = result.get("captcha").cloned().unwrap_or(json!({}));
-    let enabled = captcha.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-    let provider = captcha.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-    Ok(json!({ "enabled": enabled, "provider": provider }))
+    let d = result.get("data").unwrap_or(&result);
+    let app_id = d
+        .get("tencent_captcha_app_id")
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "enabled": d.get("tencent_captcha_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+        "appId": app_id,
+    }))
 }
 
-pub async fn login(email: &str, password: &str) -> Result<LoginResult, String> {
-    let body = json!({ "email": email, "password": password });
+pub async fn login(email: &str, password: &str, captcha_ticket: &str, captcha_randstr: &str) -> Result<LoginResult, String> {
+    // Sub2API LoginRequest 字段:tencent_captcha_ticket / tencent_captcha_randstr(源码 auth_handler.go)
+    let body = json!({
+        "email": email,
+        "password": password,
+        "tencent_captcha_ticket": captcha_ticket,
+        "tencent_captcha_randstr": captcha_randstr,
+    });
     let result = xapi_request("/auth/login", reqwest::Method::POST, &body, "").await?;
 
     if result.get("requires_2fa").and_then(|v| v.as_bool()).unwrap_or(false) {

@@ -221,10 +221,13 @@ async fn handle_auth_captcha(State(_s): State<Arc<AppState>>) -> Response {
 async fn handle_auth_login(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let email = body.get("email").and_then(|v| v.as_str()).unwrap_or("");
     let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    // 腾讯滑块票据(前端人工完成后随请求带上;未开启验证码的站点为空)
+    let ticket = body.get("captchaTicket").and_then(|v| v.as_str()).unwrap_or("");
+    let randstr = body.get("captchaRandstr").and_then(|v| v.as_str()).unwrap_or("");
     if email.is_empty() || password.is_empty() {
         return err_json(StatusCode::BAD_REQUEST, "邮箱和密码不能为空");
     }
-    match crate::auth::login(email, password).await {
+    match crate::auth::login(email, password, ticket, randstr).await {
         Ok(result) => {
             crate::auth::save_session(&s.codex_home, &result);
             ok_json(json!({ "authenticated": true, "user": result.user }))
