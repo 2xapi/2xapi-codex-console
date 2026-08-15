@@ -80,6 +80,10 @@ pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
     };
     if base_url.contains(GATEWAY_ADDR) {
         let data = crate::providers::load(providers_path);
+        // 无任何供应商 → 未托管:config 残留网关 custom 段也不表达托管(空状态必须 hosting=null)
+        if data.providers.is_empty() {
+            return Value::Null;
+        }
         let (id, name) = match &data.active_provider_id {
             Some(id) => {
                 let name = data
@@ -565,8 +569,10 @@ mod tests {
         write_providers(&prov, vec![provider("p1", "2xapi")]);
         let err = host(&cfg, &bk, &home, &prov, "p1", "direct").unwrap_err();
         assert_eq!(err.1, "E_DIRECT_UNAVAILABLE");
+        assert!(!err.2.is_empty(), "4xx 消息须为人话,不可为空");
         let err2 = host(&cfg, &bk, &home, &prov, "nope", "gateway").unwrap_err();
         assert_eq!(err2.1, "E_PROVIDER_NOT_FOUND");
+        assert_eq!(err2.2, "找不到该供应商", "providerId 不存在的 4xx 须为人话(UI2 空状态兜底)");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -678,6 +684,31 @@ mod tests {
         let h2 = detect_hosting(&cfg, &prov);
         assert_eq!(h2["way"], "gateway");
         assert!(h2["providerId"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = home;
+    }
+
+    // ── UI2 空状态:无任何供应商时 hosting 必须为 null ──
+
+    #[test]
+    fn state_hosting_null_when_no_providers() {
+        let (root, cfg, _bk, home, prov) = sandbox("state-empty");
+        // 空 providers.json(无任何供应商)
+        std::fs::write(&prov, r#"{"schema_version":1,"active_provider_id":null,"providers":[]}"#).unwrap();
+        // 未托管(config 无 custom 段)→ null
+        std::fs::write(&cfg, "model_provider = \"openai\"\n").unwrap();
+        let s = state(&cfg, &prov, &home);
+        assert!(s["hosting"].is_null(), "无供应商且未托管 → hosting null:\n{s}");
+        assert!(!s["hasOfficial"].as_bool().unwrap(), "无 auth.json → hasOfficial false");
+        assert_eq!(s["gateway"]["addr"], GATEWAY_ADDR);
+        // 此前托管过、后来清空供应商 → config 残留网关 custom 段,仍必须未托管(null)
+        std::fs::write(
+            &cfg,
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\n",
+        )
+        .unwrap();
+        let s2 = state(&cfg, &prov, &home);
+        assert!(s2["hosting"].is_null(), "无供应商但 config 残留网关段 → 仍应未托管:\n{s2}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = home;
     }
