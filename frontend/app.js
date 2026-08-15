@@ -11,6 +11,7 @@ var state = {
   providers: [],       // GET /api/providers(pure_api 过滤后;含 agent 字段,按 agent 分流)
   dstate: null,        // GET /api/desktop/state {hasOfficial, gateway, hosting}(Codex 托管)
   claude: null,        // Claude 注入式(前端本地态:null 或 {started, way, providerId, providerName, env, command, model};后端无 claude-state 接口)
+  codexWay: "gateway", // Codex 通路方式(会话内本地态 gateway|direct;direct 由 hasOfficial===false 门控,不落盘)
   accel: null,         // GET /api/accel/state {mode, customNode, lines, scopeNote, usage}
   session: null,       // GET /api/session
   balance: null,       // GET /api/auth/me → user.balance
@@ -51,10 +52,17 @@ function providersFor(agent) {
 function lineOf(id) { return providersFor(state.agent).find(function (p) { return p.id === id; }) || null; }
 function hosting() {
   var d = state.dstate;
-  return (d && d.hosting && d.hosting.way === "gateway") ? d.hosting : null;
+  var h = d && d.hosting;
+  return (h && (h.way === "gateway" || h.way === "direct")) ? h : null;
 }
 function claudeStarted() { var c = state.claude; return !!(c && c.started); }
 function claudeWay() { var c = state.claude; return (c && c.way) || "gateway"; }
+function codexWayNow() {
+  var w = state.codexWay || "gateway";
+  /* 直连仅在 hasOfficial === false(纯 API 模式)可用;官方登录在/状态未知 → 回落网关 */
+  if (w === "direct" && !(state.dstate && state.dstate.hasOfficial === false)) return "gateway";
+  return w;
+}
 function hostedBy(id) {
   if (state.agent === "claude") { var c = state.claude; return !!(c && c.started && c.providerId === id); }
   var h = hosting(); return !!h && h.providerId === id;
@@ -123,6 +131,9 @@ async function refreshProviders() {
 }
 async function refreshDesktop() {
   try { state.dstate = await api.desktopState(); } catch (e) { state.dstate = null; }
+  /* 已托管的实际方式回写 seg 态(如上次会话直连托管,本会话 seg 对齐事实) */
+  var h = state.dstate && state.dstate.hosting;
+  if (h && (h.way === "direct" || h.way === "gateway")) state.codexWay = h.way;
 }
 async function refreshClaudeState() {
   /* 后端无 claude-state 接口:注入态纯前端本地;注入的供应商若已被删除 → 复位未注入 */
@@ -293,6 +304,10 @@ function dashHtml() {
   var accelMode = acc.mode || "off";
   var accelOn = accelMode !== "off";
   var hasOff = !!(state.dstate && state.dstate.hasOfficial);
+  /* 直连门控:hasOfficial === false(纯 API 模式)才放开;官方登录在/状态未知 → 禁用 */
+  var directOk = !!(state.dstate && state.dstate.hasOfficial === false);
+  var way = codexWayNow();
+  var direct = way === "direct";
 
   var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
   var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
@@ -300,6 +315,10 @@ function dashHtml() {
   if (!hp) {
     r = st("var(--c-official)", "桌面版 Codex", "官方登录") + lk("var(--c-official)") + st("var(--c-official)", "官方 OpenAI", "chatgpt 登录");
     note = '当前:官方直连 · 选一个供应商并「开启托管」即可走中转';
+  } else if (direct) {
+    /* 通路:直连 —— Key 写入本地配置,不经网关、无加速(两站,同构 Claude 世界 direct 分支) */
+    r = st("var(--c-gw)", "桌面版 Codex", "官方登录保留") + lk("var(--c-direct)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:直连(Key 写入本地配置,不经网关、无加速)';
   } else if (!accelOn) {
     r = st("var(--c-gw)", "桌面版 Codex", "官方登录保留") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787") + lk("var(--c-gw)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
     note = '通路:网关(加速已关,直发上游) · 配置零 Key,Key 由网关注入';
@@ -308,13 +327,13 @@ function dashHtml() {
       + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
     note = '通路:网关 + 加速(已启用线路自动择优,失败自动切换) · 配置零 Key,Key 由网关注入';
   }
-  /* scope 提示条(琥珀,后端给定文案) */
+  /* scope 提示条(琥珀,后端给定文案;直连无加速 → 不出条) */
   var scopeHtml = "";
-  if (hp && accelOn && acc.scopeNote) {
+  if (hp && !direct && accelOn && acc.scopeNote) {
     scopeHtml = '<div style="margin:8px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ ' + esc(acc.scopeNote) + '</div>';
   }
   var usage = (acc.usage && acc.usage.ok) ? acc.usage : null;
-  if (hp && accelOn && usage && usage.degradedToDirect) {
+  if (hp && !direct && accelOn && usage && usage.degradedToDirect) {
     scopeHtml += '<div style="margin:6px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ 官方加速配额已用满,已自动切换直连;可在 ⚙ 设置 → IP 管理 刷新凭证重试。</div>';
   }
   var selVal = hp ? hp.id : state.selId;
@@ -322,8 +341,12 @@ function dashHtml() {
     return '<option value="' + esc(x.id) + '"' + (x.id === selVal ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
   }).join("");
   var p = lineOf(state.selId) || hp;
+  var wayTagColor = direct ? "var(--c-direct)" : "var(--c-gw)";
 
-  var html = '<section class="card"><h2>桌面版 Codex(ChatGPT.app)· 主通道</h2>'
+  /* 详情卡在前、主卡在后(两世界一致) */
+  var html = "";
+  if (p) html += providerDetailCard(p);
+  html += '<section class="card"><h2>桌面版 Codex(ChatGPT.app)· 主通道</h2>'
     + '<div class="detect">'
     + (hasOff
       ? '<span class="tag on">检测:官方登录 ✓ → 混入模式</span>'
@@ -334,21 +357,24 @@ function dashHtml() {
     + '<div class="route-mode"><span class="k">●</span> ' + note + '</div>'
     + scopeHtml
     + '<div class="grid2">'
-    + '<div class="f"><label>通路方式</label><div class="seg"><button disabled style="--lc:var(--c-direct)">直连<small>即将支持</small></button><button aria-pressed="true" style="--lc:var(--c-gw)">网关 + 加速<small>零 Key(默认)</small></button></div></div>'
+    + '<div class="f"><label>通路方式</label><div class="seg">'
+    + (directOk
+      ? '<button data-a="way" data-w="direct" aria-pressed="' + direct + '" style="--lc:var(--c-direct)">直连<small>Key 写入本地配置</small></button>'
+      : '<button disabled style="--lc:var(--c-direct)">直连<small>' + (hasOff ? "官方登录下直连暂不支持(待实测)" : "即将支持") + '</small></button>')
+    + '<button data-a="way" data-w="gateway" aria-pressed="' + (!direct) + '" style="--lc:var(--c-gw)">网关 + 加速<small>零 Key(默认)</small></button></div></div>'
     + '<div class="f"><label>加速</label><div style="display:flex;gap:6px;align-items:center">'
     + '<div class="seg" style="flex:1">'
-    + '<button data-a="accel" data-m="off" aria-pressed="' + (!accelOn) + '" style="--lc:var(--muted)">关</button>'
-    + '<button data-a="accel" data-m="on" aria-pressed="' + (accelOn) + '" style="--lc:var(--c-accel)">开<small>自动择优</small></button></div>'
+    + '<button data-a="accel" data-m="off" aria-pressed="' + (!accelOn) + '" style="--lc:var(--muted)"' + (direct ? " disabled" : "") + '>关</button>'
+    + '<button data-a="accel" data-m="on" aria-pressed="' + (accelOn) + '" style="--lc:var(--c-accel)"' + (direct ? " disabled" : "") + '>开<small>自动择优</small></button></div>'
     + '</div><div class="sub" style="margin-top:2px">线路在 左下 ⚙ 设置 → IP 管理 里维护</div></div>'
     + '<div class="f"><label>供应商(走哪家中转)</label><select id="provSel" data-a="prov">' + opts + '</select></div>'
-    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">' + (hp ? "网关 · 配置零 Key" : "未托管") + '</span></div></div>'
+    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:' + wayTagColor + ';color:' + wayTagColor + '">' + (hp ? (direct ? "直连 · Key 写入本地配置" : "网关 · 配置零 Key") : "未托管") + '</span></div></div>'
     + '</div>'
     + '<div class="btn-row">'
     + (hp ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>还原官方</button>'
       : '<button class="btn primary" data-a="host-on"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
     + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
     + '</div><div id="rtest"></div></section>';
-  if (p) html += providerDetailCard(p);
   if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
   return html;
 }
@@ -367,7 +393,11 @@ function providerDetailCard(p) {
       + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
       + (hb ? '<button class="btn ghost" disabled>删除(注入中)</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
   } else {
-    btns = '<button class="btn primary" data-a="edit" data-id="' + esc(p.id) + '">编辑</button>'
+    /* Codex 世界:启用(未托管)/停用(已托管)+ 编辑 + 诊断 + 删除(托管中禁用)——与 Claude 分支同构 */
+    btns = (hb
+      ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>停用</button>'
+      : '<button class="btn primary" data-a="host-on" data-id="' + esc(p.id) + '"' + (state.busy === "host" ? " disabled" : "") + '>启用</button>')
+      + '<button class="btn" data-a="edit" data-id="' + esc(p.id) + '">编辑</button>'
       + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
       + (hb ? '<button class="btn ghost" disabled>删除(' + tagLabel + ')</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
   }
@@ -469,7 +499,10 @@ function claudeDashHtml() {
   }).join("");
   var p = lineOf(state.selId) || hp;
 
-  var html = '<section class="card"><h2>Claude Code · 主通道(注入式)</h2>'
+  /* 详情卡在前、主卡在后(两世界一致) */
+  var html = "";
+  if (p) html += providerDetailCard(p);
+  html += '<section class="card"><h2>Claude Code · 主通道(注入式)</h2>'
     + '<div class="detect">'
     + '<span class="tag on">Claude Code · 注入式</span>'
     + (started ? '<span class="tag" style="border-color:var(--c-claude);color:var(--c-claude)">已注入 · ' + esc(hp.name) + '</span>' : '<span class="tag">未注入</span>')
@@ -496,7 +529,6 @@ function claudeDashHtml() {
       : '<button class="btn primary" data-a="claude-start"' + (state.busy === "claude-start" ? " disabled" : "") + '>启动 Claude Code</button>')
     + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
     + '</div><div id="rtest"></div></section>';
-  if (p) html += providerDetailCard(p);
   if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
   return html;
 }
@@ -721,14 +753,20 @@ async function doDiag() {
 }
 
 /* ── 托管 / 还原 ── */
-async function doHost(providerId) {
+async function doHost(providerId, way) {
   if (!providerId) return;
+  var w = (way === "direct" || way === "gateway") ? way : codexWayNow();
   state.busy = "host"; render();
   try {
-    var r = await api.desktopHost(providerId, "gateway");
+    var r = await api.desktopHost(providerId, w);
+    state.codexWay = w;
     await refreshAll();
     state.selId = providerId;
-    showToast(r && r.switched ? "已切换供应商(即时生效)" : "桌面版已托管走中转(已自动备份,可随时还原)", "ok");
+    showToast(r && r.switched
+      ? "已切换供应商(即时生效)"
+      : (w === "direct"
+        ? "桌面版已直连托管(Key 已写入本地配置,已自动备份,可随时还原)"
+        : "桌面版已托管走中转(已自动备份,可随时还原)"), "ok");
   } catch (e) {
     showToast(e.message, "error");
     await refreshDesktop();
@@ -1191,19 +1229,27 @@ document.addEventListener("click", function (ev) {
       if (state.confirmCb) { var cb = state.confirmCb; state.confirmCb = null; cb(true); }
       break;
     case "confirm-no": closeConfirm(); break;
-    case "host-on":
-      askConfirm("开启托管?", "桌面版 Codex 将走选中的供应商中转,官方登录保留;操作前自动备份。").then(function (yes) {
-        if (yes) doHost(state.selId);
+    case "host-on": {
+      var hw = codexWayNow();
+      askConfirm("开启托管?", hw === "direct"
+        ? "桌面版 Codex 将直连选中的供应商(Key 写入本地配置,不经网关、无加速);操作前自动备份。"
+        : "桌面版 Codex 将走选中的供应商中转,官方登录保留;操作前自动备份。").then(function (yes) {
+        if (yes) doHost(t.dataset.id || state.selId, hw);
       });
       break;
+    }
     case "unhost":
       askConfirm("还原官方?", "清除本软件写入的托管配置(config 托管段 / auth Key),~/.codex 回到官方状态;操作前自动备份。").then(function (yes) {
         if (yes) doUnhost();
       });
       break;
     case "way":
-      state.claude = state.claude || {};
-      state.claude.way = t.dataset.w;
+      if (state.agent === "claude") {
+        state.claude = state.claude || {};
+        state.claude.way = t.dataset.w;
+      } else {
+        state.codexWay = t.dataset.w === "direct" ? "direct" : "gateway";
+      }
       render();
       break;
     case "claude-copy": {
