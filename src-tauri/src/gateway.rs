@@ -43,7 +43,9 @@ pub async fn proxy_anthropic(State(s): State<Arc<AppState>>, req: Request<Body>)
 /// - 取 agent=claude 的 active 供应商(规则见 providers::get_provider_for_agent,global active 是 codex 时取 claude 首个);
 /// - 注入该供应商 api_key 作 `Authorization: Bearer <key>`(Key 只走上游,不进日志),透传到供应商 base_url 的 `/v1/messages`;
 /// - base_url 已以 `/v1` 结尾(挂载在根) → 拼 `/messages`;否则拼 `/v1/messages`(中转站两形态均可,CTO 实测 2xa.cc.cd 均 200);
-/// - 透传原样 body,**不做** Responses/Chat 转换(中转站原生 Anthropic 兼容);本期不加加速线路(加速复用留待接线员/罗盘结论)。
+/// - 透传原样 body,**不做** Responses/Chat 转换(中转站原生 Anthropic 兼容);
+/// - R1 加速接线:与 Codex 同一体系——accel_plan 命中 → 首选 build_line_client;连接层失败且
+///   未写首字节 → 直连重试一次;407 → per-Key 重签判别/降级直连/人话化 502(共用 send_with_accel)。
 async fn dispatch_anthropic(state: &AppState, req: Request<Body>) -> Response<Body> {
     let provider = match crate::providers::get_provider_for_agent(&state.providers_path, "claude") {
         Some(p) => p,
@@ -54,10 +56,24 @@ async fn dispatch_anthropic(state: &AppState, req: Request<Body>) -> Response<Bo
         return err_resp(StatusCode::BAD_REQUEST, "Official 模式不走网关");
     }
 
-    let client = match build_client(&provider) {
+    // ── R1 加速装配(与 dispatch 同源):命中线 → 线 client 首选,直连兜底 ──
+    let line = accel_plan(state, &provider.base_url, &provider.api_key);
+    let direct_client = match build_client(&provider) {
         Ok(c) => c,
         Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("build client: {e}")),
     };
+    let timeout = Duration::from_secs(provider.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+    let line_client = match &line {
+        Some((l, _)) => match build_line_client(l, timeout) {
+            Ok(c) => Some(c),
+            Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("build line client: {e}")),
+        },
+        None => None,
+    };
+    if let Some((l, pk)) = &line {
+        eprintln!("[GW] anthropic accel line={} endpoint={} per_key={} (直连兜底开启)", l.id, l.endpoint, pk);
+    }
+
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
@@ -72,32 +88,31 @@ async fn dispatch_anthropic(state: &AppState, req: Request<Body>) -> Response<Bo
         format!("{}/v1/messages", base)
     };
 
-    // 01-D3：注入 provider.api_key（覆盖任何来源的凭证）
-    let mut rb = client
-        .request(method, target)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", provider.api_key));
-    if let Some(ua) = provider.user_agent.as_deref().filter(|s| !s.is_empty()) {
-        rb = rb.header(reqwest::header::USER_AGENT, ua);
-    }
-    if let Some(hs) = provider.custom_headers.as_ref() {
-        for (k, v) in hs {
-            rb = rb.header(k, v);
+    // 01-D3：注入 provider.api_key（覆盖任何来源的凭证）；抽为闭包以支持换线重试(同 dispatch)
+    let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
+        let mut rb = client
+            .request(method.clone(), target.clone())
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", provider.api_key));
+        if let Some(ua) = provider.user_agent.as_deref().filter(|s| !s.is_empty()) {
+            rb = rb.header(reqwest::header::USER_AGENT, ua);
         }
-    }
-    if let Some(ct) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
-        rb = rb.header(reqwest::header::CONTENT_TYPE, ct.clone());
-    }
-    if !body_bytes.is_empty() {
-        rb = rb.body(body_bytes.clone());
-    }
+        if let Some(hs) = provider.custom_headers.as_ref() {
+            for (k, v) in hs {
+                rb = rb.header(k, v);
+            }
+        }
+        if let Some(ct) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+            rb = rb.header(reqwest::header::CONTENT_TYPE, ct.clone());
+        }
+        if !body_bytes.is_empty() {
+            rb = rb.body(body_bytes.clone());
+        }
+        rb
+    };
 
-    let upstream = match rb.send().await {
+    let upstream = match send_with_accel(state, &provider.api_key, &line, &line_client, &direct_client, timeout, &build_rb).await {
         Ok(r) => r,
-        Err(e) if e.is_timeout() => return err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
-        Err(e) => {
-            eprintln!("[GW] anthropic ✗ upstream ERR: {e}");
-            return err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable");
-        }
+        Err(resp) => return resp,
     };
 
     // 原样透传（FR-4.11）：上游状态码 + body 流式回传，不做协议转换
@@ -210,86 +225,10 @@ async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str) -> Respons
 
     // ── 换线重试:首发带 line 的 client;连接层失败且 line 存在 → 用直连 client 重试一次。
     // send() 返回 Ok 前未向客户端写任何字节,故「已开始写响应(中途断流)」绝不重试是天然成立的。
-    let used_line = line_client.is_some();
-    let per_key = line.as_ref().map(|(_, pk)| *pk).unwrap_or(false);
-    let first = line_client.as_ref().unwrap_or(&direct_client);
-    let upstream = match build_rb(first).send().await {
-        Ok(r) => {
-            // 代理 407 → 线路凭证无效。per-Key 凭证走重签判别(星图 resolve_407:重签/降级/直连);
-            // legacy/custom 凭证人话化 502,不换直连(避免绕过用户指定的线路)。
-            if used_line && r.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-                if !per_key {
-                    eprintln!("[GW] line 凭证无效(407)");
-                    return err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效");
-                }
-                let line_ref = &line.as_ref().expect("used_line ⇒ line").0;
-                let retry_line = match resolve_407_perkey(state, &provider.api_key, line_ref, timeout).await {
-                    Resolve407::Invalid => return err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"),
-                    Resolve407::NewClient(c) => Some(c),
-                    Resolve407::Direct => None,
-                };
-                let client = retry_line.as_ref().unwrap_or(&direct_client);
-                match build_rb(client).send().await {
-                    // 重签凭证重试仍 407 → 人话化收束(不无限重试)
-                    Ok(r2) if retry_line.is_some() && r2.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
-                        eprintln!("[GW] 重签后仍 407");
-                        return err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效");
-                    }
-                    Ok(r2) => r2,
-                    Err(e2) if e2.is_timeout() => return err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
-                    Err(e2) => {
-                        eprintln!("[GW] ✗ upstream ERR: {e2}");
-                        return err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable");
-                    }
-                }
-            } else {
-                r
-            }
-        }
-        Err(e) => {
-            if used_line && proxy_auth_error(&e) {
-                // CONNECT 阶段的 407 以 Err(hyper ProxyAuthRequired) 形态出现:per-Key 同判别
-                if !per_key {
-                    eprintln!("[GW] line 代理认证失败: {e}");
-                    return err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效");
-                }
-                eprintln!("[GW] per-Key 代理认证失败,重签判别: {e}");
-                let line_ref = &line.as_ref().expect("used_line ⇒ line").0;
-                let retry_line = match resolve_407_perkey(state, &provider.api_key, line_ref, timeout).await {
-                    Resolve407::Invalid => return err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"),
-                    Resolve407::NewClient(c) => Some(c),
-                    Resolve407::Direct => None,
-                };
-                let client = retry_line.as_ref().unwrap_or(&direct_client);
-                match build_rb(client).send().await {
-                    Ok(r2) if retry_line.is_some() && r2.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
-                        eprintln!("[GW] 重签后仍 407");
-                        return err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效");
-                    }
-                    Ok(r2) => r2,
-                    Err(e2) if e2.is_timeout() => return err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
-                    Err(e2) => {
-                        eprintln!("[GW] ✗ upstream ERR: {e2}");
-                        return err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable");
-                    }
-                }
-            } else if used_line {
-                eprintln!("[GW] line 失败({e}),换直连重试一次");
-                match build_rb(&direct_client).send().await {
-                    Ok(r) => r,
-                    Err(e2) if e2.is_timeout() => return err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
-                    Err(e2) => {
-                        eprintln!("[GW] ✗ upstream ERR: {e2}");
-                        return err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable");
-                    }
-                }
-            } else if e.is_timeout() {
-                return err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout");
-            } else {
-                eprintln!("[GW] ✗ upstream ERR: {e}");
-                return err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable");
-            }
-        }
+    // 407 判别/换线重试整段抽为 send_with_accel(R1 /anthropic 接线共用,行为与原内联等价)。
+    let upstream = match send_with_accel(state, &provider.api_key, &line, &line_client, &direct_client, timeout, &build_rb).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
     eprintln!("[GW] ← upstream {} conv={:?}", upstream.status(), conv_stream);
 
@@ -611,6 +550,107 @@ fn build_line_client(line: &AccLine, timeout: Duration) -> Result<reqwest::Clien
         .proxy(proxy)
         .build()
         .map_err(|e| format!("client: {e}"))
+}
+
+/// 加速发送核心(R1 抽共用,dispatch 与 dispatch_anthropic 共享):
+/// 首发 = 命中线的 client(未命中/加速关 = 直连 client);Ok 但代理 407 或 Err 呈现代理
+/// 认证失败(CONNECT 阶段 407)→ 非 per-Key(legacy/custom)人话化 502 不绕线,per-Key 走
+/// resolve_407_and_retry 判别;其余连接层失败且线在用 → 换直连 client 重试一次;
+/// 未用线时 timeout → 504、其余 → 502。终态响应以 Err(Response) 返回,调用方直接透传。
+/// send() 返回 Ok 前未向客户端写任何字节,故重试/换线均无重复副作用。
+async fn send_with_accel<F>(
+    state: &AppState,
+    api_key: &str,
+    line: &Option<(AccLine, bool)>,
+    line_client: &Option<reqwest::Client>,
+    direct_client: &reqwest::Client,
+    timeout: Duration,
+    build_rb: &F,
+) -> Result<reqwest::Response, Response<Body>>
+where
+    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+{
+    let used_line = line_client.is_some();
+    let per_key = line.as_ref().map(|(_, pk)| *pk).unwrap_or(false);
+    let first = line_client.as_ref().unwrap_or(direct_client);
+    match build_rb(first).send().await {
+        Ok(r) => {
+            // 代理 407 → 线路凭证无效。per-Key 凭证走重签判别(星图 resolve_407:重签/降级/直连);
+            // legacy/custom 凭证人话化 502,不换直连(避免绕过用户指定的线路)。
+            if used_line && r.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+                if !per_key {
+                    eprintln!("[GW] line 凭证无效(407)");
+                    return Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"));
+                }
+                let line_ref = &line.as_ref().expect("used_line ⇒ line").0;
+                resolve_407_and_retry(state, api_key, line_ref, timeout, direct_client, build_rb).await
+            } else {
+                Ok(r)
+            }
+        }
+        Err(e) => {
+            if used_line && proxy_auth_error(&e) {
+                // CONNECT 阶段的 407 以 Err(hyper ProxyAuthRequired) 形态出现:per-Key 同判别
+                if !per_key {
+                    eprintln!("[GW] line 代理认证失败: {e}");
+                    return Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"));
+                }
+                eprintln!("[GW] per-Key 代理认证失败,重签判别: {e}");
+                let line_ref = &line.as_ref().expect("used_line ⇒ line").0;
+                resolve_407_and_retry(state, api_key, line_ref, timeout, direct_client, build_rb).await
+            } else if used_line {
+                eprintln!("[GW] line 失败({e}),换直连重试一次");
+                match build_rb(direct_client).send().await {
+                    Ok(r) => Ok(r),
+                    Err(e2) if e2.is_timeout() => Err(err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout")),
+                    Err(e2) => {
+                        eprintln!("[GW] ✗ upstream ERR: {e2}");
+                        Err(err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"))
+                    }
+                }
+            } else if e.is_timeout() {
+                Err(err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"))
+            } else {
+                eprintln!("[GW] ✗ upstream ERR: {e}");
+                Err(err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"))
+            }
+        }
+    }
+}
+
+/// 407 后的 per-Key 重签判别 + 单次重试(R1 抽共用):resolve_407_perkey 给出
+/// NewClient(新凭证线 client 重试一次,仍 407 → 人话化 502 收束)/ Direct(直连重试)/
+/// Invalid(502 人话化);重试的连接错误处理同首发(timeout → 504,其余 → 502)。
+async fn resolve_407_and_retry<F>(
+    state: &AppState,
+    api_key: &str,
+    line: &AccLine,
+    timeout: Duration,
+    direct_client: &reqwest::Client,
+    build_rb: &F,
+) -> Result<reqwest::Response, Response<Body>>
+where
+    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+{
+    let retry_line = match resolve_407_perkey(state, api_key, line, timeout).await {
+        Resolve407::Invalid => return Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效")),
+        Resolve407::NewClient(c) => Some(c),
+        Resolve407::Direct => None,
+    };
+    let client = retry_line.as_ref().unwrap_or(direct_client);
+    match build_rb(client).send().await {
+        // 重签凭证重试仍 407 → 人话化收束(不无限重试)
+        Ok(r2) if retry_line.is_some() && r2.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
+            eprintln!("[GW] 重签后仍 407");
+            Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"))
+        }
+        Ok(r2) => Ok(r2),
+        Err(e2) if e2.is_timeout() => Err(err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout")),
+        Err(e2) => {
+            eprintln!("[GW] ✗ upstream ERR: {e2}");
+            Err(err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"))
+        }
+    }
 }
 
 /// 请求错误是否指向代理认证失败(407/401):CONNECT 模式下代理拒绝会以 Err 形式出现
@@ -1031,6 +1071,129 @@ mod tests {
         let (state, _providers_path, root) = make_state("anthropic-none");
         let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{}").await).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── R1 /anthropic 加速接线(与 Codex 同一体系,四个必测场景)──
+
+    // ⑴ anthropic + official 命中 → 请求经代理转发到上游。mock 代理校验 Basic auth
+    // (Proxy-Authorization 不符即 407);legacy 非 per-Key,407 即 502——故 200 + 上游命中
+    // 即证明线路凭证 Basic auth 已正确送达代理。
+    #[tokio::test]
+    async fn anthropic_accel_hit_routes_through_proxy_with_basic_auth() {
+        let _g = crate::server::set_issue_base_for_tests(crate::server::DEAD_ISSUE_BASE);
+        let (up_base, up_seen) = mock_anthropic_upstream().await;
+        let (px_url, px_seen) = mock_proxy(Some(("u", "p"))).await;
+        let (state, providers_path, root) = make_state("anth-accel-hit");
+        add_claude_provider(&providers_path, &up_base, "sk-claude-line");
+        state.nodecreds.write().unwrap().legacy =
+            Some(Cred { user: "u".into(), pass: "p".into() });
+        set_accel(
+            &state,
+            "official",
+            vec![test_line("l1", &px_url, &["127.0.0.1"], Some(Cred { user: "u".into(), pass: "p".into() }))],
+            "",
+        );
+
+        let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{\"model\":\"claude-sonnet\"}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK, "命中线应经代理(Basic auth 校验通过)返回 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"ANTHROPIC_OK_V1");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!px_seen.lock().unwrap().is_empty(), "anthropic 命中线:代理应看到经其转发的请求");
+        assert_eq!(
+            up_seen.lock().unwrap().first().map(|(a, p)| (a.as_str(), p.as_str())),
+            Some(("Bearer sk-claude-line", "/v1/messages")),
+            "上游应经代理收到请求并保留 Bearer 注入"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ⑵ 未命中 scope → 直连,代理零请求。
+    #[tokio::test]
+    async fn anthropic_accel_no_match_falls_back_direct() {
+        let (up_base, up_seen) = mock_anthropic_upstream().await;
+        let (px_url, px_seen) = mock_proxy(Some(("u", "p"))).await;
+        let (state, providers_path, root) = make_state("anth-accel-nomatch");
+        add_claude_provider(&providers_path, &up_base, "sk-claude-direct");
+        set_accel(
+            &state,
+            "official",
+            vec![test_line("l1", &px_url, &["not-this-host.com"], Some(Cred { user: "u".into(), pass: "p".into() }))],
+            "",
+        );
+
+        let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"ANTHROPIC_OK_V1");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(px_seen.lock().unwrap().is_empty(), "未命中不应经代理");
+        assert_eq!(
+            up_seen.lock().unwrap().first().map(|(a, _)| a.as_str()),
+            Some("Bearer sk-claude-direct"),
+            "直连应命中上游"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ⑶ 线路坏(连接即断)→ 换直连重试一次,响应完整。legacy 在册 → accel_plan 保留
+    // 共享凭证线,首发真打坏代理失败(非 407)→ 直连兜底。
+    #[tokio::test]
+    async fn anthropic_accel_bad_line_retries_direct_and_response_complete() {
+        let bad = broken_proxy().await;
+        let (up_base, up_seen) = mock_anthropic_upstream().await;
+        let (state, providers_path, root) = make_state("anth-accel-badline");
+        add_claude_provider(&providers_path, &up_base, "sk-claude-retry");
+        state.nodecreds.write().unwrap().legacy =
+            Some(Cred { user: "u".into(), pass: "p".into() });
+        set_accel(
+            &state,
+            "official",
+            vec![test_line("l1", &bad, &["127.0.0.1"], Some(Cred { user: "u".into(), pass: "p".into() }))],
+            "",
+        );
+
+        let resp = proxy_anthropic(State(Arc::new(state)), req_post_anthropic("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"ANTHROPIC_OK_V1", "坏线换直连后响应应完整");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(up_seen.lock().unwrap().len(), 1, "直连重试应恰好命中上游一次");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ⑷ per-Key 407 → 重签判得配额满 → store 记降级,本请求降级直连且响应完整。
+    #[tokio::test]
+    async fn anthropic_per_key_407_quota_full_degrades_direct() {
+        let issue = crate::server::spawn_issue_mock(
+            "403 Forbidden",
+            r#"{"error":"该账号本月已用满 10G","quotaUsedBytes":777,"quotaTotalBytes":888}"#,
+        )
+        .await;
+        let _g = crate::server::set_issue_base_for_tests(&issue);
+        let (up_base, up_seen) = mock_anthropic_upstream().await;
+        let (px_url, px_seen) = mock_proxy(Some(("right", "right"))).await;
+        let (state, providers_path, root) = make_state("anth-pk-403");
+        add_claude_provider(&providers_path, &up_base, "sk-claude-full-0006");
+        put_cred(&state, "sk-claude-full-0006", "stale-user", "stale-pass", false); // 代理侧为错 → 407
+        set_accel(
+            &state,
+            "official",
+            vec![test_line("l1", &px_url, &["127.0.0.1"], Some(Cred { user: "x".into(), pass: "y".into() }))],
+            "",
+        );
+
+        let resp = proxy_anthropic(State(Arc::new(state.clone())), req_post_anthropic("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK, "配额满降级直连应 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"ANTHROPIC_OK_V1", "降级直连响应应完整");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(up_seen.lock().unwrap().len(), 1, "直连重试恰好命中上游一次");
+        assert!(!px_seen.lock().unwrap().is_empty(), "首发应打到代理(收到 407)");
+        let entry = state.nodecreds.read().unwrap().get_for_key("sk-claude-full-0006").cloned().unwrap();
+        assert!(entry.degraded_to_direct, "QuotaFull 应记 degraded_to_direct");
+        assert_eq!(entry.quota_used_bytes, 777, "快照 used 应回写");
         let _ = std::fs::remove_dir_all(&root);
     }
 
