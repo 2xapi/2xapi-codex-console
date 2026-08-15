@@ -62,6 +62,7 @@ button { font-family: inherit; }
 .chip .led { width: 6px; height: 6px; border-radius: 50%; background: var(--c-official); }
 .chip .led.off { background: var(--muted); }
 .chip b { color: var(--text); }
+#hostChip.claude { color: var(--c-claude); }
 
 /* ── 按钮/通用 ── */
 .btn { padding: 6px 12px; border-radius: 7px; border: 1px solid var(--hair); background: var(--raised); color: var(--text); cursor: pointer; font-size: 12.5px; }

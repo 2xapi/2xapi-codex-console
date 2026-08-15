@@ -111,6 +111,34 @@
     // 测试连接(阶段 2):{providerId} 或 {baseUrl, apiKey}
     preflight: (body) => request("POST", "/api/launcher/preflight", { body }),
 
+    // ── Claude 注入式托管(Claude 批次:后端返回注入信息,前端展示/复制;停用=前端本地态)──
+    // claude-start 契约:成功 {ok:true, command, env:{ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN}, way, providerId, providerName, model}
+    //   —— 字段在顶层(不走 data 信封);失败 {ok:false, error:{code,message}}(4xx)。Key 只在响应,不落盘。
+    claudeStart: async (way) => {
+      const resp = await fetch("/api/desktop/claude-start", {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        body: JSON.stringify({ way: way || "" }),
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (payload && payload.ok === true) {
+        return {
+          command: payload.command || "",
+          env: payload.env || {},
+          way: payload.way || "",
+          providerId: payload.providerId || "",
+          providerName: payload.providerName || "",
+          model: payload.model || "",
+        };
+      }
+      const e = payload && payload.error;
+      const err = new Error((e && e.message) || "Claude 注入失败(" + resp.status + ")");
+      err.code = (e && e.code) || "E_UNKNOWN";
+      err.status = resp.status;
+      throw err;
+    },
+    // 后端无 claude-stop 接口(注入式无常驻进程):停用 = 前端清除注入态,本地即刻完成
+    claudeStop: async () => ({ restored: true }),
+
     // ── 加速(阶段 4,任务书 §…):mode off|official|custom;customNode 仅本机保存 ──
     // GET /api/accel/state 返回非信封 {mode,customNode,lines[],scopeNote}(字段在顶层),失败时可能 {ok:false,error};用 rawJson 解顶层字段
     accelState: async () => {
