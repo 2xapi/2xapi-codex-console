@@ -204,6 +204,8 @@ pub struct ProviderInput {
     pub sub2api_enabled: bool,
     pub sub2api_multiplier: f64,
     pub custom_headers: Option<HashMap<String, String>>,
+    // ProviderInput 不经 serde 反序列化（由 value_to_input 解析），缺失键默认 None → 旧请求不带该字段时不会清空已保存档位。
+    pub reasoning_levels: Option<Vec<String>>,
 }
 
 // ── 存储读写（02 §3，原子写）─────────────────────────────────
@@ -277,7 +279,7 @@ pub fn input_to_provider(input: ProviderInput) -> Provider {
         custom_headers: input.custom_headers,
         config_toml_snapshot: None,
         auth_json_snapshot: None,
-        reasoning_levels: None,
+        reasoning_levels: input.reasoning_levels,
     }
 }
 
@@ -319,6 +321,10 @@ pub fn validate(input: &ProviderInput) -> Result<(), Vec<ValidationError>> {
     if input.sub2api_multiplier <= 0.0 {
         errs.push(ValidationError { field: "sub2api_multiplier".into(), message: "sub2api_multiplier 须 > 0".into() });
     }
+
+    // reasoning_levels：不做校验约束。归一化（逐项 trim + 去掉空串）已在 value_to_input 的
+    // parse_reasoning_levels 入口完成；且不设白名单——上游档位可能超出 low/medium/high，避免过度约束。
+    // 直接构造 ProviderInput 的调用方（如 gateway.rs 测试）传原始值也合法，validate 无需干预。
 
     if errs.is_empty() {
         Ok(())
@@ -365,7 +371,7 @@ pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<Validat
         custom_headers: input.custom_headers,
         config_toml_snapshot: None,
         auth_json_snapshot: None,
-        reasoning_levels: None,
+        reasoning_levels: input.reasoning_levels,
     };
     data.providers.push(provider.clone());
     save_atomic(path, &data, "create").map_err(io_errs)?;
@@ -408,6 +414,10 @@ pub fn update(path: &Path, id: &str, input: ProviderInput) -> Result<Provider, V
     p.sub2api_enabled = eff.sub2api_enabled;
     p.sub2api_multiplier = eff.sub2api_multiplier;
     p.custom_headers = eff.custom_headers;
+    // reasoning_levels：Some → 更新为传入值；None → 保留现值（旧客户端/PUT 不带该字段时不清空已保存档位）。
+    if let Some(levels) = eff.reasoning_levels {
+        p.reasoning_levels = Some(levels);
+    }
     let updated = p.clone();
     save_atomic(path, &data, "update").map_err(io_errs)?;
     Ok(updated)
@@ -493,6 +503,8 @@ pub fn public_provider(p: &Provider) -> Value {
         "proxyUrl": p.proxy_url, "timeoutSecs": p.timeout_secs,
         "sub2apiEnabled": p.sub2api_enabled, "sub2apiMultiplier": p.sub2api_multiplier,
         "customHeaders": p.custom_headers,
+        // 思考档位:前端读取名=snake reasoning_levels(app.js:318/577/715/782),None 序列化为 null。
+        "reasoning_levels": p.reasoning_levels,
     })
 }
 
@@ -544,6 +556,10 @@ pub fn value_to_input(body: &Value) -> ProviderInput {
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0),
         custom_headers: body.get("customHeaders").or_else(|| body.get("custom_headers")).map(parse_headers),
+        reasoning_levels: body
+            .get("reasoningLevels")
+            .or_else(|| body.get("reasoning_levels"))
+            .and_then(parse_reasoning_levels),
     }
 }
 
@@ -578,6 +594,19 @@ fn parse_headers(v: &Value) -> HashMap<String, String> {
     v.as_object()
         .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
         .unwrap_or_default()
+}
+
+/// 解析 reasoning_levels 数组：逐项 trim 后去掉空串（不设白名单，上游档位可超出 low/medium/high）。
+fn parse_reasoning_levels(v: &Value) -> Option<Vec<String>> {
+    v.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|lv| {
+                lv.as_str()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .collect()
+    })
 }
 
 // ── 单测（M1 Gate）────────────────────────────────────────────
@@ -867,5 +896,93 @@ mod tests {
         assert_eq!(raw2.lines().filter(|l| !l.trim().is_empty()).count(), 4);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_persists_reasoning_levels() {
+        let path = tmp_path("rl_create");
+        let mut i = sample_input("RL", AccessMode::Official);
+        i.model = "m".into();
+        i.reasoning_levels = Some(vec!["low".into(), "high".into()]);
+        let p = create(&path, i).expect("create");
+        assert_eq!(p.reasoning_levels, Some(vec!["low".into(), "high".into()]));
+        // 重载后仍在
+        let data = load(&path);
+        assert_eq!(data.providers[0].reasoning_levels, Some(vec!["low".into(), "high".into()]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_reasoning_levels_some_updates_none_preserves() {
+        let path = tmp_path("rl_update");
+        let mut i = sample_input("RLU", AccessMode::Official);
+        i.model = "m".into();
+        i.reasoning_levels = Some(vec!["low".into()]);
+        let p = create(&path, i).expect("create");
+
+        // None → 保留原值
+        let keep = sample_input("RLU2", AccessMode::Official);
+        let p2 = update(&path, &p.id, keep).expect("update-keep");
+        assert_eq!(p2.reasoning_levels, Some(vec!["low".into()]));
+
+        // Some → 更新
+        let mut set = sample_input("RLU3", AccessMode::Official);
+        set.reasoning_levels = Some(vec!["medium".into(), "high".into()]);
+        let p3 = update(&path, &p.id, set).expect("update-set");
+        assert_eq!(p3.reasoning_levels, Some(vec!["medium".into(), "high".into()]));
+
+        // 持久化后仍在
+        let data = load(&path);
+        assert_eq!(data.providers[0].reasoning_levels, Some(vec!["medium".into(), "high".into()]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_request_without_reasoning_levels_is_fine() {
+        let path = tmp_path("rl_old");
+        let mut i = sample_input("Old", AccessMode::Official);
+        i.model = "m".into();
+        // 直接构造且不带 reasoning_levels（None）→ create 不崩、字段为 None
+        let p = create(&path, i).expect("create");
+        assert_eq!(p.reasoning_levels, None);
+
+        // 经 value_to_input 的旧请求 body（无该字段）→ 字段为 None
+        let input = value_to_input(&json!({"name":"ViaJson","model":"m","accessMode":"official"}));
+        assert_eq!(input.reasoning_levels, None);
+
+        // update 不带该字段 → 保留原值（仍为 None），不崩
+        let keep = sample_input("Old2", AccessMode::Official);
+        let p2 = update(&path, &p.id, keep).expect("update");
+        assert_eq!(p2.reasoning_levels, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn value_to_input_parses_and_cleans_reasoning_levels() {
+        // camelCase 优先于 snake_case（与其他字段一致）；逐项 trim 后去掉空串
+        let body = json!({
+            "name": "X", "model": "m",
+            "reasoning_levels": [" low ", " ", "medium", ""],
+            "reasoningLevels": ["high"]
+        });
+        assert_eq!(value_to_input(&body).reasoning_levels, Some(vec!["high".into()]));
+        // 仅 snake_case：trim + 去空
+        let body2 = json!({"name":"Y","model":"m","reasoning_levels":[" low ",""," high ","  "]});
+        assert_eq!(value_to_input(&body2).reasoning_levels, Some(vec!["low".into(), "high".into()]));
+    }
+
+    #[test]
+    fn public_provider_includes_reasoning_levels() {
+        // None → 输出 null，不崩（前端 app.js 用 (p.reasoning_levels || []) 容错）
+        let p_none = sample_provider(); // sample_provider 的 reasoning_levels 为 None
+        let v_none = public_provider(&p_none);
+        assert_eq!(v_none["reasoning_levels"], serde_json::Value::Null);
+
+        // Some → 字段名 snake、值正确（前端读取名，app.js:318/577/715/782）
+        let mut p = sample_provider();
+        p.reasoning_levels = Some(vec!["low".into(), "medium".into()]);
+        let v = public_provider(&p);
+        assert_eq!(v["reasoning_levels"], serde_json::json!(["low", "medium"]));
+        assert_eq!(v["reasoning_levels"].as_array().map(|a| a.len()), Some(2));
     }
 }
