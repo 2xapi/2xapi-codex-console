@@ -179,6 +179,8 @@
     sessionsRepair: () => request("POST", "/api/sessions/repair"),
     sessionsSettings: () => request("GET", "/api/sessions/settings"),
     sessionsSetSettings: (autoRepair) => request("POST", "/api/sessions/settings", { body: { autoRepairBeforeHost: autoRepair } }),
+    // ── Claude 会话历史(R2:只读列表;~/.claude/projects jsonl,无修复/删除)──
+    claudeSessions: (page, size) => request("GET", "/api/claude/sessions?page=" + (page || 1) + "&size=" + (size || 50)),
 
     // ── 运维：备份/快照/恢复/历史诊断（旧路由，raw 响应）──
     backups: async () => rawJson("GET", "/api/backups"),
