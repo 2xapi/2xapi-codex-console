@@ -302,7 +302,11 @@ async fn handle_auth_api_keys(State(s): State<Arc<AppState>>) -> Response {
         return err_json(StatusCode::UNAUTHORIZED, "请先登录 2xapi 账号");
     };
     let keys = match crate::auth::fetch_api_keys(&session.access_token).await {
-        Ok(v) => v.get("data").cloned().unwrap_or(json!([])),
+        Ok(v) => {
+            let d = v.get("data").cloned().unwrap_or(json!([]));
+            // 部署版为 {items:[...]}(main 分支为直接数组)——两种都兼容
+            if d.is_array() { d } else { d.get("items").cloned().unwrap_or(json!([])) }
+        }
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("获取 Key 列表失败: {}", e)),
     };
     let base_url = crate::auth::fetch_relay_base_url().await.unwrap_or_else(|_| "https://2xa.cc.cd".into());

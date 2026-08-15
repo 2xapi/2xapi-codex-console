@@ -196,9 +196,10 @@ pub async fn fetch_key_groups(access_token: &str) -> Result<Value, String> {
     xapi_request("/groups", reqwest::Method::GET, &json!({}), access_token).await
 }
 
-/// 用户 API Key 列表(Sub2API GET /api-keys?key 明文)——「一键导入」数据源。
+/// 用户 API Key 列表——「一键导入」数据源。
+/// 2xapi 部署版为 GET /keys(响应 data.items;main 分支源码的 /api-keys 在该版本 404)。
 pub async fn fetch_api_keys(access_token: &str) -> Result<Value, String> {
-    xapi_request("/api-keys?page=1&page_size=100", reqwest::Method::GET, &json!({}), access_token).await
+    xapi_request("/keys?page=1&page_size=100", reqwest::Method::GET, &json!({}), access_token).await
 }
 
 /// relay 上游地址(settings.api_base_url)——导入供应商的 baseUrl。
