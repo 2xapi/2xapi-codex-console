@@ -195,3 +195,16 @@ pub async fn login(email: &str, password: &str, captcha_ticket: &str, captcha_ra
 pub async fn fetch_key_groups(access_token: &str) -> Result<Value, String> {
     xapi_request("/groups", reqwest::Method::GET, &json!({}), access_token).await
 }
+
+/// 用户 API Key 列表(Sub2API GET /api-keys?key 明文)——「一键导入」数据源。
+pub async fn fetch_api_keys(access_token: &str) -> Result<Value, String> {
+    xapi_request("/api-keys?page=1&page_size=100", reqwest::Method::GET, &json!({}), access_token).await
+}
+
+/// relay 上游地址(settings.api_base_url)——导入供应商的 baseUrl。
+pub async fn fetch_relay_base_url() -> Result<String, String> {
+    let result = xapi_request("/settings/public?timezone=UTC", reqwest::Method::GET, &json!({}), "").await?;
+    let d = result.get("data").unwrap_or(&result);
+    let raw = d.get("api_base_url").and_then(|v| v.as_str()).unwrap_or("https://2xa.cc.cd");
+    Ok(raw.trim_end_matches('/').trim_end_matches("/v1").trim_end_matches('/').to_string())
+}

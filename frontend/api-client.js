@@ -72,6 +72,7 @@
     remembered: async () => rawJson("GET", "/api/auth/remembered"),
     remember: async (email, password) => rawJson("POST", "/api/auth/remember", { email, password }),
     forget: async () => rawJson("POST", "/api/auth/forget", {}),
+    apiKeys: async () => rawJson("GET", "/api/auth/api-keys"),
     keyGroups: async () => rawJson("GET", "/api/key-groups"),
 
     // ── Codex 启动器（M7，直连版）──

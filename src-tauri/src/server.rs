@@ -49,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/auth/remember", post(handle_auth_remember))
         .route("/api/auth/forget", post(handle_auth_forget))
         .route("/api/key-groups", get(handle_key_groups))
+        .route("/api/auth/api-keys", get(handle_auth_api_keys))
         // --- Providers（04 契约）---
         .route("/api/providers", get(handle_providers_list).post(handle_providers_create))
         .route("/api/providers/active", get(handle_providers_active))
@@ -272,6 +273,24 @@ async fn handle_key_groups(State(s): State<Arc<AppState>>) -> Response {
         },
         None => err_json(StatusCode::UNAUTHORIZED, "请先登录 2xapi 账号"),
     }
+}
+
+// GET /api/auth/api-keys —— 一键导入数据源:用户 Key 列表 + relay 上游地址
+async fn handle_auth_api_keys(State(s): State<Arc<AppState>>) -> Response {
+    // session 过期自动续期(与 /api/session 同策略)
+    let session = match crate::auth::load_session(&s.codex_home) {
+        Some(sess) => Some(sess),
+        None => crate::auth::refresh_session(&s.codex_home).await,
+    };
+    let Some(session) = session else {
+        return err_json(StatusCode::UNAUTHORIZED, "请先登录 2xapi 账号");
+    };
+    let keys = match crate::auth::fetch_api_keys(&session.access_token).await {
+        Ok(v) => v.get("data").cloned().unwrap_or(json!([])),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("获取 Key 列表失败: {}", e)),
+    };
+    let base_url = crate::auth::fetch_relay_base_url().await.unwrap_or_else(|_| "https://2xa.cc.cd".into());
+    ok_json(json!({ "keys": keys, "baseUrl": base_url }))
 }
 
 // --- Providers（04 契约：统一信封 + 错误码）---
