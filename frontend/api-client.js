@@ -20,10 +20,11 @@
     }
     const payload = await resp.json().catch(() => ({}));
     if (payload && payload.ok === true) return payload.data;
-    const e = (payload && payload.error) || {};
-    const err = new Error(e.message || "请求失败 (" + resp.status + ")");
-    err.code = e.code || "E_UNKNOWN";
-    err.fields = e.fields || null;
+    // 错误信封兼容两种形态:04 契约 {error:{code,message,fields}};加速等路由 {error:"人话"(字符串)}
+    const e = (payload && payload.error) || null;
+    const err = new Error((typeof e === "string" ? e : (e && e.message)) || "请求失败 (" + resp.status + ")");
+    err.code = (e && typeof e === "object" && e.code) || "E_UNKNOWN";
+    err.fields = (e && e.fields) || null;
     err.status = resp.status;
     throw err;
   }
@@ -109,6 +110,27 @@
     },
     // 测试连接(阶段 2):{providerId} 或 {baseUrl, apiKey}
     preflight: (body) => request("POST", "/api/launcher/preflight", { body }),
+
+    // ── 加速(阶段 4,任务书 §…):mode off|official|custom;customNode 仅本机保存 ──
+    // GET /api/accel/state 返回非信封 {mode,customNode,lines[],scopeNote}(字段在顶层),失败时可能 {ok:false,error};用 rawJson 解顶层字段
+    accelState: async () => {
+      const p = await rawJson("GET", "/api/accel/state");
+      if (p && p.ok === false) {
+        const e = new Error((p && p.error) || "获取加速状态失败");
+        e.status = (p && p.status) || 0;
+        throw e;
+      }
+      return { mode: p.mode, customNode: p.customNode || "", lines: p.lines || [], scopeNote: p.scopeNote || "" };
+    },
+    // mode/custom-node 契约走 04 信封 → {ok:true}
+    accelSetMode: (mode) => request("POST", "/api/accel/mode", { body: { mode } }),
+    accelSetCustomNode: (endpoint) => request("POST", "/api/accel/custom-node", { body: { endpoint } }),
+    // test-node 契约是 {ok:true, latencyMs:123} / {ok:false, error:"人话"}——字段在顶层不走 data 信封,故用 rawJson
+    accelTestNode: async (endpoint) => {
+      const p = await rawJson("POST", "/api/accel/test-node", { endpoint });
+      if (!p || p.ok !== true) { const e = new Error((p && p.error) || "测试节点失败"); e.status = (p && p.status) || 0; throw e; }
+      return p; // {ok:true, latencyMs}
+    },
 
     // ── 历史会话管理(阶段 3,任务书 §四)──
     sessions: (page, size, provider) => request("GET", "/api/sessions?page=" + (page || 1) + "&size=" + (size || 50) + "&provider=" + encodeURIComponent(provider || "")),

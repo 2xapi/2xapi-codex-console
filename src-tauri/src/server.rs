@@ -7,12 +7,30 @@ use axum::{
     Json, Router,
 };
 use rust_embed::RustEmbed;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc};
 
 #[derive(RustEmbed)]
 #[folder = "../frontend/"]
 struct FrontendAsset;
+
+/// 加速配置(阶段 4,任务书 §五)。mode ∈ off|official|custom;custom_node 为用户自定义节点地址。
+/// 持久化到 `{codex_home}/2xapi-settings.json` 的 `accel` 段(camelCase 与前端契约一致)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccelCfg {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub custom_node: String,
+}
+
+impl Default for AccelCfg {
+    fn default() -> Self {
+        AccelCfg { mode: "off".into(), custom_node: String::new() }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,6 +39,10 @@ pub struct AppState {
     pub providers_path: PathBuf,
     pub codex_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
+    /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
+    pub health: std::sync::Arc<crate::acclines::HealthState>,
+    /// 加速开关配置(mode + 自定义节点;内存态 + 2xapi-settings.json 持久化)。
+    pub accel: std::sync::Arc<std::sync::Mutex<AccelCfg>>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -77,6 +99,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sessions", get(handle_sessions_list))
         .route("/api/sessions/repair", post(handle_sessions_repair))
         .route("/api/sessions/settings", get(handle_sessions_settings).post(handle_sessions_settings_set))
+        // --- 加速线路(阶段 4,任务书 §五)---
+        .route("/api/accel/state", get(handle_accel_state))
+        .route("/api/accel/mode", post(handle_accel_mode))
+        .route("/api/accel/custom-node", post(handle_accel_custom_node))
+        .route("/api/accel/test-node", post(handle_accel_test_node))
         .route("/api/config/snapshot", post(handle_config_snapshot))
         .route("/api/config/restore", post(handle_config_restore))
         .with_state(state)
@@ -501,6 +528,139 @@ async fn handle_history(State(s): State<Arc<AppState>>) -> Response {
     ok_json(result)
 }
 
+// ── 加速线路(阶段 4,任务书 §五)─────────────────────────
+
+fn accel_settings_path(codex_home: &std::path::Path) -> std::path::PathBuf {
+    codex_home.join("2xapi-settings.json")
+}
+
+/// 读 `{codex_home}/2xapi-settings.json` 的 `accel` 段;缺失/非法 → 默认(off)。
+/// 复用 sessions 读写该文件的模式(autoRepairBeforeHost 同文件,互不覆盖)。
+pub fn load_accel_cfg(codex_home: &std::path::Path) -> AccelCfg {
+    let raw = std::fs::read_to_string(accel_settings_path(codex_home)).unwrap_or_default();
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    v.get("accel")
+        .and_then(|a| serde_json::from_value(a.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// 写 `accel` 段(保留文件其余段)。
+pub fn save_accel_cfg(codex_home: &std::path::Path, cfg: &AccelCfg) {
+    std::fs::create_dir_all(codex_home).ok();
+    let raw = std::fs::read_to_string(accel_settings_path(codex_home)).unwrap_or_default();
+    let mut v: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("accel".into(), serde_json::to_value(cfg).unwrap_or(json!({})));
+    }
+    let _ = std::fs::write(accel_settings_path(codex_home), serde_json::to_string_pretty(&v).unwrap_or_default());
+}
+
+/// scopeNote 纯函数(供单测):mode=official 且 active 供应商 base_url 未被任何线路命中
+/// → 提示「不在官方线路范围,已直连」;命中或无 active → 空串;off/custom → 空串。
+fn compute_scope_note(mode: &str, active_base_url: Option<&str>, lines: &[crate::acclines::AccLine]) -> String {
+    if mode != "official" {
+        return String::new();
+    }
+    let Some(base) = active_base_url else { return String::new() };
+    if crate::acclines::match_line(base, lines).is_none() {
+        "该供应商不在官方线路范围,已直连".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// 加速路由错误信封:{ok:false, error} (与前端画师契约一致,非统一信封)。
+fn err_accel(status: StatusCode, msg: &str) -> Response {
+    (status, Json(json!({ "ok": false, "error": msg }))).into_response()
+}
+
+// GET /api/accel/state → {mode, customNode, lines, scopeNote}
+async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
+    let (mode, custom_node) = {
+        let cfg = s.accel.lock().unwrap();
+        (cfg.mode.clone(), cfg.custom_node.clone())
+    };
+    let lines: Vec<Value> = {
+        let ls = s.health.lines.lock().unwrap();
+        let table = s.health.table.lock().unwrap();
+        ls.iter()
+            .map(|l| {
+                let h = table.get(&l.id);
+                json!({
+                    "id": l.id,
+                    "name": l.name,
+                    "endpoint": l.endpoint,
+                    "scope": l.scope,
+                    "priority": l.priority,
+                    "enabled": l.enabled,
+                    "latency": h.map(|h| h.latency_ms).unwrap_or(0),
+                    "fails": h.map(|h| h.fails).unwrap_or(0),
+                })
+            })
+            .collect()
+    };
+    let active_base = crate::providers::get_active(&s.providers_path).map(|p| p.base_url);
+    let scope_note = {
+        let ls = s.health.lines.lock().unwrap();
+        compute_scope_note(&mode, active_base.as_deref(), &ls)
+    };
+    ok_json(json!({
+        "mode": mode,
+        "customNode": custom_node,
+        "lines": lines,
+        "scopeNote": scope_note,
+    }))
+}
+
+// POST /api/accel/mode {mode}
+async fn handle_accel_mode(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !matches!(mode.as_str(), "off" | "official" | "custom") {
+        return err_accel(StatusCode::BAD_REQUEST, "mode 须为 off/official/custom");
+    }
+    let mut cfg = s.accel.lock().unwrap();
+    if mode == "custom" && cfg.custom_node.trim().is_empty() {
+        return err_accel(StatusCode::BAD_REQUEST, "请先配置自定义加速节点");
+    }
+    cfg.mode = mode;
+    save_accel_cfg(&s.codex_home, &cfg);
+    ok_json(json!({ "ok": true }))
+}
+
+// POST /api/accel/custom-node {endpoint}
+async fn handle_accel_custom_node(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let endpoint = body.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        return err_accel(StatusCode::BAD_REQUEST, "节点地址须为 http(s):// 开头");
+    }
+    let mut cfg = s.accel.lock().unwrap();
+    cfg.custom_node = endpoint;
+    save_accel_cfg(&s.codex_home, &cfg);
+    ok_json(json!({ "ok": true }))
+}
+
+// POST /api/accel/test-node {endpoint}
+async fn handle_accel_test_node(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let endpoint = body.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        return err_accel(StatusCode::BAD_REQUEST, "节点地址须为 http(s):// 开头");
+    }
+    let cred = crate::acclines::load_credentials(&s.codex_home);
+    let outcome = crate::gateway::test_node_via(
+        &endpoint,
+        "https://api.2xa.cc.cd/models",
+        cred.as_ref(),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    match outcome {
+        crate::gateway::NodeTestOutcome::Ok { latency_ms } => ok_json(json!({ "ok": true, "latencyMs": latency_ms })),
+        crate::gateway::NodeTestOutcome::Timeout => err_accel(StatusCode::BAD_GATEWAY, "连不上:检查地址或网络"),
+        crate::gateway::NodeTestOutcome::Auth => err_accel(StatusCode::BAD_GATEWAY, "节点凭证无效"),
+        crate::gateway::NodeTestOutcome::Unavailable => err_accel(StatusCode::BAD_GATEWAY, "节点不可用"),
+    }
+}
+
 // ── 历史会话管理(阶段 3,任务书 §四)─────────────────────
 
 // GET /api/sessions?page=&size=&provider= → {total, items, db}
@@ -556,6 +716,8 @@ mod tests {
             providers_path: PathBuf::from("/tmp/2xapi-m0-providers.json"),
             codex_home: PathBuf::from("/tmp/2xapi-m0-codex-home"),
             launcher: Default::default(),
+            health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
+            accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
         }
     }
 
@@ -616,6 +778,8 @@ mod tests {
             providers_path: root.join("providers.json"),
             codex_home: root.join("codex"),
             launcher: Default::default(),
+            health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
+            accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
         };
         (state, root)
     }
@@ -842,6 +1006,177 @@ mod tests {
         let app = build_router(state.clone());
         let v = body_json(app.oneshot(Request::builder().method("GET").uri("/api/desktop/state").body(Body::empty()).unwrap()).await.unwrap()).await;
         assert!(v["data"]["hosting"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 阶段 4 加速线路路由(任务书 §五)──
+
+    fn accel_line(id: &str, scope: &[&str]) -> crate::acclines::AccLine {
+        crate::acclines::AccLine {
+            id: id.into(),
+            name: id.into(),
+            endpoint: "http://line.test:1".into(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            priority: 1,
+            enabled: true,
+            credential: None,
+        }
+    }
+
+    fn accel_state(mode: &str, custom_node: &str, lines: Vec<crate::acclines::AccLine>) -> (AppState, std::path::PathBuf) {
+        let (state, root) = unique_state("accel");
+        *state.accel.lock().unwrap() = AccelCfg { mode: mode.into(), custom_node: custom_node.into() };
+        state.health.set_lines(lines);
+        (state, root)
+    }
+
+    async fn accel_get(app: &Router, uri: &str) -> Value {
+        body_json(
+            app.clone()
+                .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn accel_post(app: &Router, uri: &str, body: &Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (resp.status(), body_json(resp).await)
+    }
+
+    #[tokio::test]
+    async fn accel_state_default_off_no_scope_note() {
+        let (state, root) = accel_state("off", "", vec![accel_line("l1", &["2xa.cc.cd"])]);
+        let app = build_router(state.clone());
+        let v = accel_get(&app, "/api/accel/state").await;
+        assert_eq!(v["mode"], "off");
+        assert_eq!(v["customNode"], "");
+        assert_eq!(v["scopeNote"], "");
+        let lines = v["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["id"], "l1");
+        assert_eq!(lines[0]["latency"], 0, "未探测 latency 为 0");
+        assert_eq!(lines[0]["fails"], 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_mode_roundtrip_persists_to_settings() {
+        let (state, root) = accel_state("off", "", vec![]);
+        // 先建 codex_home,验证写 2xapi-settings.json
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/mode", &json!({"mode": "official"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        // 落盘
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(state.codex_home.join("2xapi-settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["accel"]["mode"], "official");
+        assert_eq!(saved["accel"]["customNode"], "");
+        // GET 反映
+        let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(v["mode"], "official");
+        // 往返回 off
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/mode", &json!({"mode": "off"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(v["mode"], "off");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_custom_node_roundtrip_persists() {
+        let (state, root) = accel_state("off", "", vec![]);
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/custom-node", &json!({"endpoint": "http://node.test:1"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(v["customNode"], "http://node.test:1");
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(state.codex_home.join("2xapi-settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["accel"]["customNode"], "http://node.test:1");
+        // 非法地址 400
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/custom-node", &json!({"endpoint": "ftp://bad"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(v["ok"], false);
+        assert!(!v["error"].as_str().unwrap_or("").is_empty(), "400 应带人话 error");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_mode_invalid_returns_400() {
+        let (state, root) = accel_state("off", "", vec![]);
+        let (st, v) = accel_post(&build_router(state), "/api/accel/mode", &json!({"mode": "bogus"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(v["ok"], false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_custom_mode_without_node_returns_400() {
+        let (state, root) = accel_state("off", "", vec![]); // 无 custom_node
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/mode", &json!({"mode": "custom"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap_or("").contains("自定义"), "应提示先配节点: {v}");
+        // 已配节点 → 成功
+        let (st, _v) = accel_post(&build_router(state.clone()), "/api/accel/custom-node", &json!({"endpoint": "http://node.test:1"})).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, v) = accel_post(&build_router(state.clone()), "/api/accel/mode", &json!({"mode": "custom"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accel_scope_note_hit_and_miss() {
+        let lines = vec![accel_line("l1", &["2xa.cc.cd"])];
+        // official + 未命中 → 提示
+        assert_eq!(
+            compute_scope_note("official", Some("https://openai.com"), &lines),
+            "该供应商不在官方线路范围,已直连"
+        );
+        // official + 命中 → 空串
+        assert_eq!(compute_scope_note("official", Some("https://api.2xa.cc.cd"), &lines), "");
+        // official + 无 active → 空串
+        assert_eq!(compute_scope_note("official", None, &lines), "");
+        // off / custom → 空串
+        assert_eq!(compute_scope_note("off", Some("https://openai.com"), &lines), "");
+        assert_eq!(compute_scope_note("custom", Some("https://openai.com"), &lines), "");
+    }
+
+    #[tokio::test]
+    async fn accel_state_scope_note_from_active_provider() {
+        let (state, root) = accel_state("official", "", vec![accel_line("l1", &["2xa.cc.cd"])]);
+        // active provider 的 base_url 未命中(openai.com)
+        let app = build_router(state.clone());
+        let body = json!({"name":"Miss","baseUrl":"https://openai.com","apiKey":"sk","model":"m","accessMode":"mixed"});
+        let resp = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/providers").header("content-type", "application/json")
+                .body(Body::from(body.to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let id = body_json(resp).await["data"]["id"].as_str().unwrap().to_string();
+        let app = build_router(state.clone());
+        let resp = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/providers/activate").header("content-type", "application/json")
+                .body(Body::from(json!({"id": id}).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(v["scopeNote"], "该供应商不在官方线路范围,已直连");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -25,6 +25,10 @@ var state = {
   sessionsProvider: "",
   sessionsRepairing: false,
   sessionsSettings: null, // {autoRepairBeforeHost}
+  accel: null,            // GET /api/accel/state {mode, customNode, lines, scopeNote}
+  nodeInput: null,        // 本机设置「我的加速节点」输入框草稿(重绘防丢)
+  accelBusy: null,        // "mode" | "node-save" | "node-test"
+  accelTest: null,        // 节点连通测试:{busy:true} | {ok:true,latencyMs} | {ok:false,msg}
 };
 
 var $ = function (s) { return document.querySelector(s); };
@@ -62,6 +66,9 @@ async function refreshProviders() {
 async function refreshDesktop() {
   try { state.dstate = await api.desktopState(); } catch (e) { state.dstate = null; }
 }
+async function refreshAccel() {
+  try { state.accel = await api.accelState(); } catch (e) { state.accel = state.accel || { mode: "off", customNode: "", lines: [], scopeNote: "" }; }
+}
 async function refreshSession() {
   try { state.session = await api.session(); } catch (e) { state.session = null; }
   // 实时余额(auth/me;未登录/失败静默——顶栏显示 …)
@@ -75,7 +82,7 @@ async function refreshSession() {
   }
 }
 async function refreshAll() {
-  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession()]);
+  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel()]);
 }
 
 // ── 渲染 ──
@@ -196,7 +203,7 @@ async function doTestConnection() {
   render();
 }
 
-/* ── 桌面版主卡:账号状态自动检测 × 通路(本期 gateway;direct 待字段实测,加速待阶段 4) ── */
+/* ── 桌面版主卡:账号状态自动检测 × 通路(网关 + 加速三态:关/官方线路/我的节点,阶段 4) ── */
 function desktopCard() {
   var d = state.dstate || {};
   var hasOff = !!d.hasOfficial;
@@ -205,6 +212,11 @@ function desktopCard() {
   var p = lineOf(state.selId) || lineOf(h && h.providerId);
   var modeName = hasOff ? "混入模式" : "纯 API 模式";
   var acctSub = hasOff ? "官方登录保留" : "纯 API · 无官方账号";
+
+  var acc = state.accel || {};
+  var accelMode = acc.mode || "off";                       // off | official | custom
+  var accelLabel = accelMode === "official" ? "官方线路" : "我的节点";
+  var accelOn = accelMode !== "off" && (accelMode === "official" || !!acc.customNode); // 是否走加速节点
 
   var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
   var lk = function (c, live) { return '<div class="lk ' + (live ? "live" : "") + '" style="--lc:' + c + '"></div>'; };
@@ -223,11 +235,15 @@ function desktopCard() {
     route = st("var(--c-gw)", "桌面版 Codex", acctSub)
       + lk("var(--c-gw)", true)
       + st("var(--c-gw)", "网关", "127.0.0.1:8787")
-      + lk("var(--c-gw)", true)
+      + (accelOn
+        ? lk("var(--c-accel)", true) + st("var(--c-accel)", "加速节点", accelLabel) + lk("var(--c-accel)", true)
+        : lk("var(--c-gw)", true))
       + st(p ? chipColor(p, state.providers.indexOf(p)) : "var(--c-gw)", esc(p ? p.name : "?"), "中转站");
-    note = '<div class="route-mode"><span class="k">●</span>通路二:网关(加速即将上线,当前直发上游) · 配置文件零 Key,Key 由网关注入 · ' + modeName + '</div>';
+    note = '<div class="route-mode"><span class="k">●</span>通路二:网关' + (accelOn ? " + 加速(" + accelLabel + ")" : "(加速已关,直发上游)") + ' · 配置文件零 Key,Key 由网关注入 · ' + modeName + '</div>'
+      + (accelMode === "official" && acc.scopeNote ? '<div class="notice" style="margin:0 0 10px">' + esc(acc.scopeNote) + '</div>' : "");
     mech = (hasOff ? '<span>① 官方登录/插件保留</span>' : '<span>① 无需官方账号</span>')
-      + '<span>② 配置文件零 Key</span><span>③ 协议转换 · chat 中转可用</span><span>依赖本 app 常驻</span>';
+      + '<span>② 配置文件零 Key</span><span>③ 协议转换 · chat 中转可用</span>'
+      + '<span>④ 加速:' + (accelMode === "off" ? "关" : accelLabel) + '</span><span>依赖本 app 常驻</span>';
   }
 
   var opts = state.providers.map(function (x) {
@@ -249,10 +265,10 @@ function desktopCard() {
     + '<button data-a="way" data-w="gateway" aria-pressed="true" style="--lc:var(--c-gw)"' + (isHost ? "" : " disabled") + '>网关(推荐)<small>零落盘 · 加速可开关</small></button>'
     + '</div>'
     + (isHost
-      ? '<div class="seg" style="margin-top:8px;max-width:460px" title="阶段 4 上线">'
-        + '<button data-a="accel" data-m="off" aria-pressed="true" style="--lc:var(--muted)" disabled>加速:关<small>网关直发上游</small></button>'
-        + '<button data-a="accel" data-m="official" aria-pressed="false" style="--lc:var(--c-accel)" disabled>官方加速专线<span class="badge-soon">即将上线</span><small>2xapi 站专用</small></button>'
-        + '<button data-a="accel" data-m="custom" aria-pressed="false" style="--lc:var(--c-accel)" disabled>我的节点<span class="badge-soon">即将上线</span><small>自己的 VPS / 本地代理</small></button>'
+      ? '<div class="seg" style="margin-top:8px;max-width:460px">'
+        + '<button data-a="accel" data-m="off" aria-pressed="' + (accelMode === "off") + '" style="--lc:var(--muted)">加速:关<small>网关直发上游</small></button>'
+        + '<button data-a="accel" data-m="official" aria-pressed="' + (accelMode === "official") + '" style="--lc:var(--c-accel)">官方线路<small>2xapi 站专用 · 自动可用</small></button>'
+        + '<button data-a="accel" data-m="custom" aria-pressed="' + (accelMode === "custom") + '" style="--lc:var(--c-accel)"' + (acc.customNode ? "" : " disabled") + '>我的节点<small>自己的 VPS / 本地代理</small></button>'
         + '</div>'
       : "")
     + '</div>'
@@ -500,8 +516,21 @@ function modalHtml() {
   if (m.t === "history") {
     body = historyPane();
   } else {
+    var nodeVal = (state.nodeInput != null ? state.nodeInput : ((state.accel && state.accel.customNode) || ""));
+    var at = state.accelTest;
+    var testHtml;
+    if (at && at.busy) testHtml = '<div class="hint" style="margin:6px 0 0">连通测试中…</div>';
+    else if (at && at.ok) testHtml = '<div class="hint" style="margin:6px 0 0;color:var(--c-official)">✓ 连通 · 延迟 ' + at.latencyMs + 'ms</div>';
+    else if (at && !at.ok) testHtml = '<div class="err" style="margin:6px 0 0">✗ ' + esc(at.msg) + '</div>';
+    else testHtml = "";
     body = '<div class="kv"><div><div class="k">config.toml</div><div class="v mono">~/.codex(托管开启时仅一处 custom 段,零 Key)</div></div><div><div class="k">网关</div><div class="v mono">127.0.0.1:8787 · 托盘常驻</div></div></div>'
-      + '<div class="f full" style="margin-top:12px"><label>我的加速节点(即将上线 · 仅本机保存)</label><input class="mono" placeholder="socks5://127.0.0.1:7890 或 http://用户:密码@你的VPS:8443" disabled><div class="hint">阶段 4 上线:自己的 VPS(跑 gost/squid)或本地代理客户端端口。官方加速专线由 2xapi 下发,无需填写。</div></div>';
+      + '<div class="f full" style="margin-top:12px"><label>我的加速节点(可选 · 仅本机保存,不上传)</label>'
+      + '<div style="display:flex;gap:8px;align-items:flex-start">'
+      + '<input class="mono" style="flex:1" data-anode value="' + esc(nodeVal) + '" placeholder="socks5://127.0.0.1:7890 或 http://用户:密码@你的VPS:8443">'
+      + '<button class="btn ghost" data-a="node-save"' + (state.accelBusy === "node-save" ? " disabled" : "") + '>保存</button>'
+      + '<button class="btn ghost" data-a="test-node"' + (state.accelBusy === "node-test" ? " disabled" : "") + '>测试节点连通</button>'
+      + '</div>' + testHtml
+      + '<div class="hint">自己的 VPS(跑 gost/squid)或本地代理客户端端口;填好后保存,主卡「加速」里即可选「我的节点」。官方加速专线由 2xapi 下发,无需填写。某个供应商若要固定走代理,用该供应商编辑里的「高级 · HTTP 代理」。</div></div>';
   }
   var title = { history: "历史会话", settings: "本机设置" }[m.t];
   return '<div class="mask" data-a="mclose"><div class="box"><h2 style="margin:0 0 12px;font-size:15px">' + title + '</h2>' + body + '<div class="btn-row"><button class="btn ghost" data-a="mclose">关闭</button></div></div></div>';
@@ -569,6 +598,49 @@ async function doUnhost() {
     showToast(r.restored ? "已还原(可从备份目录恢复)" : "当前未托管,无需还原", "ok");
   } catch (e) { showToast(e.message, "error"); await refreshDesktop(); }
   state.busy = null; render();
+}
+
+/* ── 加速(阶段 4):三态切换 / 我的节点保存 / 节点连通测试(契约:POST /api/accel/*,零耦合) ── */
+async function doAccelMode(m) {
+  var acc = state.accel || {};
+  if (m === acc.mode) return;
+  if (m === "custom" && !acc.customNode) { showToast("请先在本机设置里保存「我的加速节点」", "error"); return; }
+  state.accelBusy = "mode"; render();
+  try {
+    await api.accelSetMode(m);
+    state.accel.mode = m;
+    showToast(m === "off" ? "加速已关闭,网关直发上游" : "加速已切换:" + (m === "official" ? "官方线路" : "我的节点"), "ok");
+  } catch (e) {
+    showToast(e.message, "error");
+  }
+  state.accelBusy = null; render();
+}
+async function doAccelSaveNode() {
+  var el = document.querySelector("[data-anode]");
+  var endpoint = el ? el.value.trim() : "";
+  if (!endpoint) { showToast("请先填写节点地址", "error"); return; }
+  state.nodeInput = endpoint;
+  state.accelBusy = "node-save"; render();
+  try {
+    await api.accelSetCustomNode(endpoint);
+    state.accel.customNode = endpoint;
+    showToast("我的加速节点已保存(仅本机)", "ok");
+  } catch (e) {
+    showToast(e.message, "error");
+  }
+  state.accelBusy = null; render();
+}
+async function doAccelTestNode() {
+  var endpoint = (state.nodeInput != null ? state.nodeInput : ((state.accel && state.accel.customNode) || "")).trim();
+  if (!endpoint) { showToast("请先填写节点地址", "error"); return; }
+  state.accelTest = { busy: true }; render();
+  try {
+    var d = await api.accelTestNode(endpoint);
+    state.accelTest = { ok: true, latencyMs: d.latencyMs };
+  } catch (e) {
+    state.accelTest = { ok: false, msg: e.message };
+  }
+  render();
 }
 
 async function doSave() {
@@ -818,11 +890,16 @@ document.addEventListener("click", function (ev) {
     case "cyes": { var c = state.confirmBox; state.confirmBox = null; render(); if (c) c.resolve(true); break; }
     case "cno": { var c2 = state.confirmBox; state.confirmBox = null; render(); if (c2) c2.resolve(false); break; }
     case "test": doTestConnection(); break;
+    case "accel": doAccelMode(t.dataset.m); break;
+    case "node-save": doAccelSaveNode(); break;
+    case "test-node": doAccelTestNode(); break;
   }
 });
 
 /* 下拉/change:输入收集 + 供应商切换(已托管 = 热切换) */
 document.addEventListener("change", function (ev) {
+  var nd = ev.target.closest("[data-anode]");
+  if (nd) { state.nodeInput = nd.value; return; }
   var sel = ev.target.closest("[data-a='lsel']");
   if (sel) {
     var id = sel.value;
@@ -852,6 +929,8 @@ document.addEventListener("change", function (ev) {
 });
 /* 输入中也收集(避免重绘时机丢半个字) */
 document.addEventListener("input", function (ev) {
+  var nd = ev.target.closest("[data-anode]");
+  if (nd) { state.nodeInput = nd.value; return; }
   if (ev.target.closest("[data-f], [data-mf], [data-l]")) collectDraft();
 });
 
