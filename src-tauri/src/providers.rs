@@ -102,6 +102,9 @@ pub struct Provider {
     // ── 基础 ──
     pub id: String,
     pub name: String,
+    /// 归属 agent:默认 `"codex"`(Claude 接入时再扩展)。旧 providers.json 无该字段 → 反序列化补默认,不写回文件。
+    #[serde(default = "default_agent")]
+    pub agent: String,
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
@@ -164,6 +167,18 @@ fn default_multiplier() -> f64 {
     1.0
 }
 
+fn default_agent() -> String {
+    "codex".to_string()
+}
+
+/// agent 白名单归一化:空 / 未知 → 默认 `"codex"`(本期仅 codex;接入 Claude 时在此扩展)。
+fn normalize_agent(agent: &str) -> String {
+    match agent.trim().to_ascii_lowercase().as_str() {
+        "codex" => "codex".to_string(),
+        _ => default_agent(),
+    }
+}
+
 /// providers.json 顶层结构（02 §3）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderData {
@@ -187,6 +202,8 @@ pub struct ValidationError {
 #[derive(Debug, Clone, Default)]
 pub struct ProviderInput {
     pub name: String,
+    /// 归属 agent:缺省空串,经 value_to_input/create/update 归一化为 `"codex"`(缺省不崩)。
+    pub agent: String,
     pub icon: Option<String>,
     pub icon_color: Option<String>,
     pub website_url: Option<String>,
@@ -218,6 +235,10 @@ pub fn load(path: &Path) -> ProviderData {
     // 兼容旧文件 / 空 default：保证 schema_version 落地。
     if data.schema_version == 0 {
         data.schema_version = SCHEMA_VERSION;
+    }
+    // agent 存量归一化：旧文件缺省(serde 默认已补 codex)/ 非法值 → codex。不写回文件,除非后续保存。
+    for p in &mut data.providers {
+        p.agent = normalize_agent(&p.agent);
     }
     data
 }
@@ -258,6 +279,7 @@ pub fn input_to_provider(input: ProviderInput) -> Provider {
     Provider {
         id: String::new(),
         name: input.name,
+        agent: normalize_agent(&input.agent),
         icon: input.icon,
         icon_color: input.icon_color,
         sort_index: 0,
@@ -350,6 +372,7 @@ pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<Validat
     let provider = Provider {
         id: uuid::Uuid::new_v4().to_string(),
         name: input.name,
+        agent: normalize_agent(&input.agent),
         icon: input.icon,
         icon_color: input.icon_color,
         sort_index,
@@ -397,6 +420,7 @@ pub fn update(path: &Path, id: &str, input: ProviderInput) -> Result<Provider, V
 
     let p = data.providers.iter_mut().find(|p| p.id == id).expect("已校验存在");
     p.name = eff.name;
+    p.agent = normalize_agent(&eff.agent);
     p.icon = eff.icon;
     p.icon_color = eff.icon_color;
     p.website_url = eff.website_url;
@@ -492,6 +516,7 @@ pub fn save(path: &Path, body: &Value) -> Result<Provider, Vec<ValidationError>>
 pub fn public_provider(p: &Provider) -> Value {
     json!({
         "id": p.id, "name": p.name,
+        "agent": p.agent,
         "icon": p.icon, "iconColor": p.icon_color,
         "sortIndex": p.sort_index, "createdAt": p.created_at,
         "websiteUrl": p.website_url, "notes": p.notes,
@@ -524,6 +549,7 @@ fn io_errs(e: String) -> Vec<ValidationError> {
 pub fn value_to_input(body: &Value) -> ProviderInput {
     ProviderInput {
         name: body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        agent: normalize_agent(body.get("agent").and_then(|v| v.as_str()).unwrap_or("")),
         icon: opt_str(body, &["icon"]),
         icon_color: opt_str(body, &["iconColor", "icon_color"]),
         website_url: opt_str(body, &["websiteUrl", "website_url"]),
@@ -638,6 +664,7 @@ mod tests {
         Provider {
             id: "uuid-1".into(),
             name: "Demo".into(),
+            agent: "codex".into(),
             icon: Some("🚀".into()),
             icon_color: Some("#fff".into()),
             sort_index: 3,
@@ -984,5 +1011,74 @@ mod tests {
         let v = public_provider(&p);
         assert_eq!(v["reasoning_levels"], serde_json::json!(["low", "medium"]));
         assert_eq!(v["reasoning_levels"].as_array().map(|a| a.len()), Some(2));
+    }
+
+    // ── agent 归属(UI2)──────────────────────────────────────
+
+    #[test]
+    fn create_persists_agent() {
+        let path = tmp_path("agent_create");
+        let mut i = sample_input("AG", AccessMode::Official);
+        i.model = "m".into();
+        i.agent = "codex".into();
+        let p = create(&path, i).expect("create");
+        assert_eq!(p.agent, "codex");
+        // 重载后仍在
+        let data = load(&path);
+        assert_eq!(data.providers[0].agent, "codex");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_defaults_agent_to_codex() {
+        let path = tmp_path("agent_default");
+        let mut i = sample_input("AGD", AccessMode::Official);
+        i.model = "m".into();
+        // 未显式设置 agent → ProviderInput 缺省空串,create 归一化为 codex
+        let p = create(&path, i).expect("create");
+        assert_eq!(p.agent, "codex");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_load_backfills_agent_codex() {
+        let path = tmp_path("agent_legacy");
+        // 旧文件无 agent 字段 → 补 codex(serde 默认 + load 归一化,不写回文件)
+        let legacy = r#"{"schema_version":1,"providers":[{"id":"old","name":"Old","model":"m"}]}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let data = load(&path);
+        assert_eq!(data.providers[0].agent, "codex");
+        // 文件内非法值 → 归一化为 codex
+        let bad = r#"{"schema_version":1,"providers":[{"id":"b","name":"Bad","model":"m","agent":"evil"}]}"#;
+        std::fs::write(&path, bad).unwrap();
+        let data2 = load(&path);
+        assert_eq!(data2.providers[0].agent, "codex");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn public_provider_includes_agent() {
+        let p = sample_provider(); // agent: codex
+        let v = public_provider(&p);
+        assert_eq!(v["agent"], "codex");
+    }
+
+    #[test]
+    fn value_to_input_and_update_normalize_agent() {
+        // 缺省 / 空 / 非法(白名单外)→ codex
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m"})).agent, "codex");
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":""})).agent, "codex");
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"  Claude  "})).agent, "codex");
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"codex"})).agent, "codex");
+        // update 对缺省 agent 输入归一化为 codex
+        let path = tmp_path("agent_update");
+        let mut i = sample_input("AU", AccessMode::Official);
+        i.model = "m".into();
+        i.agent = "codex".into();
+        let p = create(&path, i).expect("create");
+        let keep = sample_input("AU2", AccessMode::Official); // agent 缺省空串
+        let p2 = update(&path, &p.id, keep).expect("update");
+        assert_eq!(p2.agent, "codex");
+        let _ = std::fs::remove_file(&path);
     }
 }
