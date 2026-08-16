@@ -83,6 +83,7 @@ pub fn state(oclaw_home: &Path) -> Value {
         json!({
             "providerId": PROVIDER_ID,
             "baseUrl": e.get("baseUrl"),
+            "api": e.get("api"),
             "models": e.get("models"),
         })
     });
@@ -116,12 +117,24 @@ pub fn host(
     if way == "direct" && provider.base_url.trim().is_empty() {
         return Err((422, "E_NO_BASE_URL".into(), "该供应商未配置 API 地址".into()));
     }
+    // Anthropic 协议供应商:网关通路(chat→anthropic 转换未做)明确拒绝不静默;直连已原生支持
+    if way == "gateway" && provider.wire_api == crate::providers::WireApi::Anthropic {
+        return Err((400, "E_ANTHROPIC_DIRECT_ONLY".into(), "该供应商为 Anthropic 协议,OpenClaw 网关通路暂不支持,请改用直连方式(已支持 Anthropic)".into()));
+    }
 
     let mut root = read_root(oclaw_home)?;
-    let (base_url, api_key, key_note) = if way == "gateway" {
-        (format!("{GATEWAY_BASE}/openclaw/v1"), PLACEHOLDER_KEY.to_string(), "占位(真实 Key 只在网关)")
+    let (base_url, api_key, api_kind, key_note) = if way == "gateway" {
+        (format!("{GATEWAY_BASE}/openclaw/v1"), PLACEHOLDER_KEY.to_string(), "openai-completions", "占位(真实 Key 只在网关)")
+    } else if provider.wire_api == crate::providers::WireApi::Anthropic {
+        // 真机实证:anthropic-messages 自动拼 /v1/messages + x-api-key 头 → 带 /v1 尾的上游去尾防双拼
+        (
+            provider.base_url.trim().trim_end_matches('/').trim_end_matches("/v1").to_string(),
+            provider.api_key.clone(),
+            "anthropic-messages",
+            "直连:真实 Key 落盘于 openclaw.json(Anthropic 协议)",
+        )
     } else {
-        (provider.base_url.trim().trim_end_matches('/').to_string(), provider.api_key.clone(), "直连:真实 Key 落盘于 openclaw.json")
+        (provider.base_url.trim().trim_end_matches('/').to_string(), provider.api_key.clone(), "openai-completions", "直连:真实 Key 落盘于 openclaw.json")
     };
 
     let model_ids: Vec<(String, String, Option<u64>)> = if provider.models.is_empty() {
@@ -143,7 +156,7 @@ pub fn host(
     let entry = json!({
         "baseUrl": base_url,
         "apiKey": api_key,
-        "api": "openai-completions",
+        "api": api_kind,
         "models": models,
     });
     root.entry("models".to_string())
@@ -180,7 +193,7 @@ pub fn host(
 
     let written = write_root(oclaw_home, backup_dir, &root, if switched { "pre-host" } else { "pre-switch" })?;
     Ok(json!({
-        "hosted": true, "way": way, "switched": !existing.is_empty(),
+        "hosted": true, "way": way, "api": api_kind, "switched": !existing.is_empty(),
         "defaultModelSwitched": switched,
         "suggested": !switched,
         "changed": { "config": written },
@@ -214,4 +227,108 @@ pub fn unhost(oclaw_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
         .unwrap_or(false);
     let written = write_root(oclaw_home, backup_dir, &root, "pre-unhost")?;
     Ok(json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 直连协议分流(增强批):Anthropic→anthropic-messages(真机实证:自动拼 /v1/messages+x-api-key);
+    /// 其余→openai-completions(原行为)。gateway+Anthropic 早拒。
+    fn setup(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("oclaw-enh-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let backup = root.join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        (home, backup, root)
+    }
+
+    fn fixture(dir: &std::path::Path, wire: &str, base_url: &str) -> std::path::PathBuf {
+        let path = dir.join("providers.json");
+        std::fs::write(
+            &path,
+            json!({
+                "providers": [{
+                    "id": "p1", "name": "t", "agent": "openclaw",
+                    "base_url": base_url, "api_key": "sk-real",
+                    "model": "m1", "wire_api": wire, "sort_index": 0, "created_at": 1
+                }],
+                "active_provider_id": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn read_entry(home: &Path) -> Value {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(config_path(home)).unwrap()).unwrap();
+        v["models"]["providers"][PROVIDER_ID].clone()
+    }
+
+    #[test]
+    fn direct_anthropic_writes_messages_api() {
+        let (home, backup, root) = setup("direct-anth");
+        let prov = fixture(&root, "anthropic", "https://opencode.ai/zen/go/v1/");
+        let r = host(&home, &backup, &prov, "p1", "direct").unwrap();
+        assert_eq!(r["api"], json!("anthropic-messages"));
+        let e = read_entry(&home);
+        assert_eq!(e["api"], json!("anthropic-messages"));
+        assert_eq!(e["baseUrl"], json!("https://opencode.ai/zen/go"), "带 /v1 尾须去尾(OpenClaw 自动拼 /v1/messages)");
+        assert_eq!(e["apiKey"], json!("sk-real"), "direct 真实 Key 落盘(既定语义)");
+        assert_eq!(e["models"][0]["id"], json!("m1"));
+        assert!(r["keyNote"].as_str().unwrap().contains("Anthropic"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn direct_anthropic_bare_base_kept() {
+        let (home, backup, root) = setup("direct-anth-bare");
+        let prov = fixture(&root, "messages", "https://2xa.cc.cd");
+        let _ = host(&home, &backup, &prov, "p1", "direct").unwrap();
+        let e = read_entry(&home);
+        assert_eq!(e["baseUrl"], json!("https://2xa.cc.cd"), "裸域原样(自动拼出 /v1/messages)");
+        assert_eq!(e["api"], json!("anthropic-messages"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn direct_chat_unchanged() {
+        let (home, backup, root) = setup("direct-chat");
+        let prov = fixture(&root, "chat_completions", "https://go.example/v1");
+        let r = host(&home, &backup, &prov, "p1", "direct").unwrap();
+        assert_eq!(r["api"], json!("openai-completions"), "非 Anthropic 供应商行为不变");
+        let e = read_entry(&home);
+        assert_eq!(e["api"], json!("openai-completions"));
+        assert_eq!(e["baseUrl"], json!("https://go.example/v1"), "openai-completions 不去 /v1 尾(原行为)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gateway_rejects_anthropic_provider() {
+        let (home, backup, root) = setup("gw-reject");
+        let prov = fixture(&root, "anthropic", "https://2xa.cc.cd");
+        let err = host(&home, &backup, &prov, "p1", "gateway").unwrap_err();
+        assert_eq!(err.0, 400);
+        assert_eq!(err.1, "E_ANTHROPIC_DIRECT_ONLY");
+        assert!(!config_path(&home).exists(), "拒绝时零写入");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unhost_after_anthropic_direct_restores() {
+        let (home, backup, root) = setup("unhost-anth");
+        let prov = fixture(&root, "anthropic", "https://x.example");
+        host(&home, &backup, &prov, "p1", "direct").unwrap();
+        let s = state(&home);
+        assert!(s["hosting"].is_object());
+        assert_eq!(s["hosting"]["api"], json!("anthropic-messages"), "state 暴露 api 形态");
+        let u = unhost(&home, &backup).unwrap();
+        assert_eq!(u["restored"], json!(true));
+        assert_eq!(u["defaultModelRemoved"], json!(true));
+        let s2 = state(&home);
+        assert!(s2["hosting"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
