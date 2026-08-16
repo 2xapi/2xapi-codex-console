@@ -8,6 +8,7 @@
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
 
 pub mod gemini;
+pub mod hermes;
 pub mod workbuddy;
 
 use serde_json::{json, Value};
@@ -21,8 +22,11 @@ pub struct AgentMeta {
     pub name: &'static str,
     /// 导航提示文案
     pub tip: &'static str,
-    /// 是否已实现(可切换世界 / 可建供应商);false = 前端置灰标「即将上线」
+    /// 后端已并入(网关可服务该平台流量,供应商白名单据此放行)
     pub available: bool,
+    /// 前端世界已交付(导航可点亮、可进世界;false = 导航灰标「即将上线」)。
+    /// 后端先行合并而前端未交付的平台:available=true + frontend_ready=false。
+    pub frontend_ready: bool,
     /// 对网关的消费协议(responses|chat|anthropic|gemini);未实现平台为规划值
     pub egress: &'static str,
     /// 托管形态:"config"=写配置文件 / "inject"=注入式启动 / ""=未定
@@ -36,6 +40,7 @@ static REGISTRY: &[AgentMeta] = &[
         name: "Codex",
         tip: "Codex",
         available: true,
+        frontend_ready: true,
         egress: "responses",
         hosting: "config",
     },
@@ -44,14 +49,17 @@ static REGISTRY: &[AgentMeta] = &[
         name: "Claude Code",
         tip: "Claude Code",
         available: true,
+        frontend_ready: true,
         egress: "anthropic",
         hosting: "inject",
     },
     AgentMeta {
         id: "gemini",
         name: "Gemini CLI",
-        tip: "Gemini CLI",
+        tip: "Gemini CLI(即将上线)",
+        // 后端已并入 main(阶段 C 转换器+adapter);前端世界微批次交付时 frontend_ready 翻 true
         available: true,
+        frontend_ready: false,
         egress: "gemini",
         hosting: "config",
     },
@@ -60,6 +68,7 @@ static REGISTRY: &[AgentMeta] = &[
         name: "Grok Build",
         tip: "Grok Build(即将上线)",
         available: false,
+        frontend_ready: false,
         egress: "chat",
         hosting: "config",
     },
@@ -68,6 +77,7 @@ static REGISTRY: &[AgentMeta] = &[
         name: "OpenCode",
         tip: "OpenCode(即将上线)",
         available: false,
+        frontend_ready: false,
         egress: "chat",
         hosting: "config",
     },
@@ -76,14 +86,16 @@ static REGISTRY: &[AgentMeta] = &[
         name: "OpenClaw",
         tip: "OpenClaw(即将上线)",
         available: false,
+        frontend_ready: false,
         egress: "anthropic",
         hosting: "config",
     },
     AgentMeta {
         id: "hermes",
         name: "Hermes",
-        tip: "Hermes(即将上线)",
-        available: false,
+        tip: "Hermes",
+        available: true,
+        frontend_ready: true,
         egress: "chat",
         hosting: "config",
     },
@@ -92,14 +104,17 @@ static REGISTRY: &[AgentMeta] = &[
         name: "Claude 桌面版",
         tip: "Claude Desktop(即将上线)",
         available: false,
+        frontend_ready: false,
         egress: "anthropic",
         hosting: "config",
     },
     AgentMeta {
         id: "workbuddy",
         name: "WorkBuddy",
-        tip: "WorkBuddy / CodeBuddy",
+        tip: "WorkBuddy / CodeBuddy(即将上线)",
+        // 后端已并入 main(双载体叠加写);前端世界批次交付时 frontend_ready 翻 true
         available: true,
+        frontend_ready: false,
         egress: "chat",
         hosting: "config",
     },
@@ -135,6 +150,7 @@ pub fn registry_json() -> Value {
                     "name": m.name,
                     "tip": m.tip,
                     "available": m.available,
+                    "frontend_ready": m.frontend_ready,
                     "egress": m.egress,
                     "hosting": m.hosting,
                 })
@@ -159,10 +175,18 @@ mod tests {
         assert!(!all.contains(&"pi"), "pi 已裁撤,不得出现在注册表");
     }
 
-    /// 可用平台 = codex/claude/gemini/workbuddy(gemini 阶段 C 接入;workbuddy 为 B 阶段第一个新平台)。
+    /// 白名单(available 语义=后端已并入;gemini/workbuddy 后端在 main 而前端未交付→available=true
+    /// +frontend_ready=false,其前端批次交付时翻 frontend_ready,本断言不动)。顺序 = REGISTRY 声明序。
     #[test]
-    fn supported_ids_includes_workbuddy() {
-        assert_eq!(supported_ids(), vec!["codex", "claude", "gemini", "workbuddy"]);
+    fn supported_ids_are_backend_merged() {
+        assert_eq!(supported_ids(), vec!["codex", "claude", "gemini", "hermes", "workbuddy"]);
+    }
+
+    /// 前端世界就绪 = 可点亮导航:恰为 codex/claude/hermes(gemini/workbuddy 后端先行、前端未交付)。
+    #[test]
+    fn frontend_ready_platforms() {
+        let ready: Vec<&str> = registry().filter(|m| m.frontend_ready).map(|m| m.id).collect();
+        assert_eq!(ready, vec!["codex", "claude", "hermes"]);
     }
 
     /// find 大小写不敏感;未注册 id 返回 None(泛化路由据此 404)。
