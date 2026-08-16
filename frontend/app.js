@@ -11,6 +11,7 @@ var state = {
   providers: [],       // GET /api/providers(pure_api 过滤后;含 agent 字段,按 agent 分流)
   dstate: null,        // GET /api/desktop/state {hasOfficial, gateway, hosting}(Codex 托管)
   claude: null,        // Claude 注入式(前端本地态:null 或 {started, way, providerId, providerName, env, command, model};后端无 claude-state 接口)
+  hermes: null,        // Hermes 托管态(GET /api/desktop/hermes/state:{hosting:{way,entry}|null, pointer, configPath})
   codexWay: "gateway", // Codex 通路方式(会话内本地态 gateway|direct;direct 由 hasOfficial===false 门控,不落盘)
   accel: null,         // GET /api/accel/state {mode, customNode, lines, scopeNote, usage}
   session: null,       // GET /api/session
@@ -60,6 +61,8 @@ function hosting() {
   return (h && (h.way === "gateway" || h.way === "direct")) ? h : null;
 }
 function claudeStarted() { var c = state.claude; return !!(c && c.started); }
+function hermesHosted() { var h = state.hermes; return !!(h && h.hosting); }
+function hermesPointerName() { var h = state.hermes; return (h && h.pointer) || ""; }
 function claudeWay() { var c = state.claude; return (c && c.way) || "gateway"; }
 function codexWayNow() {
   var w = state.codexWay || "gateway";
@@ -69,6 +72,7 @@ function codexWayNow() {
 }
 function hostedBy(id) {
   if (state.agent === "claude") { var c = state.claude; return !!(c && c.started && c.providerId === id); }
+  if (state.agent === "hermes") return false; /* hermes 托管为整体态(条目存在),不绑死单个供应商 */
   var h = hosting(); return !!h && h.providerId === id;
 }
 function wireLabel(p) {
@@ -146,6 +150,10 @@ async function refreshClaudeState() {
     var p = providersFor("claude").find(function (x) { return x.id === c.providerId; });
     if (!p) state.claude = null;
   }
+}
+async function refreshHermesState() {
+  /* Hermes 托管态:{hosting:{way,entry}|null, pointer, configPath}(叠加条目存在性 = 托管标记) */
+  try { state.hermes = await api.agentState("hermes"); } catch (e) { state.hermes = null; }
 }
 async function refreshAccel() {
   try {
@@ -240,7 +248,9 @@ function renderRailRows() {
 function renderContent() {
   var c = document.getElementById("content"); if (!c) return;
   if (state.view === "history") c.innerHTML = historyHtml();
-  else c.innerHTML = (state.agent === "claude") ? claudeDashHtml() : dashHtml();
+  else c.innerHTML = (state.agent === "claude") ? claudeDashHtml()
+    : (state.agent === "hermes") ? hermesDashHtml()
+    : dashHtml();
 }
 function renderTopAuth() {
   var el = document.getElementById("topAuth"); if (!el) return;
@@ -594,8 +604,74 @@ function diagCard(d) {
     + '</section>';
 }
 
+/* ── 主卡 dash(Hermes:叠加式托管,条目写入 ~/.hermes/config.yaml;指针受控切换)── */
+function hermesDashHtml() {
+  var mine = providersFor("hermes");
+  if (!mine.length) {
+    return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
+      + '<div style="font-size:30px">🪽</div>'
+      + '<h2 style="font-size:15px">开始使用 Hermes</h2>'
+      + '<div class="sub" style="max-width:380px">还没有 Hermes 供应商。' + (loggedIn() ? '点「导入 Key」自动生成供应商,' : '登录 2xapi 后一键导入 Key,') + '或手动添加一个中转站(需 OpenAI Chat 兼容协议)。</div>'
+      + '<div class="btn-row" style="justify-content:center">'
+      + (loggedIn() ? '<button class="btn primary" data-a="import-keys">⇭ 导入 Key</button>' : '<button class="btn primary" data-a="login">登录 2xapi</button>')
+      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>';
+  }
+  var hosted = hermesHosted();
+  var ptr = hermesPointerName();
+  var acc = state.accel || {};
+  var accelOn = (acc.mode || "off") !== "off";
+  var hp = hosted ? (lineOf(state.selId) || mine[0]) : null;
+
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var r, note;
+  if (!hosted) {
+    r = st("var(--c-official)", "Hermes CLI", "当前供应商:" + (esc(ptr) || "未设置")) + lk("var(--c-official)") + st("var(--c-official)", "官方/自有配置", "~/.hermes/config.yaml");
+    note = '当前:Hermes 按自有配置直连 · 选一个供应商并「开启托管」即可走中转(写入叠加条目,不动已有配置)';
+  } else if (!accelOn) {
+    r = st("var(--c-gw)", "Hermes CLI", "条目 2xapi-gateway") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787/hermes") + lk("var(--c-gw)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关(加速已关,直发上游) · 条目零真 Key,Key 由网关注入';
+  } else {
+    r = st("var(--c-gw)", "Hermes CLI", "条目 2xapi-gateway") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", "127.0.0.1:8787/hermes")
+      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关 + 加速(已启用线路自动择优,失败自动切换) · 条目零真 Key,Key 由网关注入';
+  }
+  var selVal = hp ? hp.id : (state.selId || (mine[0] && mine[0].id));
+  var opts = mine.map(function (x) {
+    return '<option value="' + esc(x.id) + '"' + (x.id === selVal ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
+  }).join("");
+  var p = lineOf(selVal);
+
+  var html = "";
+  if (p) html += providerDetailCard(p);
+  html += '<section class="card"><h2>Hermes Agent · 主通道</h2>'
+    + '<div class="detect">'
+    + (hosted ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">已托管 · 叠加条目 2xapi-gateway</span>' : '<span class="tag">未托管</span>')
+    + (ptr ? '<span class="tag">指针:' + esc(ptr) + '</span>' : '<span class="tag">指针:未设置</span>')
+    + '</div>'
+    + '<div class="route">' + r + '</div>'
+    + '<div class="route-mode"><span class="k">●</span> ' + note + '</div>'
+    + '<div style="margin:8px 0 0;padding:8px 10px;background:rgba(120,160,255,.06);border:1px solid rgba(120,160,255,.25);border-radius:8px;font-size:11.5px;color:#A8C0F0">ⓘ 叠加平台:条目写入 ~/.hermes/config.yaml 的 custom_providers,已有供应商与个性化配置零触碰;托管仅在指针为官方默认/未设置时自动切换默认模型,「还原官方」即移除条目并恢复指针。</div>'
+    + '<div class="grid2">'
+    + '<div class="f"><label>供应商(走哪家中转)</label><select id="provSel" data-a="prov">' + opts + '</select></div>'
+    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">' + (hosted ? "网关 · 叠加条目" : "未托管") + '</span></div></div>'
+    + '</div>'
+    + '<div class="btn-row">'
+    + (hosted ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>还原官方</button>'
+      : '<button class="btn primary" data-a="host-on"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
+    + '</div></section>';
+  return html;
+}
+
 /* ── 历史会话视图(Codex 走 db 列表+修复;Claude 走 ~/.claude jsonl 只读列表)── */
-function historyHtml() {
+function historyHtml() {  if (state.agent === "hermes") {
+    /* Hermes 会话第一版不做(方案 §六);state.db 为 hermes 私有格式,后续批次再评估 */
+    return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
+      + '<div style="font-size:30px">🕘</div>'
+      + '<h2 style="font-size:15px">Hermes 历史会话</h2>'
+      + '<div class="sub" style="max-width:380px">Hermes 的会话历史功能第一版暂不提供;可在终端 hermes 内查看。</div>'
+      + '</section>';
+  }
   if (state.agent === "claude") {
     var cs = state.claudeSessions;
     var clist;
@@ -698,12 +774,13 @@ function renderModelRows() {
 function openEdit(id) {
   var p = id ? lineOf(id) : null;
   var isC = state.agent === "claude";
-  var defWire = isC ? "anthropic" : "responses";
+  var isH = state.agent === "hermes";
+  var defWire = isC ? "anthropic" : (isH ? "chat_completions" : "responses");
   state.edit = p
     ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, models: (p.models || []).map(normModel) }
     : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, models: [] };
   state.fieldErrors = {};
-  document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + (isC ? "Claude" : "Codex");
+  document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + (isC ? "Claude" : (isH ? "Hermes" : "Codex"));
   document.getElementById("eName").value = state.edit.name;
   document.getElementById("eUrl").value = state.edit.baseUrl;
   document.getElementById("eKey").value = "";
@@ -803,31 +880,50 @@ async function doDiag() {
 /* ── 托管 / 还原 ── */
 async function doHost(providerId, way) {
   if (!providerId) return;
-  var w = (way === "direct" || way === "gateway") ? way : codexWayNow();
   state.busy = "host"; render();
   try {
-    var r = await api.desktopHost(providerId, w);
-    state.codexWay = w;
-    await refreshAll();
-    state.selId = providerId;
-    showToast(r && r.switched
-      ? "已切换供应商(即时生效)"
-      : (w === "direct"
-        ? "桌面版已直连托管(Key 已写入本地配置,已自动备份,可随时还原)"
-        : "桌面版已托管走中转(已自动备份,可随时还原)"), "ok");
+    if (state.agent === "hermes") {
+      /* Hermes 叠加托管:固定 gateway 通路,走泛化路由 */
+      var r = await api.agentHost("hermes", providerId, "gateway");
+      await refreshHermesState();
+      state.selId = providerId;
+      showToast(r && r.pointerSwitched === false
+        ? "条目已写入;Hermes 当前默认模型指向你的第三方供应商,未自动切换(可在 hermes 内自选)"
+        : "Hermes 已托管走中转(叠加条目已写入,已自动备份,可随时还原)", "ok");
+    } else {
+      var w = (way === "direct" || way === "gateway") ? way : codexWayNow();
+      var r2 = await api.desktopHost(providerId, w);
+      state.codexWay = w;
+      await refreshAll();
+      state.selId = providerId;
+      showToast(r2 && r2.switched
+        ? "已切换供应商(即时生效)"
+        : (w === "direct"
+          ? "桌面版已直连托管(Key 已写入本地配置,已自动备份,可随时还原)"
+          : "桌面版已托管走中转(已自动备份,可随时还原)"), "ok");
+    }
   } catch (e) {
     showToast(e.message, "error");
-    await refreshDesktop();
+    if (state.agent === "hermes") await refreshHermesState(); else await refreshDesktop();
   }
   state.busy = null; render();
 }
 async function doUnhost() {
   state.busy = "unhost"; render();
   try {
-    var r = await api.desktopUnhost();
-    await refreshAll();
-    showToast(r && r.restored ? "已还原(可从备份目录恢复)" : "当前未托管,无需还原", "ok");
-  } catch (e) { showToast(e.message, "error"); await refreshDesktop(); }
+    if (state.agent === "hermes") {
+      var r = await api.agentUnhost("hermes");
+      await refreshHermesState();
+      showToast(r && r.restored ? "已还原(条目已移除,指针已恢复;可从备份目录恢复)" : "当前未托管,无需还原", "ok");
+    } else {
+      var r2 = await api.desktopUnhost();
+      await refreshAll();
+      showToast(r2 && r2.restored ? "已还原(可从备份目录恢复)" : "当前未托管,无需还原", "ok");
+    }
+  } catch (e) {
+    showToast(e.message, "error");
+    if (state.agent === "hermes") await refreshHermesState(); else await refreshDesktop();
+  }
   state.busy = null; render();
 }
 
@@ -1223,6 +1319,7 @@ document.addEventListener("click", function (ev) {
       state.agent = t.dataset.g; state.view = "dash"; state.diag = null; state.test = null; state.search = "";
       render();
       if (state.agent === "claude") refreshClaudeState().then(function () { render(); });
+      else if (state.agent === "hermes") refreshHermesState().then(function () { render(); });
       else state.claude = null;
       break;
     case "view":
@@ -1290,6 +1387,12 @@ document.addEventListener("click", function (ev) {
       break;
     case "confirm-no": closeConfirm(); break;
     case "host-on": {
+      if (state.agent === "hermes") {
+        askConfirm("开启托管?", "Hermes 将写入叠加条目 2xapi-gateway(指向本机网关),已有配置零触碰;操作前自动备份。").then(function (yes) {
+          if (yes) doHost(t.dataset.id || state.selId, "gateway");
+        });
+        break;
+      }
       var hw = codexWayNow();
       askConfirm("开启托管?", hw === "direct"
         ? "桌面版 Codex 将直连选中的供应商(Key 写入本地配置,不经网关、无加速);操作前自动备份。"
@@ -1299,6 +1402,12 @@ document.addEventListener("click", function (ev) {
       break;
     }
     case "unhost":
+      if (state.agent === "hermes") {
+        askConfirm("还原官方?", "移除写入 ~/.hermes/config.yaml 的叠加条目并恢复模型指针;操作前自动备份。").then(function (yes) {
+          if (yes) doUnhost();
+        });
+        break;
+      }
       askConfirm("还原官方?", "清除本软件写入的托管配置(config 托管段 / auth Key),~/.codex 回到官方状态;操作前自动备份。").then(function (yes) {
         if (yes) doUnhost();
       });
@@ -1354,6 +1463,9 @@ document.addEventListener("change", function (ev) {
     if (state.agent === "claude") {
       if (claudeStarted()) doClaudeStart(id); /* 已注入:切供应商 = 重新注入 */
       else render();
+    } else if (state.agent === "hermes") {
+      if (hermesHosted()) doHost(id, "gateway"); /* 已托管:切供应商 = 条目热更新 */
+      else render();
     } else if (hosting()) doHost(id); /* 已托管:切供应商 = 网关热切换 */
     else render();
     return;
@@ -1380,4 +1492,37 @@ document.addEventListener("input", function (ev) {
 
 /* ── 启动 ── */
 try { state.balShow = localStorage.getItem("2xapi.balShow") !== "off"; } catch (e) {}
+/* ── 多平台导航数据驱动(A 阶段,方案 §2.3 + D3):从注册表拉取未上线平台,在最后一个静态平台按钮后
+ * 插入「即将上线」占位按钮。图标:有可靠品牌图形的用品牌灰标(gemini=四角星、claude-desktop=Anthropic
+ * 星芒),其余用首字母标(品牌 logo 原文由各平台前端批次从 simple-icons 补齐);第三方 logo 仅导航识别。
+ * codex/claude/hermes 真实按钮保留静态 DOM 零改动;拉取失败或为空 → 维持现状。幂等:只注入一次。── */
+var AGENT_NAV_ICON = {
+  // Gemini 四角星(几何构造,近似品牌视觉)
+  gemini: '<svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M12 1l2.7 8.3L23 12l-8.3 2.7L12 23l-2.7-8.3L1 12l8.3-2.7z"/></svg>',
+  // Anthropic 星芒(与 claude 按钮同 path,导航识别用)
+  "claude-desktop": '<svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
+};
+function injectUpcomingAgents() {
+  return api.agents().then(function (reg) {
+    var upcoming = ((reg && reg.agents) || []).filter(function (m) { return !m.frontend_ready; });
+    var statics = document.querySelectorAll('.nav .nav-btn.agent');
+    var anchor = statics.length ? statics[statics.length - 1] : null;
+    if (!anchor || !upcoming.length || anchor.dataset.upcomingDone) return;
+    anchor.dataset.upcomingDone = "1";
+    var html = upcoming.map(function (m) {
+      var icon = AGENT_NAV_ICON[m.id];
+      var mark = icon
+        ? '<span style="display:inline-flex;width:19px;height:19px;color:#8a8f98">' + icon + '</span>'
+        : (function (g) {
+            return '<span style="display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;font-size:11px;font-weight:600;color:#8a8f98">' + esc(g) + '</span>';
+          })((m.name || "?").trim().charAt(0).toUpperCase());
+      return '<button class="nav-btn" disabled style="--ac:#8a8f98" title="' + esc(m.name) + '">'
+        + mark
+        + '<span class="tip">' + esc(m.tip || ((m.name || "") + "(即将上线)")) + '</span>'
+        + '</button>';
+    }).join("");
+    anchor.insertAdjacentHTML("afterend", html);
+  }).catch(function (e) { console.warn("agents 注册表拉取失败,维持静态导航", e); });
+}
+injectUpcomingAgents();
 refreshAll().then(render).catch(function (e) { console.error(e); render(); });

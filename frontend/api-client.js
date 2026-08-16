@@ -87,6 +87,8 @@
     // ── 桌面版托管开关（阶段 1，任务书 §1.1）──
     // host/unhost 的错误形态为 {"error": code, "message": msg}（非 04 信封），需单独剥出 code
     desktopState: () => request("GET", "/api/desktop/state"),
+  // 多平台注册表(A 阶段,D3 导航数据源):{agents:[{id,name,tip,available,egress,hosting}]}
+  agents: () => request("GET", "/api/desktop/agents"),
     desktopHost: async (providerId, way) => {
       const resp = await fetch("/api/desktop/host", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
@@ -112,6 +114,33 @@
     },
     // 测试连接(阶段 2):{providerId} 或 {baseUrl, apiKey}
     preflight: (body) => request("POST", "/api/launcher/preflight", { body }),
+
+    // ── 泛化 agent 路由(A 阶段 /api/desktop/:agent/*;hermes 等新平台使用,codex/claude 仍走具名)──
+    // 错误形态同 desktopHost:{"error": code, "message": msg}
+    agentState: (agent) => request("GET", "/api/desktop/" + agent + "/state"),
+    agentHost: async (agent, providerId, way) => {
+      const resp = await fetch("/api/desktop/" + agent + "/host", {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        body: JSON.stringify({ providerId: providerId, way: way || "gateway" }),
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (resp.ok && payload && payload.ok === true) return payload.data;
+      const err = new Error((payload && payload.message) || "托管失败 (" + resp.status + ")");
+      err.code = (payload && payload.error) || "E_UNKNOWN";
+      err.status = resp.status;
+      throw err;
+    },
+    agentUnhost: async (agent) => {
+      const resp = await fetch("/api/desktop/" + agent + "/unhost", {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (resp.ok && payload && payload.ok === true) return payload.data;
+      const err = new Error((payload && payload.message) || "还原失败 (" + resp.status + ")");
+      err.code = (payload && payload.error) || "E_UNKNOWN";
+      err.status = resp.status;
+      throw err;
+    },
 
     // ── Claude 注入式托管(Claude 批次:后端返回注入信息,前端展示/复制;停用=前端本地态)──
     // claude-start 契约:成功 {ok:true, command, env:{ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN}, way, providerId, providerName, model}
