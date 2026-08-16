@@ -302,11 +302,15 @@ async fn dispatch_gemini(state: &AppState, model_action: &str, req: Request<Body
         }
         // ── 转换:Gemini → ChatCompletions(M3b 同思路)──
         crate::providers::WireApi::ChatCompletions => {
-            let conv = match crate::gateway_gemini_conv::gemini_to_chat_request(model, stream, &body_bytes) {
+            // 模型映射(2026-08-16 实测定案):gemini CLI 的 ModelRouter 恒发 gemini 系名
+            // (GEMINI_MODEL/-m/settings 均拦不住),Chat 上游 Key 组通常没有 → 重写为供应商默认模型;
+            // 供应商未配模型则原名透传。透传分支(wire=gemini)不重写:原生上游模型名原样。
+            let upstream_model = if provider.model.is_empty() { model } else { &provider.model };
+            let conv = match crate::gateway_gemini_conv::gemini_to_chat_request(upstream_model, stream, &body_bytes) {
                 Ok(c) => c,
                 Err(e) => return gemini_err(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", e.message()),
             };
-            eprintln!("[GW] gemini conv→chat model={model} action={action} stream={stream} body={}B", conv.body.len());
+            eprintln!("[GW] gemini conv→chat model={model}→{upstream_model} action={action} stream={stream} body={}B", conv.body.len());
 
             // /v1 双形态(与 dispatch_anthropic 同规则):裸域拼 /v1/chat/completions(OpenAI 惯例,
             // 2xapi.cc.cd 实测仅 /v1 形态);base 已带 /v1 则直接拼(DeepSeek 等挂载根的站两形态均可)
@@ -386,7 +390,7 @@ async fn dispatch_gemini(state: &AppState, model_action: &str, req: Request<Body
                     Ok(b) => b,
                     Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
                 };
-                let converted = match crate::gateway_gemini_conv::chat_json_to_gemini_json(model, &up_bytes) {
+                let converted = match crate::gateway_gemini_conv::chat_json_to_gemini_json(upstream_model, &up_bytes) {
                     Ok(v) => v,
                     Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("gemini conv: {e}")),
                 };
@@ -1549,6 +1553,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 模型映射:CLI 路由恒发 gemini 系名 → 重写为供应商默认模型;未配模型则原名透传。
+    #[tokio::test]
+    async fn gemini_route_maps_model_to_provider_default() {
+        let chat_resp = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+        let (base, seen) = mock_chat_upstream(chat_resp, "application/json").await;
+        let (state, providers_path, root) = make_state("gem-model-map");
+        let _gid = add_gemini_provider(&providers_path, &base, "sk-gem", crate::providers::WireApi::ChatCompletions);
+
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("gemini-3.5-flash:generateContent".into()),
+            req_gemini("gemini-3.5-flash:generateContent", None, r#"{"contents":[{"role":"user","parts":[{"text":"x"}]}]}"#.into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let up: serde_json::Value = {
+            let seen = seen.lock().unwrap();
+            serde_json::from_slice(&seen[0].1).unwrap()
+        };
+        assert_eq!(up["model"], "gemini-2.5-flash", "应重写为供应商默认模型:{up}");
+
+        // 供应商未配模型 → 原名透传(create 校验要求 model 非空,故直接写文件模拟历史数据)
+        let (state2, providers_path2, root2) = make_state("gem-model-keep");
+        std::fs::write(
+            &providers_path2,
+            serde_json::json!({ "providers": [{ "id": "gnm", "name": "无模型", "agent": "gemini",
+                "base_url": base, "api_key": "sk-gem", "model": "", "wire_api": "chat_completions" }] }).to_string(),
+        )
+        .unwrap();
+        let resp2 = proxy_gemini(
+            State(Arc::new(state2)),
+            axum::extract::Path("gemini-3.5-flash:generateContent".into()),
+            req_gemini("gemini-3.5-flash:generateContent", None, r#"{"contents":[{"role":"user","parts":[{"text":"x"}]}]}"#.into()),
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let up2: serde_json::Value = {
+            let seen = seen.lock().unwrap();
+            serde_json::from_slice(&seen[1].1).unwrap()
+        };
+        assert_eq!(up2["model"], "gemini-3.5-flash", "未配模型应原名透传:{up2}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
     /// streamGenerateContent 缺 ?alt=sse → 400(gemini CLI 固定 alt=sse)。
     #[tokio::test]
     async fn gemini_stream_missing_alt_400() {
@@ -1589,9 +1640,14 @@ mod tests {
         let upstream_base = entry["base_url"].as_str().unwrap_or("https://2xa.cc.cd").to_string();
         eprintln!("[E2E] 上游 = {upstream_base} 模型 = {model}");
 
-        // 2. 隔离环境:临时 providers.json(仅 1 个 gemini 供应商)+ 临时 HOME
+        // 2. 隔离环境:临时 providers.json(仅 1 个 gemini 供应商,模型=条目真实默认)+ 临时 HOME
         let (state, providers_path, root) = make_state("gemini-e2e");
-        let _gid = add_gemini_provider(&providers_path, &upstream_base, &real_key, crate::providers::WireApi::ChatCompletions);
+        std::fs::write(
+            &providers_path,
+            serde_json::json!({ "providers": [{ "id": "ge2e", "name": "2xa真实站", "agent": "gemini",
+                "base_url": upstream_base, "api_key": real_key, "model": model, "wire_api": "chat_completions" }] }).to_string(),
+        )
+        .unwrap();
         let home_e2e = root.join("cli-home");
         std::fs::create_dir_all(home_e2e.join(".gemini")).unwrap();
         std::fs::write(
@@ -1604,6 +1660,11 @@ mod tests {
         let router = crate::server::build_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            home_e2e.join(".gemini/.env"),
+            format!("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:{port}\nGEMINI_API_KEY=sk-gateway-placeholder\nGEMINI_MODEL={model}\n"),
+        )
+        .unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, router).await; });
 
         // 4. 真实 gemini CLI:注入式启动(Key=占位,真 Key 只在网关)
@@ -1613,12 +1674,7 @@ mod tests {
                 .arg("-p")
                 .arg("请只回复两个字:收到")
                 .env("HOME", &home_e2e)
-                .env("GEMINI_API_KEY", "sk-gateway-placeholder")
-                .env("GOOGLE_GEMINI_BASE_URL", format!("http://127.0.0.1:{port}"))
                 .env("GEMINI_CLI_TRUST_WORKSPACE", "true")
-                .env("GEMINI_MODEL", &model)
-                // CLI 辅助/摘要模型默认 gemini-3.1-flash-lite,上游 Key 组通常没有 → 指向同组模型
-                .env("GEMINI_SMALL_MODEL", &model)
                 .output(),
         )
         .await
@@ -2569,5 +2625,64 @@ mod tests {
         let (up_base, _) = mock_upstream("OK").await;
         let out = test_node_via(&hang, &up_base, None, Duration::from_millis(400)).await;
         assert!(matches!(out, NodeTestOutcome::Timeout), "代理挂起应超时, got {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod verify_wb_path {
+    use super::*;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::{Arc, Mutex};
+
+    // 实证:workbuddy chat 入口对 base 不带 /v1 的上游应发 /v1/chat/completions(0c89f3a 修复)
+    #[tokio::test]
+    async fn workbuddy_chat_upstream_gets_v1_path() {
+        let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let hits_c = hits.clone();
+        let hits_bare = hits.clone();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(move |uri: axum::http::Uri, _b: axum::body::Bytes| {
+                let h = hits_c.clone();
+                async move { h.lock().unwrap().push(format!("V1:{}", uri.path())); (StatusCode::OK, "{\"ok\":1}") }
+            }))
+            .route("/chat/completions", post(move |uri: axum::http::Uri, _b: axum::body::Bytes| {
+                let h = hits_bare.clone();
+                async move { h.lock().unwrap().push(format!("BARE:{}", uri.path())); (StatusCode::OK, "{\"ok\":1}") }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+
+        let root = std::env::temp_dir().join(format!("wb-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("providers.json"), serde_json::json!({
+            "providers": [{"id": "wpx", "name": "x", "agent": "workbuddy",
+                "base_url": format!("http://{addr}"), "api_key": "sk-x", "model": "m1",
+                "wire_api": "chat_completions"}]
+        }).to_string()).unwrap();
+        let state = AppState {
+            config_path: root.join("c.toml"), backup_dir: root.join("bk"), providers_path: root.join("providers.json"),
+            codex_home: root.join("codex"), wb_home: root.clone(), hermes_home: root.clone(),
+            gem_home: root.clone(), grok_home: root.clone(), oc_home: root.clone(), oclaw_home: root.clone(), cd_home: root.clone(),
+            launcher: Default::default(),
+            health: Arc::new(crate::acclines::HealthState::new(vec![])),
+            accel: Arc::new(Mutex::new(crate::server::AccelCfg::default())),
+            nodecreds: Arc::new(std::sync::RwLock::new(crate::nodecreds::Store::empty())),
+        };
+        let app2 = crate::server::build_router(state);
+        use tower::ServiceExt;
+        let resp = app2
+            .oneshot(
+                Request::builder().method("POST").uri("/workbuddy/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model":"m1","stream":false,"messages":[]}"#)).unwrap(),
+            )
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = hits.lock().unwrap().clone();
+        assert_eq!(got, vec!["V1:/v1/chat/completions"], "应只命中 /v1 路径: {got:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

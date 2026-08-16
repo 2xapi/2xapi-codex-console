@@ -2400,12 +2400,6 @@ async fn handle_agent_start(
             body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
             &s.gem_home,
         )),
-        "grokbuild" => agent_op_response(crate::agents::grok::start(
-            &s.providers_path,
-            body.get("way").and_then(|v| v.as_str()).unwrap_or("gateway").trim(),
-            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
-            &s.grok_home,
-        )),
         _ => agent_unsupported_response(),
     }
 }
