@@ -8,6 +8,7 @@
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
 
 pub mod claude_desktop;
+pub mod eco;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;

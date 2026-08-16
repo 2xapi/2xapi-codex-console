@@ -52,6 +52,8 @@ pub struct AppState {
     pub oclaw_home: PathBuf,
     /// Claude Desktop 配置父目录(Application Support 根;adapter 内 join("Claude")/"Claude-3p";测试传 tempdir)。
     pub cd_home: PathBuf,
+    /// Cursor 配置根(用户 HOME;eco adapter 内 join(".cursor/mcp.json");测试传 tempdir)。
+    pub cursor_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -139,6 +141,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/desktop/:agent/host", post(handle_agent_host))
         .route("/api/desktop/:agent/unhost", post(handle_agent_unhost))
         .route("/api/desktop/:agent/start", post(handle_agent_start))
+        // --- 生态管理(开发组·生态中心 A 段):MCP 服务器列表/操作 + 预设市场;
+        // 支持表独立于托管注册表(cursor 无托管世界也可管理生态),故不走 reject_agent ---
+        .route("/api/desktop/:agent/eco", get(handle_agent_eco).post(handle_agent_eco_op))
+        .route("/api/desktop/eco-presets", get(handle_eco_presets))
         // --- Backups & history ---
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
@@ -954,6 +960,7 @@ mod tests {
             oc_home: PathBuf::from("/tmp/2xapi-m0-oc-home"),
             oclaw_home: PathBuf::from("/tmp/2xapi-m0-oclaw-home"),
             cd_home: PathBuf::from("/tmp/2xapi-m0-cd-home"),
+            cursor_home: PathBuf::from("/tmp/2xapi-m0-cursor-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1243,6 +1250,7 @@ mod tests {
             oc_home: root.join("ochome"),
             oclaw_home: root.join("oclaw"),
             cd_home: root.join("cdsupport"),
+            cursor_home: root.join("cursorhome"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1254,6 +1262,156 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 生态管理 e2e(开发组·生态中心 A 段):codex TOML 段级 + cursor JSON 全链;
+    /// 手动条目 409 拒写、其他段零触碰、预设市场、未知平台 404。
+    #[tokio::test]
+    async fn eco_routes_e2e() {
+        let (state, root) = unique_state("eco-e2e");
+        let app = build_router(state.clone());
+        // 预置带手动 MCP 条目与其他段的真实形状 config.toml
+        std::fs::write(
+            root.join("config.toml"),
+            "model = \"gpt-5\"\n[mcp_servers.computer-use]\ncommand = \"node\"\nargs = [\"cu.js\"]\n[custom]\nbase_url = \"http://x\"\n",
+        )
+        .unwrap();
+
+        // GET 列表:手动条目识别
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/codex/eco").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let servers = v["data"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["id"], "computer-use");
+        assert_eq!(servers[0]["source"], "manual");
+
+        // install 预设 → 写入 [mcp_servers.fetch],其他段保留
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/codex/eco")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op":"install","presetId":"fetch"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "install 应成功");
+        let toml = std::fs::read_to_string(root.join("config.toml")).unwrap().parse::<toml::Value>().unwrap();
+        assert_eq!(toml["mcp_servers"]["fetch"]["command"].as_str(), Some("uvx"));
+        assert_eq!(toml["mcp_servers"]["computer-use"]["command"].as_str(), Some("node"), "已有条目零触碰");
+        assert_eq!(toml["custom"]["base_url"].as_str(), Some("http://x"), "其他段零触碰");
+
+        // 手动条目拒写
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/codex/eco")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op":"install","name":"computer-use","spec":{"command":"x"}}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // disable → 移除;enable → 写回;uninstall → 双清
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/codex/eco")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op":"disable","name":"fetch"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let toml = std::fs::read_to_string(root.join("config.toml")).unwrap().parse::<toml::Value>().unwrap();
+        assert!(toml["mcp_servers"].get("fetch").is_none());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/codex/eco")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op":"enable","name":"fetch"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let toml = std::fs::read_to_string(root.join("config.toml")).unwrap().parse::<toml::Value>().unwrap();
+        assert!(toml["mcp_servers"]["fetch"].is_table(), "enable 应回写");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/codex/eco")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op":"uninstall","name":"fetch"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let toml = std::fs::read_to_string(root.join("config.toml")).unwrap().parse::<toml::Value>().unwrap();
+        assert!(toml["mcp_servers"].get("fetch").is_none());
+        let reg = std::fs::read_to_string(root.join("codex").join("eco-managed.json")).unwrap_or_default();
+        assert!(!reg.contains("fetch"), "uninstall 后登记表应清除该条");
+
+        // 备份链:eco-apply 备份存在
+        let backups: Vec<_> = std::fs::read_dir(root.join("backups")).unwrap().flatten().collect();
+        assert!(!backups.is_empty(), "应有备份快照");
+
+        // cursor:文件不存在 → 空列表;install 建文件
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/cursor/eco").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["data"]["servers"].as_array().unwrap().len(), 0);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/cursor/eco")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op":"install","presetId":"playwright"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mcp = std::fs::read_to_string(root.join("cursorhome").join(".cursor").join("mcp.json")).unwrap();
+        let doc: Value = serde_json::from_str(&mcp).unwrap();
+        assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx");
+
+        // 未知平台 404;非法 op 400
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/hermes/eco").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/codex/eco")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"op":"nuke"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 预设市场
+        let resp = app
+            .oneshot(Request::builder().uri("/api/desktop/eco-presets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["data"]["presets"].as_array().unwrap().len(), 6);
+        assert_eq!(v["data"]["agents"].as_array().unwrap().len(), 2);
     }
 
     /// grokbuild 泛化路由 e2e:建 agent=grokbuild 供应商 → host 写 ~/.grok TOML → state 托管中 → unhost 还原(隔离 grok_home)
@@ -2402,6 +2560,109 @@ async fn handle_agent_start(
         )),
         _ => agent_unsupported_response(),
     }
+}
+
+// ── 生态管理(开发组·生态中心 A 段)──────────────────────────
+
+/// eco store 构造:支持表校验 + adapter 实例化。
+fn eco_store_for(
+    s: &AppState,
+    agent: &str,
+) -> Result<Box<dyn crate::agents::eco::EcoStore>, Response> {
+    match crate::agents::eco::supported(agent) {
+        Some("codex") => Ok(Box::new(crate::agents::eco::codex::TomlStore::new(&s.config_path))),
+        Some("cursor") => Ok(Box::new(crate::agents::eco::cursor::JsonStore::new(&s.cursor_home))),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "E_ECO_UNKNOWN_AGENT", "message": format!("「{agent}」暂未支持生态管理") })),
+        )
+            .into_response()),
+    }
+}
+
+fn eco_op_response(r: Result<Value, (u16, String, String)>) -> Response {
+    match r {
+        Ok(v) => ok_env(v),
+        Err((status, code, msg)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "error": code, "message": msg })),
+        )
+            .into_response(),
+    }
+}
+
+// GET /api/desktop/:agent/eco —— MCP 条目列表(来源标记 manual/console)
+async fn handle_agent_eco(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+) -> Response {
+    let store = match eco_store_for(&s, &agent) {
+        Ok(st) => st,
+        Err(resp) => return resp,
+    };
+    eco_op_response(crate::agents::eco::list(store.as_ref(), &s.codex_home))
+}
+
+// POST /api/desktop/:agent/eco {op: install|uninstall|enable|disable, name?, presetId?, spec?}
+async fn handle_agent_eco_op(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let store = match eco_store_for(&s, &agent) {
+        Ok(st) => st,
+        Err(resp) => return resp,
+    };
+    let op = body.get("op").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let name = body
+        .get("name")
+        .or_else(|| body.get("presetId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let r = match op.as_str() {
+        "install" => {
+            if let Some(pid) = body.get("presetId").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                let Some(p) = crate::agents::eco::find_preset(pid) else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": "E_ECO_PRESET_NOT_FOUND", "message": format!("预设不存在: {pid}") })),
+                    )
+                        .into_response();
+                };
+                let n = if name.is_empty() { p.id.to_string() } else { name };
+                crate::agents::eco::install(
+                    store.as_ref(), &s.codex_home, &s.backup_dir, &n,
+                    &crate::agents::eco::preset_spec(p),
+                )
+            } else if let Some(spec) = body.get("spec") {
+                crate::agents::eco::install(store.as_ref(), &s.codex_home, &s.backup_dir, &name, spec)
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "E_BAD_REQUEST", "message": "install 需要 presetId 或 spec(+name)" })),
+                )
+                    .into_response();
+            }
+        }
+        "uninstall" => crate::agents::eco::uninstall(store.as_ref(), &s.codex_home, &s.backup_dir, &name),
+        "disable" => crate::agents::eco::disable(store.as_ref(), &s.codex_home, &s.backup_dir, &name),
+        "enable" => crate::agents::eco::enable(store.as_ref(), &s.codex_home, &s.backup_dir, &name),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "E_BAD_REQUEST", "message": "op 仅支持 install / uninstall / enable / disable" })),
+            )
+                .into_response()
+        }
+    };
+    eco_op_response(r)
+}
+
+// GET /api/desktop/eco-presets —— MCP 预设市场(静态目录 + 支持平台表)
+async fn handle_eco_presets() -> Response {
+    ok_env(crate::agents::eco::presets_json())
 }
 
 // ── Codex 启动器（M7，直连版）──────────────────────────────
