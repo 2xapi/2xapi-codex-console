@@ -57,6 +57,8 @@ pub struct AppState {
     pub cd_home: PathBuf,
     /// Cursor 配置根(用户 HOME;eco adapter 内 join(".cursor/mcp.json");测试传 tempdir)。
     pub cursor_home: PathBuf,
+    /// TRAE 配置根(用户 HOME;eco adapter 内 join(".trae/mcp.json");测试传 tempdir)。
+    pub trae_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -1716,9 +1718,24 @@ fn eco_store_for(
     s: &AppState,
     agent: &str,
 ) -> Result<Box<dyn crate::agents::eco::EcoStore>, Box<Response>> {
-    match crate::agents::eco::supported(agent) {
-        Some("codex") => Ok(Box::new(crate::agents::eco::codex::TomlStore::new(&s.config_path))),
-        Some("cursor") => Ok(Box::new(crate::agents::eco::cursor::JsonStore::new(&s.cursor_home))),
+    use crate::agents::eco;
+    match eco::supported(agent) {
+        Some("codex") => Ok(Box::new(eco::codex::TomlStore::new(&s.config_path))),
+        Some("cursor") => Ok(Box::new(eco::cursor::JsonStore::new(&s.cursor_home))),
+        Some("trae") => Ok(Box::new(eco::cursor::JsonStore::at(
+            "trae",
+            &s.trae_home.join(".trae").join("mcp.json"),
+        ))),
+        Some("claude-desktop") => Ok(Box::new(eco::cursor::JsonStore::at(
+            "claude-desktop",
+            &s.cd_home.join("Claude").join("claude_desktop_config.json"),
+        ))),
+        Some("grokbuild") => Ok(Box::new(eco::codex::TomlStore::at(
+            "grokbuild",
+            &s.grok_home.join("config.toml"),
+        ))),
+        Some("opencode") => Ok(Box::new(eco::opencode::OpencodeStore::new(&s.oc_home))),
+        Some("hermes") => Ok(Box::new(eco::hermes::HermesStore::new(&s.hermes_home))),
         _ => Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "E_ECO_UNKNOWN_AGENT", "message": format!("「{agent}」暂未支持生态管理") })),
@@ -1785,10 +1802,12 @@ async fn handle_agent_eco_op(
                         .into_response();
                 };
                 let n = if name.is_empty() { p.id.to_string() } else { name };
-                crate::agents::eco::install(
-                    store.as_ref(), &s.codex_home, &s.backup_dir, &n,
-                    &crate::agents::eco::preset_spec(p),
-                )
+                match crate::agents::eco::preset_spec(p, body.get("params")) {
+                    Ok(spec) => crate::agents::eco::install(
+                        store.as_ref(), &s.codex_home, &s.backup_dir, &n, &spec,
+                    ),
+                    Err(e) => Err(e),
+                }
             } else if let Some(spec) = body.get("spec") {
                 crate::agents::eco::install(store.as_ref(), &s.codex_home, &s.backup_dir, &name, spec)
             } else {
@@ -1838,6 +1857,7 @@ mod tests {
             oclaw_home: PathBuf::from("/tmp/2xapi-m0-oclaw-home"),
             cd_home: PathBuf::from("/tmp/2xapi-m0-cd-home"),
             cursor_home: PathBuf::from("/tmp/2xapi-m0-cursor-home"),
+            trae_home: PathBuf::from("/tmp/2xapi-m0-trae-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -2224,6 +2244,7 @@ mod tests {
             oclaw_home: root.join("oclaw"),
             cd_home: root.join("cdsupport"),
             cursor_home: root.join("cursorhome"),
+            trae_home: root.join("traehome"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -2425,7 +2446,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/desktop/hermes/eco")
+                    .uri("/api/desktop/gemini/eco")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2458,8 +2479,116 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["data"]["presets"].as_array().unwrap().len(), 6);
-        assert_eq!(v["data"]["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(v["data"]["presets"].as_array().unwrap().len(), 8);
+        assert_eq!(v["data"]["agents"].as_array().unwrap().len(), 7);
+    }
+
+    /// 生态管理 B 段 e2e:五平台 install→形状+零触碰→uninstall;装时填参 400。
+    #[tokio::test]
+    async fn eco_b_routes_e2e() {
+        let (state, root) = unique_state("eco-b");
+        let app = build_router(state.clone());
+        let post = |agent: String, body: String| {
+            let uri = format!("/api/desktop/{agent}/eco");
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder().method("POST").uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body)).unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        macro_rules! post {
+            ($a:expr, $b:expr) => {
+                post($a.to_string(), $b.to_string()).await
+            };
+        }
+
+        // ── claude-desktop:5 条用户 MCP + 其他键(mcpServers 之外零触碰)──
+        let cd = root.join("cdsupport").join("Claude");
+        std::fs::create_dir_all(&cd).unwrap();
+        let cd_cfg = cd.join("claude_desktop_config.json");
+        std::fs::write(&cd_cfg, r#"{"globalShortcut":"Ctrl+X","mcpServers":{"zhipu-vision":{"command":"node","args":["z.js"]},"GPT-image":{"command":"g"}},"other":1}"#).unwrap();
+        let resp = post!("claude-desktop", r#"{"op":"install","presetId":"fetch"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "cd install");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cd_cfg).unwrap()).unwrap();
+        assert_eq!(doc["mcpServers"]["zhipu-vision"]["command"], "node", "用户 MCP 保留");
+        assert_eq!(doc["mcpServers"]["GPT-image"]["command"], "g");
+        assert_eq!(doc["mcpServers"]["fetch"]["command"], "uvx", "新条目写入");
+        assert_eq!(doc["globalShortcut"], "Ctrl+X", "其他键保留");
+        let resp = post!("claude-desktop", r#"{"op":"uninstall","name":"fetch"}"#);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cd_cfg).unwrap()).unwrap();
+        assert!(doc["mcpServers"].get("fetch").is_none());
+        assert_eq!(doc["mcpServers"]["zhipu-vision"]["command"], "node");
+
+        // ── grokbuild:[models]/[cli] 段零触碰 ──
+        let grok_cfg = root.join("grok").join("config.toml");
+        std::fs::create_dir_all(root.join("grok")).unwrap();
+        std::fs::write(&grok_cfg, "[models]\ndefault = \"x\"\n[cli]\ntui = true\n").unwrap();
+        let resp = post!("grokbuild", r#"{"op":"install","presetId":"memory"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "grok install");
+        let t: toml::Value = std::fs::read_to_string(&grok_cfg).unwrap().parse().unwrap();
+        assert_eq!(t["models"]["default"].as_str(), Some("x"), "models 段保留");
+        assert_eq!(t["mcp_servers"]["memory"]["command"].as_str(), Some("npx"));
+        let resp = post!("grokbuild", r#"{"op":"uninstall","name":"memory"}"#);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let t: toml::Value = std::fs::read_to_string(&grok_cfg).unwrap().parse().unwrap();
+        assert!(t.get("mcp_servers").is_none(), "空段移除");
+        assert_eq!(t["models"]["default"].as_str(), Some("x"));
+
+        // ── opencode:theme 键保留 + local 形状 ──
+        let oc_cfg = root.join("ochome").join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(oc_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&oc_cfg, r#"{ "theme": "dark", "mcp": {} }"#).unwrap();
+        let resp = post!("opencode", r#"{"op":"install","presetId":"context7"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "oc install");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&oc_cfg).unwrap()).unwrap();
+        assert_eq!(doc["theme"], "dark");
+        assert_eq!(doc["mcp"]["context7"]["type"], "local");
+        assert_eq!(doc["mcp"]["context7"]["command"][0], "npx");
+        let resp = post!("opencode", r#"{"op":"uninstall","name":"context7"}"#);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&oc_cfg).unwrap()).unwrap();
+        assert!(doc.get("mcp").is_none() || doc["mcp"].as_object().unwrap().is_empty());
+
+        // ── hermes:model/agent 段保留 ──
+        let her_cfg = root.join("hermes").join("config.yaml");
+        std::fs::create_dir_all(root.join("hermes")).unwrap();
+        std::fs::write(&her_cfg, "_config_version: 33\nmodel:\n  provider: openai-api\nmcp_servers: {}\nagent:\n  name: demo\n").unwrap();
+        let resp = post!("hermes", r#"{"op":"install","presetId":"fetch"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "hermes install");
+        let raw = std::fs::read_to_string(&her_cfg).unwrap();
+        assert!(raw.contains("provider: openai-api"), "model 段保留");
+        assert!(raw.contains("name: demo"), "agent 段保留");
+        assert!(raw.contains("mcp-server-fetch"));
+        let resp = post!("hermes", r#"{"op":"uninstall","name":"fetch"}"#);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = std::fs::read_to_string(&her_cfg).unwrap();
+        assert!(!raw.contains("mcp-server-fetch"));
+        assert!(raw.contains("_config_version: 33"));
+
+        // ── trae:无文件 install 创建 ──
+        let trae_cfg = root.join("traehome").join(".trae").join("mcp.json");
+        let resp = post!("trae", r#"{"op":"install","presetId":"playwright"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "trae install");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
+        assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx");
+        let resp = post!("trae", r#"{"op":"uninstall","name":"playwright"}"#);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
+        assert!(doc.get("mcpServers").is_none());
+
+        // ── 装时填参:filesystem 缺参 400,带参成功 ──
+        let resp = post!("codex", r#"{"op":"install","presetId":"filesystem"}"#);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "缺 DIR 应 400");
+        let resp = post!("codex", r#"{"op":"install","presetId":"filesystem","params":{"DIR":"/tmp/eco-test"}}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "带参 install");
+        let t: toml::Value = std::fs::read_to_string(root.join("config.toml")).unwrap().parse().unwrap();
+        assert_eq!(t["mcp_servers"]["filesystem"]["args"][2].as_str(), Some("/tmp/eco-test"), "$DIR 替换");
     }
 
     /// grokbuild 泛化路由 e2e:建 agent=grokbuild 供应商 → host 写 ~/.grok TOML → state 托管中 → unhost 还原(隔离 grok_home)

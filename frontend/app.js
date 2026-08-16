@@ -326,7 +326,7 @@ function dashHtml() {
       + '<div class="sub" style="max-width:380px">还没有供应商。' + (loggedIn() ? '点「导入 Key」自动生成供应商,' : '登录 2xapi 后一键导入 Key,') + '或手动添加一个中转站。</div>'
       + '<div class="btn-row" style="justify-content:center">'
       + (loggedIn() ? '<button class="btn primary" data-a="import-keys">⇭ 导入 Key</button>' : '<button class="btn primary" data-a="login">登录 2xapi</button>')
-      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>';
+      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>' + ecoStripHtml("codex");
   }
   var h = hosting();
   var hp = h ? lineOf(h.providerId) : null;
@@ -406,7 +406,7 @@ function dashHtml() {
     + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
     + '</div><div id="rtest"></div></section>';
   if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
-  return html;
+  return html + ecoStripHtml("codex");
 }
 
 /* 供应商详情卡(Codex / Claude 共用;按 agent 过滤与分支按钮) */
@@ -560,7 +560,7 @@ function claudeDashHtml() {
     + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
     + '</div><div id="rtest"></div></section>';
   if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
-  return html;
+  return html + ecoStripHtml("claude");
 }
 
 /* 测试连接:三段 steps(密钥 / 协议 / 建议) */
@@ -644,7 +644,7 @@ function genericDashHtml(agent) {
       + '<div class="sub" style="max-width:380px">还没有 ' + esc(meta.label) + ' 供应商。' + (loggedIn() ? '点「导入 Key」自动生成供应商,' : '登录 2xapi 后一键导入 Key,') + '或手动添加一个中转站。</div>'
       + '<div class="btn-row" style="justify-content:center">'
       + (loggedIn() ? '<button class="btn primary" data-a="import-keys">⇭ 导入 Key</button>' : '<button class="btn primary" data-a="login">登录 2xapi</button>')
-      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>';
+      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>' + ecoStripHtml(agent);
   }
   var hosted = gwHosted(agent);
   var acc = state.accel || {};
@@ -688,7 +688,7 @@ function genericDashHtml(agent) {
       : '<button class="btn primary" data-a="host"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
     + (meta.start ? '<button class="btn" data-a="gw-start"' + (state.busy === "gw-start" ? " disabled" : "") + '>⌘ 生成启动命令</button>' : '')
     + '</div></section>';
-  return html;
+  return html + ecoStripHtml(agent);
 }
 
 function hermesDashHtml() {
@@ -700,7 +700,7 @@ function hermesDashHtml() {
       + '<div class="sub" style="max-width:380px">还没有 Hermes 供应商。' + (loggedIn() ? '点「导入 Key」自动生成供应商,' : '登录 2xapi 后一键导入 Key,') + '或手动添加一个中转站(需 OpenAI Chat 兼容协议)。</div>'
       + '<div class="btn-row" style="justify-content:center">'
       + (loggedIn() ? '<button class="btn primary" data-a="import-keys">⇭ 导入 Key</button>' : '<button class="btn primary" data-a="login">登录 2xapi</button>')
-      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>';
+      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>' + ecoStripHtml("hermes");
   }
   var hosted = hermesHosted();
   var ptr = hermesPointerName();
@@ -746,14 +746,16 @@ function hermesDashHtml() {
     + (hosted ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>还原官方</button>'
       : '<button class="btn primary" data-a="host-on"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
     + '</div></section>';
-  return html;
+  return html + ecoStripHtml("hermes");
 }
 
 /* ── 历史会话视图(Codex 走 db 列表+修复;Claude 走 ~/.claude jsonl 只读列表)── */
 /* ── 生态中心(开发组·生态中心 A 段):平台 tab + MCP 服务器管理 + 预设市场 ──
  * 后端契约:GET|POST /api/desktop/:agent/eco(信封 data={servers,tabs});手动条目只读(409 拒写)。
  * 插件/技能 tab 为占位(B/C 段铺开);平台清单来自 /api/desktop/eco-presets。 */
-var ECO_STATE = { agent: "codex", tab: "mcp", data: null, presets: null, agentsList: null, loading: false };
+var ECO_STATE = { agent: "codex", tab: "mcp", data: null, presets: null, agentsList: null, loading: false, pendingInstall: null, pendingParams: {} };
+/* eco 支持平台(与后端 SUPPORTED 同步;世界内嵌生态入口按此渲染) */
+var ECO_SUPPORTED_IDS = { codex: 1, cursor: 1, "claude-desktop": 1, grokbuild: 1, opencode: 1, hermes: 1, trae: 1 };
 function loadEco(force) {
   ECO_STATE.loading = true; render();
   var p = api.ecoPresets().then(function (v) {
@@ -824,6 +826,21 @@ function ecoCenterHtml() {
     + '<div class="sub" style="margin-top:8px">⚙ 每条 = 平台原生 MCP 配置里的一个条目;操作前自动备份,卸载可完整还原。已安装的 CLI 需重启后生效。</div>'
     + '</section>';
   /* 预设市场 */
+  var pending = ECO_STATE.pendingInstall
+    ? (ECO_STATE.presets || []).find(function (x) { return x.id === ECO_STATE.pendingInstall; })
+    : null;
+  var paramForm = "";
+  if (pending && pending.params && pending.params.length) {
+    var fields = pending.params.map(function (pm) {
+      return '<div class="f" style="grid-column:1/-1"><label>' + esc(pm.label) + (pm.required ? " *" : "") + '</label>'
+        + '<input class="mono" data-pk="' + esc(pm.key) + '" placeholder="' + esc(pm.placeholder || "") + '" value="' + esc(ECO_STATE.pendingParams[pm.key] || "") + '"></div>';
+    }).join("");
+    paramForm = '<section class="card" style="margin-top:12px"><h2>安装 ' + esc(pending.name) + ' · 需要参数</h2>'
+      + '<div class="grid2" style="margin-top:6px">' + fields + '</div>'
+      + '<div class="btn-row" style="margin-top:8px">'
+      + '<button class="btn primary" data-a="eco-param-do" data-id="' + esc(pending.id) + '">安装</button>'
+      + '<button class="btn ghost" data-a="eco-param-cancel">取消</button></div></section>';
+  }
   var cards = (ECO_STATE.presets || []).map(function (p) {
     var installed = ecoPresetInstalled(p.id);
     return '<div class="eco-card"><div class="ic">🔌</div><div style="min-width:0">'
@@ -833,6 +850,7 @@ function ecoCenterHtml() {
         : '<button class="eco-install" data-a="eco-install" data-id="' + esc(p.id) + '">点击安装</button>')
       + '</div>';
   }).join("");
+  html += paramForm;
   html += '<section class="card" style="margin-top:12px"><h2>MCP 预设市场</h2>'
     + '<div class="sub" style="margin:4px 0 10px">一键安装到当前平台(' + esc(agents.find(function (m) { return m.id === ECO_STATE.agent; }).name) + ');预设提炼自 cc-switch 与常用清单。</div>'
     + '<div class="eco-grid">' + (cards || '<span class="sub">暂无预设</span>') + '</div></section>';
@@ -851,10 +869,12 @@ function doEcoOp(op, name) {
     if (state.view === "eco") render();
   });
 }
-function doEcoInstall(presetId) {
+function doEcoInstall(presetId, params) {
   var p = (ECO_STATE.presets || []).find(function (x) { return x.id === presetId; });
   ECO_STATE.busy = presetId;
-  api.ecoOp(ECO_STATE.agent, { op: "install", presetId: presetId }).then(function (v) {
+  var body = { op: "install", presetId: presetId };
+  if (params) body.params = params;
+  api.ecoOp(ECO_STATE.agent, body).then(function (v) {
     ECO_STATE.data = v;
     var envNote = (p && p.needsEnv && p.needsEnv.length)
       ? ";该服务器需要 " + p.needsEnv.join(", ") + " 环境变量,已按空值安装,请稍后在平台配置中补填"
@@ -864,8 +884,18 @@ function doEcoInstall(presetId) {
     showToast(e.message || "安装失败", "error");
   }).finally(function () {
     ECO_STATE.busy = null;
+    ECO_STATE.pendingInstall = null;
+    ECO_STATE.pendingParams = {};
     if (state.view === "eco") render();
   });
+}
+
+/* 世界内嵌生态入口 strip:主通道卡下方一行,B 段按支持表渲染 */
+function ecoStripHtml(agent) {
+  if (!ECO_SUPPORTED_IDS[agent]) return "";
+  return '<div style="margin-top:12px;padding:10px 12px;background:rgba(80,200,130,.05);border:1px solid rgba(80,200,130,.25);border-radius:10px;display:flex;align-items:center;justify-content:space-between;gap:10px">'
+    + '<span style="font-size:12px;color:#A9E6C3">🌱 工具生态:该平台支持 MCP 服务器管理(生态中心)</span>'
+    + '<button class="btn ghost" data-a="eco-jump" data-g="' + esc(agent) + '">管理 MCP →</button></div>';
 }
 
 function historyHtml() {  if (state.agent === "hermes") {
@@ -1601,7 +1631,27 @@ document.addEventListener("click", function (ev) {
       if (ECO_STATE.agent !== t.dataset.g) { ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; loadEco(); }
       break;
     case "eco-tab": ECO_STATE.tab = t.dataset.g; render(); break;
-    case "eco-install": doEcoInstall(t.dataset.id); break;
+    case "eco-install": {
+      var pp = (ECO_STATE.presets || []).find(function (x) { return x.id === t.dataset.id; });
+      if (pp && pp.params && pp.params.length) {
+        ECO_STATE.pendingInstall = t.dataset.id;
+        ECO_STATE.pendingParams = {};
+        render();
+      } else doEcoInstall(t.dataset.id);
+      break;
+    }
+    case "eco-param-cancel": ECO_STATE.pendingInstall = null; ECO_STATE.pendingParams = {}; render(); break;
+    case "eco-param-do": {
+      var vals = {};
+      document.querySelectorAll("[data-pk]").forEach(function (inp) { vals[inp.dataset.pk] = inp.value.trim(); });
+      ECO_STATE.pendingParams = vals;
+      doEcoInstall(t.dataset.id, vals);
+      break;
+    }
+    case "eco-jump":
+      ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; ECO_STATE.pendingInstall = null;
+      state.view = "eco"; render(); loadEco();
+      break;
     case "eco-op": doEcoOp(t.dataset.op, t.dataset.id); break;
     case "accel": doAccel(t.dataset.m); break;
     case "user-menu": state.menuOpen = !state.menuOpen; renderTopAuth(); break;

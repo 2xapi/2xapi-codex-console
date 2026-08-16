@@ -1,6 +1,9 @@
-//! Cursor 生态 adapter:`~/.cursor/mcp.json`(JSON,整文件唯一键 mcpServers)。
+//! JSON 载体生态 adapter:B 段泛化,Cursor / TRAE / Claude Desktop 共用。
+//! - cursor:`~/.cursor/mcp.json`(mcpServers 段)
+//! - trae:`~/.trae/mcp.json`(mcpServers 段;E1 定案,与 Cursor 同构,docs.trae.ai 官方)
+//! - claude-desktop:`claude_desktop_config.json`(mcpServers 段;文件含用户其他键,只动本段)
 //! 读:不存在 → 空;parse 失败 → E_PARSE 拒碰(workbuddy 先例)。
-//! 写:读→改 mcpServers→pretty JSON 原子写,其余顶层键保留。
+//! 写:读→改段→pretty JSON 原子写,其余顶层键保留。
 
 use super::EcoStore;
 use serde_json::Value;
@@ -8,14 +11,20 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub struct JsonStore {
+    id: &'static str,
     path: PathBuf,
+    /// MCP 条目所在顶层键名(cursor/trae/claude-desktop 均为 mcpServers;opencode=mcp,另有转换,独立实现)
+    section: &'static str,
 }
 
 impl JsonStore {
     pub fn new(cursor_home: &Path) -> Self {
-        Self {
-            path: cursor_home.join(".cursor").join("mcp.json"),
-        }
+        Self::at("cursor", &cursor_home.join(".cursor").join("mcp.json"))
+    }
+
+    /// 通用构造(段名默认 mcpServers)。
+    pub fn at(id: &'static str, path: &Path) -> Self {
+        Self { id, path: path.to_path_buf(), section: "mcpServers" }
     }
 
     fn read_doc(&self) -> Result<serde_json::Map<String, Value>, super::OpError> {
@@ -50,7 +59,7 @@ impl JsonStore {
                 (
                     500,
                     "E_IO".to_string(),
-                    format!("创建 .cursor 目录失败: {e}"),
+                    format!("创建 {} 目录失败: {e}", self.path.display()),
                 )
             })?;
         }
@@ -66,13 +75,13 @@ impl JsonStore {
 
 impl EcoStore for JsonStore {
     fn id(&self) -> &'static str {
-        "cursor"
+        self.id
     }
 
     fn read(&self) -> Result<BTreeMap<String, Value>, super::OpError> {
         let doc = self.read_doc()?;
         let mut out = BTreeMap::new();
-        if let Some(servers) = doc.get("mcpServers").and_then(|v| v.as_object()) {
+        if let Some(servers) = doc.get(self.section).and_then(|v| v.as_object()) {
             for (k, v) in servers {
                 out.insert(k.clone(), v.clone());
             }
@@ -83,13 +92,13 @@ impl EcoStore for JsonStore {
     fn write(&self, servers: &BTreeMap<String, Value>) -> Result<(), super::OpError> {
         let mut doc = self.read_doc()?;
         if servers.is_empty() {
-            doc.remove("mcpServers");
+            doc.remove(self.section);
         } else {
             let mut m = serde_json::Map::new();
             for (k, v) in servers {
                 m.insert(k.clone(), v.clone());
             }
-            doc.insert("mcpServers".into(), Value::Object(m));
+            doc.insert(self.section.to_string(), Value::Object(m));
         }
         self.write_doc(&doc)
     }

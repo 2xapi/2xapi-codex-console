@@ -125,6 +125,14 @@ fn main() {
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default(),
         ),
+        // TRAE 生态管理(B 段):~/.trae 所在根(eco adapter join(".trae/mcp.json"))
+        trae_home: std::path::PathBuf::from(
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .unwrap_or_default(),
+        ),
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,

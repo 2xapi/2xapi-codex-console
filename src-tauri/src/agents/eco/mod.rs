@@ -1,15 +1,17 @@
-//! 生态管理(开发组·生态中心,A 段):平台世界的 MCP 服务器管理。
+//! 生态管理(开发组·生态中心,A+B 段):各平台的 MCP 服务器管理。
 //!
 //! 铁律照抄托管:叠加写入 · 零触碰已有(手动条目 409 拒写)· 备份先行 · 可还原。
 //! 来源标记走侧车登记表 `<codex_home>/eco-managed.json`(Console 写过的条目才登记,
 //! 登记表没有 = 用户手动添加,只读展示);「停用」语义 = 从平台配置移除 + 登记表留
-//! spec 标 enabled=false(启用时写回)——JSON/TOML 均无原生 disabled 字段,统一此策略。
+//! spec 标 enabled=false(启用时写回)——JSON/TOML/YAML 均无原生 disabled 字段,统一此策略。
 //!
-//! 支持平台独立于 agents 托管注册表(cursor 无托管世界也可管理生态):
-//! A 段 = codex(config.toml [mcp_servers]) + cursor(~/.cursor/mcp.json)。
+//! 支持平台独立于 agents 托管注册表(cursor/trae 无托管世界也可管理生态):
+//! A 段 = codex(config.toml)+cursor(mcp.json);B 段 = claude-desktop/grokbuild/opencode/hermes/trae。
 
 pub mod codex;
 pub mod cursor;
+pub mod hermes;
+pub mod opencode;
 
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -18,14 +20,36 @@ use std::path::{Path, PathBuf};
 pub type OpError = (u16, String, String);
 
 /// eco 支持平台表(id 规范化;顺序即前端平台 tab 顺序)。
-pub const SUPPORTED: &[&str] = &["codex", "cursor"];
+pub const SUPPORTED: &[&str] = &[
+    "codex",
+    "cursor",
+    "claude-desktop",
+    "grokbuild",
+    "opencode",
+    "hermes",
+    "trae",
+];
+
+/// 平台显示名(前端平台 tab;独立于托管注册表命名,含无托管世界的 cursor/trae)。
+pub fn display_name(agent: &str) -> &'static str {
+    match agent {
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "claude-desktop" => "Claude 桌面版",
+        "grokbuild" => "Grok Build",
+        "opencode" => "OpenCode",
+        "hermes" => "Hermes",
+        "trae" => "TRAE",
+        _ => "未知平台",
+    }
+}
 
 pub fn supported(agent: &str) -> Option<&'static str> {
     let norm = agent.trim().to_ascii_lowercase();
     SUPPORTED.iter().find(|a| **a == norm).copied()
 }
 
-/// 平台载体读写抽象:A 段两个实现(codex TOML / cursor JSON)。
+/// 平台载体读写抽象。
 /// read/write 只动 MCP 段,其余内容零触碰(由实现保证)。
 pub trait EcoStore {
     fn id(&self) -> &'static str;
@@ -384,15 +408,25 @@ pub fn uninstall(
 
 // ── MCP 预设市场 ──────────────────────────────────────────────
 // 预设数据从 cc-switch(mcpPresets.ts)提炼 + 演示 HTML 市场清单;
-// filesystem/sqlite 需装时填参数(路径/DB),留 B 段「装时填参」再上。
+// B 段新增 filesystem/sqlite(装时填参:args 里 $KEY 占位,前端弹参数表单)。
+
+/// 装时填参预设的参数声明。
+pub struct PresetParam {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub placeholder: &'static str,
+    pub required: bool,
+}
 
 pub struct Preset {
     pub id: &'static str,
     pub name: &'static str,
     pub desc: &'static str,
     pub command: &'static str,
+    /// 可含 $KEY 占位(装时由 params 替换)
     pub args: &'static [&'static str],
     pub needs_env: &'static [&'static str],
+    pub params: &'static [PresetParam],
 }
 
 pub const PRESETS: &[Preset] = &[
@@ -403,6 +437,7 @@ pub const PRESETS: &[Preset] = &[
         command: "npx",
         args: &["@playwright/mcp@latest"],
         needs_env: &[],
+        params: &[],
     },
     Preset {
         id: "github",
@@ -411,6 +446,7 @@ pub const PRESETS: &[Preset] = &[
         command: "npx",
         args: &["@modelcontextprotocol/server-github"],
         needs_env: &["GITHUB_TOKEN"],
+        params: &[],
     },
     Preset {
         id: "fetch",
@@ -419,6 +455,7 @@ pub const PRESETS: &[Preset] = &[
         command: "uvx",
         args: &["mcp-server-fetch"],
         needs_env: &[],
+        params: &[],
     },
     Preset {
         id: "context7",
@@ -427,6 +464,7 @@ pub const PRESETS: &[Preset] = &[
         command: "npx",
         args: &["-y", "@upstash/context7-mcp"],
         needs_env: &[],
+        params: &[],
     },
     Preset {
         id: "memory",
@@ -435,6 +473,7 @@ pub const PRESETS: &[Preset] = &[
         command: "npx",
         args: &["-y", "@modelcontextprotocol/server-memory"],
         needs_env: &[],
+        params: &[],
     },
     Preset {
         id: "sequentialthinking",
@@ -443,6 +482,35 @@ pub const PRESETS: &[Preset] = &[
         command: "npx",
         args: &["-y", "@modelcontextprotocol/server-sequentialthinking"],
         needs_env: &[],
+        params: &[],
+    },
+    Preset {
+        id: "filesystem",
+        name: "Filesystem",
+        desc: "受控目录文件读写(装时选目录)",
+        command: "npx",
+        args: &["-y", "@modelcontextprotocol/server-filesystem", "$DIR"],
+        needs_env: &[],
+        params: &[PresetParam {
+            key: "DIR",
+            label: "允许访问的目录(绝对路径)",
+            placeholder: "/Users/you/Documents",
+            required: true,
+        }],
+    },
+    Preset {
+        id: "sqlite",
+        name: "SQLite",
+        desc: "数据库查询浏览(装时选库文件)",
+        command: "uvx",
+        args: &["mcp-server-sqlite", "--db-path", "$DB"],
+        needs_env: &[],
+        params: &[PresetParam {
+            key: "DB",
+            label: "数据库文件路径(不存在会创建)",
+            placeholder: "/Users/you/data.db",
+            required: true,
+        }],
     },
 ];
 
@@ -459,24 +527,45 @@ pub fn presets_json() -> Value {
                     "id": p.id, "name": p.name, "desc": p.desc,
                     "command": p.command, "args": p.args,
                     "needsEnv": p.needs_env,
+                    "params": p.params.iter().map(|x| json!({
+                        "key": x.key, "label": x.label,
+                        "placeholder": x.placeholder, "required": x.required,
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>(),
         "agents": SUPPORTED
             .iter()
-            .map(|a| json!({ "id": a, "name": if *a == "codex" { "Codex" } else { "Cursor" } }))
+            .map(|a| json!({ "id": a, "name": display_name(a) }))
             .collect::<Vec<_>>(),
     })
 }
 
-/// 按预设生成安装 spec(needs_env 条目 env 值留空占位,前端提示填写)。
-pub fn preset_spec(p: &Preset) -> Value {
+/// 按预设生成安装 spec。params:前端提交的装时参数(装时填参预设);
+/// required 缺失 → 400;$KEY 占位替换进 args。needs_env 条目 env 值留空占位,前端提示填写。
+pub fn preset_spec(p: &Preset, params: Option<&Value>) -> Result<Value, OpError> {
     let mut obj = Map::new();
     obj.insert("command".into(), json!(p.command));
-    obj.insert(
-        "args".into(),
-        Value::Array(p.args.iter().map(|a| json!(a)).collect()),
-    );
+    let mut args: Vec<String> = p.args.iter().map(|a| a.to_string()).collect();
+    for param in p.params {
+        let val = params
+            .and_then(|m| m.get(param.key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if param.required && val.is_empty() {
+            return Err((
+                400,
+                "E_ECO_PARAM_REQUIRED".into(),
+                format!("「{}」需要填写:{}", p.name, param.label),
+            ));
+        }
+        for a in args.iter_mut() {
+            *a = a.replace(&format!("${}", param.key), &val);
+        }
+    }
+    obj.insert("args".into(), Value::Array(args.into_iter().map(|a| json!(a)).collect()));
     if !p.needs_env.is_empty() {
         let mut env = Map::new();
         for k in p.needs_env {
@@ -484,7 +573,7 @@ pub fn preset_spec(p: &Preset) -> Value {
         }
         obj.insert("env".into(), Value::Object(env));
     }
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 #[cfg(test)]
@@ -629,25 +718,27 @@ mod tests {
     fn presets_shape_and_spec() {
         let v = presets_json();
         let presets = v["presets"].as_array().unwrap();
-        assert_eq!(presets.len(), 6);
-        assert_eq!(v["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(presets.len(), 8);
+
         let gh = find_preset("github").unwrap();
         assert_eq!(gh.needs_env, &["GITHUB_TOKEN"]);
-        let spec = preset_spec(gh);
+        let spec = preset_spec(gh, None).unwrap();
         assert_eq!(spec["env"]["GITHUB_TOKEN"], "");
         let mem = find_preset("memory").unwrap();
-        assert!(preset_spec(mem).get("env").is_none());
-        assert!(
-            find_preset("filesystem").is_none(),
-            "需装时填参的预设不在 A 期市场"
-        );
+        assert!(preset_spec(mem, None).unwrap().get("env").is_none());
+        // 装时填参:required 缺失 400;参数替换进 args
+        let fs_p = find_preset("filesystem").unwrap();
+        assert!(preset_spec(fs_p, None).is_err(), "filesystem 无参数应 400");
+        let spec = preset_spec(fs_p, Some(&serde_json::json!({ "DIR": "/tmp/docs" }))).unwrap();
+        assert_eq!(spec["args"][2], "/tmp/docs", "$DIR 占位应被替换");
+        assert_eq!(v["agents"].as_array().unwrap().len(), 7, "B 段支持 7 平台");
     }
 
     #[test]
     fn supported_table_and_summary() {
         assert_eq!(supported("Codex"), Some("codex"));
         assert_eq!(supported("cursor"), Some("cursor"));
-        assert_eq!(supported("hermes"), None);
+        assert_eq!(supported("gemini"), None, "gemini 无 MCP 载体,B 段未入编");
         assert_eq!(
             spec_summary(&json!({ "command": "npx", "args": ["a", "b"] })),
             "npx a b"
@@ -698,7 +789,7 @@ mod real {
             &tmp,
             &backup_dir,
             "fetch",
-            &preset_spec(find_preset("fetch").unwrap()),
+            &preset_spec(find_preset("fetch").unwrap(), None).unwrap(),
         )
         .unwrap();
         let after = store.read().unwrap();
@@ -770,7 +861,7 @@ mod real {
             &home.join(".codex"),
             &cbackup,
             "playwright",
-            &preset_spec(find_preset("playwright").unwrap()),
+            &preset_spec(find_preset("playwright").unwrap(), None).unwrap(),
         )
         .unwrap();
         let raw = std::fs::read_to_string(home.join(".cursor").join("mcp.json")).unwrap();

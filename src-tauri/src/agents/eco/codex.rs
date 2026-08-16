@@ -10,12 +10,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub struct TomlStore {
+    id: &'static str,
     path: PathBuf,
 }
 
 impl TomlStore {
     pub fn new(config_path: &Path) -> Self {
         Self {
+            id: "codex",
+            path: config_path.to_path_buf(),
+        }
+    }
+
+    /// 通用构造:B 段 grok 复用(~/.grok/config.toml [mcp_servers] 同段名)。
+    pub fn at(id: &'static str, config_path: &Path) -> Self {
+        Self {
+            id,
             path: config_path.to_path_buf(),
         }
     }
@@ -113,7 +123,7 @@ impl TomlStore {
 
 impl EcoStore for TomlStore {
     fn id(&self) -> &'static str {
-        "codex"
+        self.id
     }
 
     fn read(&self) -> Result<BTreeMap<String, Value>, super::OpError> {
