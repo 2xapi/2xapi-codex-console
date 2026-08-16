@@ -709,6 +709,8 @@ function openEdit(id) {
   document.getElementById("eKey").value = "";
   document.getElementById("eKey").placeholder = state.edit.isNew ? (isC ? "sk-ant-..." : "sk-...") : (p.apiKeyMasked ? "•••• 未改则留空" : (isC ? "sk-ant-..." : "sk-..."));
   document.getElementById("eModel").value = state.edit.model;
+  var wSel = document.getElementById("eWire");
+  if (wSel) wSel.value = (["responses","chat_completions","anthropic"].indexOf(state.edit.wireApi) >= 0) ? state.edit.wireApi : "auto";
   renderModelRows();
   document.getElementById("editMask").style.display = "";
 }
@@ -748,7 +750,7 @@ async function doSaveEdit() {
   var body = {
     name: d.name, accessMode: "pure_api", model: model,
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
-    wireApi: state.edit.wireApi, models: models,
+    wireApi: (function () { var w = document.getElementById("eWire"); var v = w ? w.value : "auto"; return v === "auto" ? state.edit.wireApi : v; })(), models: models,
     proxyUrl: "", timeoutSecs: null, notes: "", reasoning_levels: [],
     agent: state.agent,
   };

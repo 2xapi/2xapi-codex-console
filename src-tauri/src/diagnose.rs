@@ -123,6 +123,10 @@ async fn real_request(p: &Provider, errors: &mut Vec<DiagError>) -> bool {
             format!("{base}/chat/completions"),
             json!({ "model": p.model, "messages": [{ "role": "user", "content": "ping" }], "max_tokens": 16 }),
         ),
+        WireApi::Anthropic => (
+            format!("{base}/v1/messages"),
+            json!({ "model": p.model, "max_tokens": 16, "messages": [{ "role": "user", "content": "ping" }] }),
+        ),
     };
     match client.post(&url).bearer_auth(&p.api_key).json(&body).send().await {
         Ok(r) if r.status().is_success() => true,
