@@ -132,14 +132,21 @@
     },
     agentUnhost: async (agent) => {
       const resp = await fetch("/api/desktop/" + agent + "/unhost", {
-        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       });
-      const payload = await resp.json().catch(() => ({}));
-      if (resp.ok && payload && payload.ok === true) return payload.data;
-      const err = new Error((payload && payload.message) || "还原失败 (" + resp.status + ")");
-      err.code = (payload && payload.error) || "E_UNKNOWN";
-      err.status = resp.status;
-      throw err;
+      const v = await resp.json().catch(() => null);
+      if (!resp.ok || (v && v.ok === false)) throw new Error((v && v.error && v.error.message) || ("HTTP " + resp.status));
+      return v && v.data !== undefined ? v.data : v;
+    },
+    // 注入式启动命令(gemini 等;返回 {command, env, hint...},Key 为占位)
+    agentStart: async (agent, way, providerId) => {
+      const resp = await fetch("/api/desktop/" + agent + "/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ way: way || "gateway", providerId: providerId || "" }),
+      });
+      const v = await resp.json().catch(() => null);
+      if (!resp.ok || (v && v.ok === false)) throw new Error((v && v.error && v.error.message) || ("HTTP " + resp.status));
+      return v && v.data !== undefined ? v.data : v;
     },
 
     // ── Claude 注入式托管(Claude 批次:后端返回注入信息,前端展示/复制;停用=前端本地态)──

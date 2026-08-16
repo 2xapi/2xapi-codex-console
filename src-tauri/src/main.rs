@@ -94,6 +94,14 @@ fn main() {
                 .unwrap_or_default();
             std::path::PathBuf::from(home).join(".openclaw")
         },
+        // Claude Desktop(macOS):~/Library/Application Support(Claude/ 与 Claude-3p/ 的父;
+        // Windows 的 APPDATA 路径未实证,首版 macOS 为主)
+        cd_home: {
+            let home = std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .unwrap_or_default();
+            std::path::PathBuf::from(home).join("Library").join("Application Support")
+        },
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,

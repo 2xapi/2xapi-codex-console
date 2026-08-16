@@ -250,6 +250,7 @@ function renderContent() {
   if (state.view === "history") c.innerHTML = historyHtml();
   else c.innerHTML = (state.agent === "claude") ? claudeDashHtml()
     : (state.agent === "hermes") ? hermesDashHtml()
+    : GW_AGENTS[state.agent] ? genericDashHtml(state.agent)
     : dashHtml();
 }
 function renderTopAuth() {
@@ -605,6 +606,82 @@ function diagCard(d) {
 }
 
 /* ── 主卡 dash(Hermes:叠加式托管,条目写入 ~/.hermes/config.yaml;指针受控切换)── */
+/* ── 通用平台世界(「全部做好」批次):gemini/grokbuild/opencode/openclaw/claude-desktop/workbuddy
+ * 共享一个数据驱动的世界视图;后端契约=泛化路由 state/host/unhost(叠加或受控段托管,按 adapter 语义)。── */
+var GW_META = {
+  "gemini":       { label: "Gemini CLI", emoji: "✦", gw: "127.0.0.1:8787(生成协议转换)", overlay: "托管写入 ~/.gemini(.env 占位 Key + 认证类型),还原恢复快照;启动可注入进程环境变量", start: true },
+  "grokbuild":    { label: "Grok Build", emoji: "𝕏", gw: "127.0.0.1:8787/grokbuild", overlay: "受控段写入 ~/.grok/config.toml([models]/[model.*]),已有其他段零触碰;还原按快照受控恢复" },
+  "opencode":     { label: "OpenCode", emoji: "◐", gw: "127.0.0.1:8787/opencode", overlay: "叠加条目写入 opencode.json(provider.2xapi-gateway),已有供应商与插件零触碰;默认模型仅空缺时才接" },
+  "openclaw":     { label: "OpenClaw", emoji: "🐾", gw: "127.0.0.1:8787/openclaw", overlay: "叠加条目写入 openclaw.json(models.providers),OpenClaw 自管理的派生注册表不碰;默认模型仅空缺时才接" },
+  "claude-desktop": { label: "Claude 桌面版", emoji: "◇", gw: "127.0.0.1:8787/claude-desktop", overlay: "官方原生 3p 网关 profile(配置库写入);改配置后需重启 Claude Desktop 生效", restart: true },
+  "workbuddy":    { label: "WorkBuddy / CodeBuddy", emoji: "◆", gw: "127.0.0.1:8787/workbuddy", overlay: "叠加条目写入 models.json(双载体同步),已有条目零触碰" }
+};
+var GW_AGENTS = {}; Object.keys(GW_META).forEach(function (k) { GW_AGENTS[k] = 1; });
+function gwState(agent) { return (state.gw && state.gw[agent]) || null; }
+function gwHosted(agent) { var s = gwState(agent); return !!(s && s.hosting); }
+
+function refreshGwState(agent) {
+  state.gw = state.gw || {};
+  return api.agentState(agent).then(function (v) { state.gw[agent] = v; }).catch(function () { state.gw[agent] = null; });
+}
+
+function genericDashHtml(agent) {
+  var meta = GW_META[agent] || { label: agent, emoji: "◆", gw: "127.0.0.1:8787/" + agent, overlay: "" };
+  var mine = providersFor(agent);
+  if (!mine.length) {
+    return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
+      + '<div style="font-size:30px">' + meta.emoji + '</div>'
+      + '<h2 style="font-size:15px">开始使用 ' + esc(meta.label) + '</h2>'
+      + '<div class="sub" style="max-width:380px">还没有 ' + esc(meta.label) + ' 供应商。' + (loggedIn() ? '点「导入 Key」自动生成供应商,' : '登录 2xapi 后一键导入 Key,') + '或手动添加一个中转站。</div>'
+      + '<div class="btn-row" style="justify-content:center">'
+      + (loggedIn() ? '<button class="btn primary" data-a="import-keys">⇭ 导入 Key</button>' : '<button class="btn primary" data-a="login">登录 2xapi</button>')
+      + '<button class="btn" data-a="new">＋ 新建供应商</button></div></section>';
+  }
+  var hosted = gwHosted(agent);
+  var acc = state.accel || {};
+  var accelOn = (acc.mode || "off") !== "off";
+  var hp = hosted ? (lineOf(state.selId) || mine[0]) : null;
+  var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
+  var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
+  var r, note;
+  if (!hosted) {
+    r = st("var(--c-official)", meta.label, "官方/自有配置") + lk("var(--c-official)") + st("var(--c-official)", "直连", "未托管");
+    note = '当前:按自有配置直连 · 选一个供应商并「开启托管」即可走中转(' + esc(meta.overlay) + ')';
+  } else if (!accelOn) {
+    r = st("var(--c-gw)", meta.label, "托管条目 2xapi-gateway") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", esc(meta.gw)) + lk("var(--c-gw)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关(加速已关,直发上游) · 托管配置零真 Key,Key 由网关注入';
+  } else {
+    r = st("var(--c-gw)", meta.label, "托管条目 2xapi-gateway") + lk("var(--c-gw)") + st("var(--c-gw)", "网关", esc(meta.gw))
+      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
+    note = '通路:网关 + 加速(线路自动择优,失败自动切换) · 托管配置零真 Key,Key 由网关注入';
+  }
+  var selVal = hp ? hp.id : (state.selId || (mine[0] && mine[0].id));
+  var opts = mine.map(function (x) {
+    return '<option value="' + esc(x.id) + '"' + (x.id === selVal ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
+  }).join("");
+
+  var html = "";
+  var p = lineOf(selVal);
+  if (p) html += providerDetailCard(p);
+  html += '<section class="card"><h2>' + esc(meta.label) + ' · 主通道</h2>'
+    + '<div class="detect">'
+    + (hosted ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">已托管</span>' : '<span class="tag">未托管</span>')
+    + (meta.restart && hosted ? '<span class="tag" style="border-color:#FF9E57;color:#FF9E57">重启客户端后生效</span>' : '')
+    + '</div>'
+    + '<div class="route">' + r + '</div>'
+    + '<div class="route-mode"><span class="k">●</span> ' + note + '</div>'
+    + '<div class="grid2">'
+    + '<div class="f"><label>供应商(走哪家中转)</label><select id="provSel" data-a="prov">' + opts + '</select></div>'
+    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">' + (hosted ? "网关 · 托管中" : "未托管") + '</span></div></div>'
+    + '</div>'
+    + '<div class="btn-row">'
+    + (hosted ? '<button class="btn" data-a="unhost"' + (state.busy === "unhost" ? " disabled" : "") + '>还原官方</button>'
+      : '<button class="btn primary" data-a="host"' + (state.busy === "host" ? " disabled" : "") + '>开启托管</button>')
+    + (meta.start ? '<button class="btn" data-a="gw-start"' + (state.busy === "gw-start" ? " disabled" : "") + '>⌘ 生成启动命令</button>' : '')
+    + '</div></section>';
+  return html;
+}
+
 function hermesDashHtml() {
   var mine = providersFor("hermes");
   if (!mine.length) {
@@ -890,6 +967,15 @@ async function doHost(providerId, way) {
       showToast(r && r.pointerSwitched === false
         ? "条目已写入;Hermes 当前默认模型指向你的第三方供应商,未自动切换(可在 hermes 内自选)"
         : "Hermes 已托管走中转(叠加条目已写入,已自动备份,可随时还原)", "ok");
+    } else if (GW_AGENTS[state.agent]) {
+      /* 通用平台世界:固定 gateway 通路,走泛化路由 */
+      var g = await api.agentHost(state.agent, providerId, "gateway");
+      await refreshGwState(state.agent);
+      state.selId = providerId;
+      var restartNote = GW_META[state.agent] && GW_META[state.agent].restart ? "(重启客户端后生效)" : "";
+      showToast(g && g.suggested
+        ? "条目已写入;当前默认模型未自动切换(可在客户端内自选)" + restartNote
+        : "已托管走中转(可随时还原)" + restartNote, "ok");
     } else {
       var w = (way === "direct" || way === "gateway") ? way : codexWayNow();
       var r2 = await api.desktopHost(providerId, w);
@@ -915,6 +1001,10 @@ async function doUnhost() {
       var r = await api.agentUnhost("hermes");
       await refreshHermesState();
       showToast(r && r.restored ? "已还原(条目已移除,指针已恢复;可从备份目录恢复)" : "当前未托管,无需还原", "ok");
+    } else if (GW_AGENTS[state.agent]) {
+      var g2 = await api.agentUnhost(state.agent);
+      await refreshGwState(state.agent);
+      showToast(g2 && g2.restored ? "已还原" + (GW_META[state.agent] && GW_META[state.agent].restart ? "(重启客户端后生效)" : "") : "当前未托管,无需还原", "ok");
     } else {
       var r2 = await api.desktopUnhost();
       await refreshAll();
@@ -1320,6 +1410,7 @@ document.addEventListener("click", function (ev) {
       render();
       if (state.agent === "claude") refreshClaudeState().then(function () { render(); });
       else if (state.agent === "hermes") refreshHermesState().then(function () { render(); });
+      else if (GW_AGENTS[state.agent]) refreshGwState(state.agent).then(function () { render(); });
       else state.claude = null;
       break;
     case "view":
@@ -1428,6 +1519,20 @@ document.addEventListener("click", function (ev) {
         .catch(function () { showToast("复制失败,请手动复制命令", "error"); });
       break;
     }
+    case "gw-start":
+      (async function () {
+        state.busy = "gw-start"; render();
+        try {
+          var pid = state.selId || (providersFor(state.agent)[0] || {}).id;
+          var r = await api.agentStart(state.agent, "gateway", pid);
+          if (r && r.command) {
+            try { await navigator.clipboard.writeText(r.command); } catch (e) { /* 剪贴板不可用时仅提示 */ }
+            showToast("启动命令已复制,粘贴到终端运行(命令中 Key 为占位,真实 Key 在网关)", "ok");
+          } else showToast((r && (r.hint || r.note)) || "已生成", "ok");
+        } catch (e) { showToast(e.message, "error"); }
+        state.busy = null; render();
+      })();
+      break;
     case "claude-start":
       askConfirm("启动 Claude Code?", "注入环境变量(ANTHROPIC_BASE_URL 等)并生成注入式启动命令,不动 ~/.claude 配置。").then(function (yes) {
         if (yes) doClaudeStart(t.dataset.id || state.selId);
@@ -1492,37 +1597,45 @@ document.addEventListener("input", function (ev) {
 
 /* ── 启动 ── */
 try { state.balShow = localStorage.getItem("2xapi.balShow") !== "off"; } catch (e) {}
-/* ── 多平台导航数据驱动(A 阶段,方案 §2.3 + D3):从注册表拉取未上线平台,在最后一个静态平台按钮后
- * 插入「即将上线」占位按钮。图标:有可靠品牌图形的用品牌灰标(gemini=四角星、claude-desktop=Anthropic
- * 星芒),其余用首字母标(品牌 logo 原文由各平台前端批次从 simple-icons 补齐);第三方 logo 仅导航识别。
- * codex/claude/hermes 真实按钮保留静态 DOM 零改动;拉取失败或为空 → 维持现状。幂等:只注入一次。── */
+/* ── 多平台导航数据驱动(「全部做好」批次):非静态平台按注册表注入——frontend_ready=true
+ * 渲染可点按钮(品牌标/首字母彩色标,点击切换世界),false 渲染灰标「即将上线」。
+ * codex/claude/hermes 真实按钮保留静态 DOM;拉取失败维持现状。幂等:只注入一次。── */
 var AGENT_NAV_ICON = {
   // Gemini 四角星(几何构造,近似品牌视觉)
   gemini: '<svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M12 1l2.7 8.3L23 12l-8.3 2.7L12 23l-2.7-8.3L1 12l8.3-2.7z"/></svg>',
   // Anthropic 星芒(与 claude 按钮同 path,导航识别用)
   "claude-desktop": '<svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
 };
-function injectUpcomingAgents() {
+var GW_NAV_COLOR = {
+  gemini: "#5B9BFF", grokbuild: "#C9CDD4", opencode: "#E06B9A", openclaw: "#FF9E57",
+  "claude-desktop": "#D9A066", workbuddy: "#6EA8FF"
+};
+function injectNavAgents() {
   return api.agents().then(function (reg) {
-    var upcoming = ((reg && reg.agents) || []).filter(function (m) { return !m.frontend_ready; });
-    var statics = document.querySelectorAll('.nav .nav-btn.agent');
-    var anchor = statics.length ? statics[statics.length - 1] : null;
-    if (!anchor || !upcoming.length || anchor.dataset.upcomingDone) return;
-    anchor.dataset.upcomingDone = "1";
-    var html = upcoming.map(function (m) {
+    var statics = Array.prototype.map.call(document.querySelectorAll('.nav .nav-btn.agent'), function (b) { return b.dataset.g; });
+    var anchor = document.querySelectorAll('.nav .nav-btn.agent');
+    anchor = anchor.length ? anchor[anchor.length - 1] : null;
+    if (!anchor || anchor.dataset.navInjected) return;
+    var rest = ((reg && reg.agents) || []).filter(function (m) { return statics.indexOf(m.id) < 0; });
+    if (!rest.length) return;
+    anchor.dataset.navInjected = "1";
+    var html = rest.map(function (m) {
       var icon = AGENT_NAV_ICON[m.id];
-      var mark = icon
-        ? '<span style="display:inline-flex;width:19px;height:19px;color:#8a8f98">' + icon + '</span>'
-        : (function (g) {
-            return '<span style="display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;font-size:11px;font-weight:600;color:#8a8f98">' + esc(g) + '</span>';
-          })((m.name || "?").trim().charAt(0).toUpperCase());
+      if (m.frontend_ready) {
+        var color = GW_NAV_COLOR[m.id] || "#9CB4DE";
+        var mark = icon
+          ? '<span style="display:inline-flex;width:19px;height:19px;color:' + color + '">' + icon + '</span>'
+          : '<span style="display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;font-size:11px;font-weight:700;color:' + color + '">' + esc((m.name || "?").trim().charAt(0).toUpperCase()) + '</span>';
+        return '<button class="nav-btn agent" style="--ac:' + color + '" data-a="agent" data-g="' + esc(m.id) + '" title="' + esc(m.name) + '">'
+          + mark + '<span class="tip">' + esc(m.tip || m.name) + '</span></button>';
+      }
+      var g = (m.name || "?").trim().charAt(0).toUpperCase();
+      var grey = '<span style="display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;font-size:11px;font-weight:600;color:#8a8f98">' + esc(g) + '</span>';
       return '<button class="nav-btn" disabled style="--ac:#8a8f98" title="' + esc(m.name) + '">'
-        + mark
-        + '<span class="tip">' + esc(m.tip || ((m.name || "") + "(即将上线)")) + '</span>'
-        + '</button>';
+        + grey + '<span class="tip">' + esc(m.tip || ((m.name || "") + "(即将上线)")) + '</span></button>';
     }).join("");
     anchor.insertAdjacentHTML("afterend", html);
   }).catch(function (e) { console.warn("agents 注册表拉取失败,维持静态导航", e); });
 }
-injectUpcomingAgents();
+injectNavAgents();
 refreshAll().then(render).catch(function (e) { console.error(e); render(); });

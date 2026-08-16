@@ -7,6 +7,7 @@
 //! 注册表即产品事实源:前端导航(D3 决策「A 后一次全亮,未实现标即将上线」)与
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
 
+pub mod claude_desktop;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;
@@ -59,40 +60,36 @@ static REGISTRY: &[AgentMeta] = &[
     AgentMeta {
         id: "gemini",
         name: "Gemini CLI",
-        tip: "Gemini CLI(即将上线)",
-        // 后端已并入 main(阶段 C 转换器+adapter);前端世界微批次交付时 frontend_ready 翻 true
+        tip: "Gemini CLI(生成协议转换)",
         available: true,
-        frontend_ready: false,
+        frontend_ready: true,
         egress: "gemini",
         hosting: "config",
     },
     AgentMeta {
         id: "grokbuild",
         name: "Grok Build",
-        tip: "Grok Build(即将上线)",
-        // 配置引擎+接线已并入(本批);前端世界批次交付时 frontend_ready 翻 true
+        tip: "Grok Build(TOML 托管)",
         available: true,
-        frontend_ready: false,
+        frontend_ready: true,
         egress: "chat",
         hosting: "config",
     },
     AgentMeta {
         id: "opencode",
         name: "OpenCode",
-        tip: "OpenCode(即将上线)",
-        // adapter 已并入(叠加写 opencode.json,侦察实证全闭环);前端世界批次交付时 frontend_ready 翻 true
+        tip: "OpenCode(叠加条目)",
         available: true,
-        frontend_ready: false,
+        frontend_ready: true,
         egress: "chat",
         hosting: "config",
     },
     AgentMeta {
         id: "openclaw",
         name: "OpenClaw",
-        tip: "OpenClaw(即将上线)",
-        // adapter 已并入(叠加写 openclaw.json,JSON5 含注释时拒绝写入并提示);前端批次交付时翻
+        tip: "OpenClaw(叠加条目)",
         available: true,
-        frontend_ready: false,
+        frontend_ready: true,
         egress: "anthropic",
         hosting: "config",
     },
@@ -108,19 +105,18 @@ static REGISTRY: &[AgentMeta] = &[
     AgentMeta {
         id: "claude-desktop",
         name: "Claude 桌面版",
-        tip: "Claude Desktop(即将上线)",
-        available: false,
-        frontend_ready: false,
+        tip: "Claude Desktop(3p 网关)",
+        available: true,
+        frontend_ready: true,
         egress: "anthropic",
         hosting: "config",
     },
     AgentMeta {
         id: "workbuddy",
         name: "WorkBuddy",
-        tip: "WorkBuddy / CodeBuddy(即将上线)",
-        // 后端已并入 main(双载体叠加写);前端世界批次交付时 frontend_ready 翻 true
+        tip: "WorkBuddy / CodeBuddy",
         available: true,
-        frontend_ready: false,
+        frontend_ready: true,
         egress: "chat",
         hosting: "config",
     },
@@ -187,15 +183,18 @@ mod tests {
     fn supported_ids_are_backend_merged() {
         assert_eq!(
             supported_ids(),
-            vec!["codex", "claude", "gemini", "grokbuild", "opencode", "openclaw", "hermes", "workbuddy"]
+            vec!["codex", "claude", "gemini", "grokbuild", "opencode", "openclaw", "hermes", "claude-desktop", "workbuddy"]
         );
     }
 
-    /// 前端世界就绪 = 可点亮导航:恰为 codex/claude/hermes(gemini/workbuddy 后端先行、前端未交付)。
+    /// 前端世界满编:九平台全部可点亮(「全部做好」批次交付后)。
     #[test]
     fn frontend_ready_platforms() {
         let ready: Vec<&str> = registry().filter(|m| m.frontend_ready).map(|m| m.id).collect();
-        assert_eq!(ready, vec!["codex", "claude", "hermes"]);
+        assert_eq!(
+            ready,
+            vec!["codex", "claude", "gemini", "grokbuild", "opencode", "openclaw", "hermes", "claude-desktop", "workbuddy"]
+        );
     }
 
     /// find 大小写不敏感;未注册 id 返回 None(泛化路由据此 404)。

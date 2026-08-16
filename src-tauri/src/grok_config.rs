@@ -274,7 +274,7 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
 pub fn build_hosted_toml(current_text: &str, provider: &Provider, way: &str) -> Result<String, String> {
     let (base_url, api_key, api_backend) = match way {
         "gateway" => (
-            crate::config::GATEWAY_BASE_URL.to_string(),
+            format!("{}/grokbuild", crate::config::GATEWAY_BASE_URL),
             GATEWAY_KEY_PLACEHOLDER.to_string(),
             DEFAULT_API_BACKEND.to_string(),
         ),
@@ -347,7 +347,7 @@ pub fn detect_hosting(grok_config_path: &Path) -> Value {
     if cfg.profile != MANAGED_PROFILE {
         return Value::Null;
     }
-    let way = if cfg.base_url.trim_end_matches('/') == crate::config::GATEWAY_BASE_URL {
+    let way = if cfg.base_url.trim_end_matches('/').starts_with(crate::config::GATEWAY_BASE_URL) {
         "gateway"
     } else {
         "direct"
@@ -703,7 +703,7 @@ context_window = 500000
         // gateway:零 Key 契约(网关地址 + 占位),api_backend 恒 responses
         let gateway = build_hosted_toml("", &p, "gateway").unwrap();
         validate_config(&gateway).expect("生成的网关配置必须过强校验");
-        assert!(gateway.contains(&format!("base_url = \"{}\"", crate::config::GATEWAY_BASE_URL)));
+        assert!(gateway.contains(&format!("base_url = \"{}/grokbuild\"", crate::config::GATEWAY_BASE_URL)));
         assert!(gateway.contains(&format!("api_key = \"{GATEWAY_KEY_PLACEHOLDER}\"")));
         assert!(gateway.contains("api_backend = \"responses\""));
         assert!(gateway.contains("context_window = 500000"));

@@ -50,6 +50,8 @@ pub struct AppState {
     pub oc_home: PathBuf,
     /// openclaw 配置根(~/.openclaw;adapter 内 join("openclaw.json");测试传 tempdir)。
     pub oclaw_home: PathBuf,
+    /// Claude Desktop 配置父目录(Application Support 根;adapter 内 join("Claude")/"Claude-3p";测试传 tempdir)。
+    pub cd_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -85,6 +87,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/opencode/chat/completions", post(crate::gateway::proxy_opencode_chat))
         .route("/openclaw/v1/chat/completions", post(crate::gateway::proxy_openclaw_chat))
         .route("/openclaw/chat/completions", post(crate::gateway::proxy_openclaw_chat))
+        // Grok Build 入口(responses 协议)/ WorkBuddy 入口(chat 完整 URL 直指)
+        .route("/grokbuild/responses", post(crate::gateway::proxy_grokbuild_responses))
+        .route("/grokbuild/v1/responses", post(crate::gateway::proxy_grokbuild_responses))
+        .route("/workbuddy/v1/chat/completions", post(crate::gateway::proxy_workbuddy_chat))
+        .route("/workbuddy/chat/completions", post(crate::gateway::proxy_workbuddy_chat))
+        // Claude Desktop 入口(阶段 D;3p gateway baseUrl=网关+/claude-desktop,app 追加 /v1/messages)
+        .route("/claude-desktop/v1/messages", post(crate::gateway::proxy_claude_desktop_messages))
+        .route("/claude-desktop/messages", post(crate::gateway::proxy_claude_desktop_messages))
         // Gemini 入口(多平台阶段 C):段内冒号无特殊含义,`gemini-2.5-flash:generateContent` 整段捕获
         .route("/v1beta/models/:model_action", post(crate::gateway::proxy_gemini))
         // --- Health & session ---
@@ -943,6 +953,7 @@ mod tests {
             grok_home: PathBuf::from("/tmp/2xapi-m0-grok-home"),
             oc_home: PathBuf::from("/tmp/2xapi-m0-oc-home"),
             oclaw_home: PathBuf::from("/tmp/2xapi-m0-oclaw-home"),
+            cd_home: PathBuf::from("/tmp/2xapi-m0-cd-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1148,17 +1159,8 @@ mod tests {
             .unwrap();
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
-        // 501 样本须选「恒未实现」平台:B 阶段八平台已全部接入,唯一剩 claude-desktop(D 阶段);
-        // 它实现时须同步换样本(教训:gemini/grokbuild/opencode 样本先后被实现打烂过三次)
-        let soon = app
-            .clone()
-            .oneshot(Request::builder().uri("/api/desktop/claude-desktop/state").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(soon.status(), StatusCode::NOT_IMPLEMENTED);
-        let sb = axum::body::to_bytes(soon.into_body(), usize::MAX).await.unwrap();
-        let sv: Value = serde_json::from_slice(&sb).unwrap();
-        assert_eq!(sv["error"], "E_AGENT_NOT_IMPLEMENTED");
+        // 501 断言已移除:九平台 available 满编后 E_AGENT_NOT_IMPLEMENTED 无触发者
+        //(reject_agent 保留该分支供未来新平台灰度期使用;未知平台 404 断言仍在上方)
 
         let nohost = app
             .clone()
@@ -1240,6 +1242,7 @@ mod tests {
             grok_home: root.join("grok"),
             oc_home: root.join("ochome"),
             oclaw_home: root.join("oclaw"),
+            cd_home: root.join("cdsupport"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1421,6 +1424,57 @@ mod tests {
                 .body(Body::from(serde_json::json!({"providerId": pid, "way": "gateway"}).to_string())).unwrap(),
         ).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// claude-desktop 泛化路由 e2e:建供应商 → host 写 3p 四件套(部署模式×2+profile+_meta) → state → unhost 还原(隔离 cd_home)
+    #[tokio::test]
+    async fn claude_desktop_routes_e2e() {
+        let (state, root) = unique_state("cd-e2e");
+        let app = build_router(state.clone());
+        let created = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/providers")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"CdT","agent":"claude-desktop","baseUrl":"https://gw.example.com","apiKey":"sk-cd-test","model":"claude-sonnet-5"}"#)).unwrap(),
+        ).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK, "agent=claude-desktop 供应商应可建");
+        let cv = body_json(created).await;
+        let pid = cv["data"]["id"].as_str().unwrap().to_string();
+
+        let hosted = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/desktop/claude-desktop/host")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"providerId": pid, "way": "gateway"}).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(hosted.status(), StatusCode::OK);
+        let hv = body_json(hosted).await;
+        assert_eq!(hv["data"]["hosted"], Value::Bool(true));
+
+        let support = root.join("cdsupport");
+        let main_cfg: Value = serde_json::from_str(&std::fs::read_to_string(support.join("Claude/claude_desktop_config.json")).unwrap()).unwrap();
+        assert_eq!(main_cfg["deploymentMode"], json!("3p"));
+        let p3_cfg: Value = serde_json::from_str(&std::fs::read_to_string(support.join("Claude-3p/claude_desktop_config.json")).unwrap()).unwrap();
+        assert_eq!(p3_cfg["deploymentMode"], json!("3p"));
+        let profile: Value = serde_json::from_str(&std::fs::read_to_string(support.join("Claude-3p/configLibrary").join(format!("{}.json", crate::agents::claude_desktop::PROFILE_ID))).unwrap()).unwrap();
+        assert_eq!(profile["inferenceGatewayBaseUrl"], json!("http://127.0.0.1:8787/claude-desktop"));
+        assert_eq!(profile["inferenceGatewayApiKey"], json!("2xapi-gateway-managed"));
+        let meta: Value = serde_json::from_str(&std::fs::read_to_string(support.join("Claude-3p/configLibrary/_meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["appliedId"], json!(crate::agents::claude_desktop::PROFILE_ID));
+
+        let st = app.clone().oneshot(
+            Request::builder().uri("/api/desktop/claude-desktop/state").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        let sv = body_json(st).await;
+        assert!(sv["data"]["hosting"].is_object(), "host 后 state.hosting 非空");
+
+        let un = app.oneshot(
+            Request::builder().method("POST").uri("/api/desktop/claude-desktop/unhost").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        let uv = body_json(un).await;
+        assert_eq!(uv["data"]["restored"], Value::Bool(true));
+        let main_after: Value = serde_json::from_str(&std::fs::read_to_string(support.join("Claude/claude_desktop_config.json")).unwrap()).unwrap();
+        assert_eq!(main_after["deploymentMode"], json!("1p"), "无簿记原值→恢复官方模式");
+        assert!(!support.join("Claude-3p/configLibrary").join(format!("{}.json", crate::agents::claude_desktop::PROFILE_ID)).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2245,6 +2299,7 @@ async fn handle_agent_state(
         "grokbuild" => ok_env(crate::agents::grok::state(&s.grok_home)),
         "opencode" => ok_env(crate::agents::opencode::state(&s.oc_home)),
         "openclaw" => ok_env(crate::agents::openclaw::state(&s.oclaw_home)),
+        "claude-desktop" => ok_env(crate::agents::claude_desktop::state(&s.cd_home)),
         _ => agent_unsupported_response(),
     }
 }
@@ -2290,6 +2345,11 @@ async fn handle_agent_host(
             body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
             body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
         )),
+        "claude-desktop" => agent_op_response(crate::agents::claude_desktop::host(
+            &s.cd_home, &s.providers_path,
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -2312,6 +2372,7 @@ async fn handle_agent_unhost(
         "grokbuild" => agent_op_response(crate::agents::grok::unhost(&s.grok_home, &s.backup_dir)),
         "opencode" => agent_op_response(crate::agents::opencode::unhost(&s.oc_home, &s.backup_dir)),
         "openclaw" => agent_op_response(crate::agents::openclaw::unhost(&s.oclaw_home, &s.backup_dir)),
+        "claude-desktop" => agent_op_response(crate::agents::claude_desktop::unhost(&s.cd_home)),
         _ => agent_unsupported_response(),
     }
 }
