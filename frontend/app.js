@@ -906,7 +906,8 @@ function openEdit(id) {
   document.getElementById("eKey").placeholder = state.edit.isNew ? (isC ? "sk-ant-..." : "sk-...") : (p.apiKeyMasked ? "•••• 未改则留空" : (isC ? "sk-ant-..." : "sk-..."));
   document.getElementById("eModel").value = state.edit.model;
   var wSel = document.getElementById("eWire");
-  if (wSel) wSel.value = (["responses","chat_completions","anthropic"].indexOf(state.edit.wireApi) >= 0) ? state.edit.wireApi : "auto";
+  /* 新建一律显示「自动」(保存时落世界默认值,拉取模型探测后回写);编辑已有供应商显示当前实际协议 */
+  if (wSel) wSel.value = state.edit.isNew ? "auto" : ((["responses","chat_completions","anthropic"].indexOf(state.edit.wireApi) >= 0) ? state.edit.wireApi : "auto");
   renderModelRows();
   document.getElementById("editMask").style.display = "";
 }
