@@ -318,6 +318,7 @@ pub fn unhost(gem_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
 }
 
 /// GET /api/desktop/gemini/state —— 托管态(.env 含受控键)+ 认证形态 + CLI 安装检测。
+/// hosting 契约对齐 B 阶段通用世界(grokbuild/opencode 等:`{way,…}|null`);hosted 保留兼容。
 pub fn state(gem_home: &Path) -> Value {
     let raw = read_env(gem_home).unwrap_or_default();
     let hosted = env_get(&raw, "GOOGLE_GEMINI_BASE_URL").is_some();
@@ -331,9 +332,13 @@ pub fn state(gem_home: &Path) -> Value {
         .and_then(|v| v.get("way").and_then(|w| w.as_str()).map(String::from));
     json!({
         "agent": "gemini",
+        "hosting": if hosted {
+            json!({ "way": way.unwrap_or_else(|| "gateway".into()), "authType": "gemini-api-key" })
+        } else {
+            Value::Null
+        },
         "hosted": hosted,
         "authType": auth_type,
-        "way": way,
         "installed": which_gemini().is_some(),
         "model": env_get(&raw, "GEMINI_MODEL"),
     })
@@ -534,6 +539,8 @@ mod tests {
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         let s1 = state(&home);
         assert_eq!(s1["hosted"], json!(true));
+        assert_eq!(s1["hosting"]["way"], "gateway", "通用世界前端读 hosting 判定托管态");
+        assert_eq!(s1["hosting"]["authType"], "gemini-api-key");
         assert_eq!(s1["authType"], "gemini-api-key");
         assert_eq!(s1["model"], "gemini-2.5-flash");
         let _ = fs::remove_dir_all(&home);
