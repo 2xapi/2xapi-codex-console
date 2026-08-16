@@ -1068,3 +1068,161 @@ mod real_b {
         println!("[B 段真机] 五平台全链通过");
     }
 }
+
+/// C 段真机 e2e(#[ignore] 手动驱动):
+/// - claude-code:~/.claude.json 是 Claude Code CLI 活配置(本机在写),副本上验全链
+///   +真实文件快速窗口 install→diff mcpServers 外零变化→uninstall 还原
+/// - workbuddy:真实 .mcp.json 副本(connector-proxy 手动条目零触碰)
+/// - hermes 技能:真实 ~/.hermes/skills 扫描(21 项)
+/// - openclaw 技能:真实 CLI list(隔离 HOME)+启停受控段+还原
+#[cfg(test)]
+mod real_c {
+    use crate::agents::eco::skills::*;
+    use crate::agents::eco::EcoStore;
+    use std::path::PathBuf;
+
+    fn home() -> PathBuf {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    }
+
+    #[test]
+    #[ignore = "C 段真机验收:真实载体副本+真实 CLI(隔离 HOME)+活文件快速窗口,手动驱动"]
+    fn eco_real_machine_c() {
+        let h = home();
+
+        // ── claude-code:副本全链(活文件零触碰)──
+        let cj_real = h.join(".claude.json");
+        assert!(cj_real.exists());
+        let t = std::env::temp_dir().join(format!("2xapi-eco-c-cc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        let orig = std::fs::read(&cj_real).unwrap();
+        std::fs::write(t.join("cc.json"), &orig).unwrap();
+        let store = crate::agents::eco::cursor::JsonStore::at("claude", &t.join("cc.json"));
+        let before = store.read().unwrap();
+        let spec = crate::agents::eco::preset_spec(
+            crate::agents::eco::find_preset("fetch").unwrap(),
+            None,
+        )
+        .unwrap();
+        crate::agents::eco::install(&store, &t, &t, "fetch", &spec).unwrap();
+        let after = store.read().unwrap();
+        assert!(after.contains_key("fetch"));
+        for (k, v) in &before {
+            assert_eq!(after.get(k), Some(v), "已有条目 {k} 零变化");
+        }
+        let doc: serde_json::Value = serde_json::from_slice(&orig).unwrap();
+        let doc2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(t.join("cc.json")).unwrap()).unwrap();
+        for (k, v) in doc.as_object().unwrap() {
+            if k == "mcpServers" {
+                continue;
+            }
+            assert_eq!(doc2.get(k), Some(v), "顶层键 {k} 零触碰");
+        }
+        crate::agents::eco::uninstall(&store, &t, &t, "fetch").unwrap();
+        let final_ = store.read().unwrap();
+        assert_eq!(final_.len(), before.len());
+        let _ = std::fs::remove_dir_all(&t);
+        println!("[claude-code] 副本全链通过(mcpServers 外顶层键零变化)");
+
+        // 真实文件快速窗口:install→验证→uninstall(mcpServers 原为空,卸载后恢复空)
+        let mcp_before = store.read().unwrap();
+        let _ = mcp_before; // 副本 store;真实窗口直接操作
+        let real_store = crate::agents::eco::cursor::JsonStore::at("claude", &cj_real);
+        let had = real_store.read().unwrap();
+        let orig2 = std::fs::read(&cj_real).unwrap();
+        crate::agents::eco::install(&real_store, &h.join(".codex"), &h.join(".codex").join("config-backups"), "fetch", &spec).unwrap();
+        let doc3: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
+        assert_eq!(doc3["mcpServers"]["fetch"]["command"], "uvx");
+        crate::agents::eco::uninstall(&real_store, &h.join(".codex"), &h.join(".codex").join("config-backups"), "fetch").unwrap();
+        let doc4: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
+        let mcp_now = doc4.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len()).unwrap_or(0);
+        let mcp_was = orig2_len_mcp(&orig2);
+        assert_eq!(mcp_now, mcp_was, "uninstall 后 mcpServers 条目数还原");
+        for (k, v) in serde_json::from_slice::<serde_json::Value>(&orig2).unwrap().as_object().unwrap() {
+            if k == "mcpServers" {
+                continue;
+            }
+            assert_eq!(doc4.get(k), Some(v), "真实文件顶层键 {k} 零触碰");
+        }
+        println!("[claude-code] 真实窗口过(原 {} 条 → 还原)", mcp_was);
+
+        // ── workbuddy:副本(connector-proxy 零触碰)──
+        let wm_real = h.join(".workbuddy").join(".mcp.json");
+        if wm_real.exists() {
+            let t2 = std::env::temp_dir().join(format!("2xapi-eco-c-wb-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&t2);
+            std::fs::create_dir_all(t2.join(".workbuddy")).unwrap();
+            std::fs::write(t2.join(".workbuddy").join(".mcp.json"), std::fs::read(&wm_real).unwrap()).unwrap();
+            let wstore = crate::agents::eco::cursor::JsonStore::at("workbuddy", &t2.join(".workbuddy").join(".mcp.json"));
+            let wbefore = wstore.read().unwrap();
+            let mspec = crate::agents::eco::preset_spec(
+                crate::agents::eco::find_preset("memory").unwrap(),
+                None,
+            )
+            .unwrap();
+            crate::agents::eco::install(&wstore, &t2, &t2, "memory", &mspec).unwrap();
+            let wafter = wstore.read().unwrap();
+            assert!(wafter.contains_key("memory"));
+            for (k, v) in &wbefore {
+                assert_eq!(wafter.get(k), Some(v), "workbuddy 已有条目 {k} 零变化");
+            }
+            crate::agents::eco::uninstall(&wstore, &t2, &t2, "memory").unwrap();
+            assert_eq!(wstore.read().unwrap().len(), wbefore.len());
+            let _ = std::fs::remove_dir_all(&t2);
+            println!("[workbuddy] 副本全链通过(connector-proxy 零触碰)");
+        }
+
+        // ── hermes 技能:真实目录扫描(只读)──
+        let hs = HermesSkills::new(&h.join(".hermes"));
+        let skills = hs.list().unwrap();
+        println!("[hermes] 真实技能 {} 项(前 5: {:?})", skills.len(), skills.iter().take(5).map(|s| s.name.as_str()).collect::<Vec<_>>());
+        assert!(skills.len() >= 15, "本机应有 21 项左右");
+
+        // ── openclaw 技能:真实 CLI + 受控段启停 + 还原 ──
+        // 真实 ~/.openclaw(读真实配置,启停写受控段,验后还原)
+        let oc = OpenclawSkills::new(h.join(".openclaw"));
+        let list = oc.list().unwrap();
+        println!("[openclaw] 真实技能 {} 项", list.len());
+        assert!(!list.is_empty(), "CLI 应列出 bundled 技能");
+        let cfg_existed = h.join(".openclaw/openclaw.json").exists();
+        let cfg_orig = if cfg_existed { std::fs::read_to_string(h.join(".openclaw/openclaw.json")).unwrap_or_default() } else { String::new() };
+        // 受控段启停(bundled 技能 apple-notes;写 skills.entries 后还原)
+        let target = list.iter().find(|s| s.name == "apple-notes").map(|s| s.name.clone())
+            .unwrap_or_else(|| list[0].name.clone());
+        let _ = oc.set_enabled(&target, false).unwrap();
+        let cfg = std::fs::read_to_string(h.join(".openclaw/openclaw.json")).unwrap();
+        assert!(cfg.contains(&format!("\"{target}\"")), "受控段写入");
+        // 还原:删掉我们写的条目(受控段只含我们的键;整段空则移除)
+        let mut doc: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+        if let Some(entries) = doc.get_mut("skills").and_then(|s| s.get_mut("entries")).and_then(|e| e.as_object_mut()) {
+            entries.remove(&target);
+            if entries.is_empty() {
+                if let Some(sk) = doc.get_mut("skills").and_then(|s| s.as_object_mut()) {
+                    sk.remove("entries");
+                    if sk.is_empty() {
+                        doc.as_object_mut().unwrap().remove("skills");
+                    }
+                }
+            }
+        }
+        if doc.as_object().map(|o| o.is_empty()).unwrap_or(false) && !cfg_existed {
+            let _ = std::fs::remove_file(h.join(".openclaw/openclaw.json"));
+        } else {
+            std::fs::write(h.join(".openclaw/openclaw.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
+        }
+        if !cfg_existed {
+            assert!(!h.join(".openclaw/openclaw.json").exists(), "新建的 openclaw.json 应删除(零残留)");
+        }
+        println!("[openclaw] 受控段启停+还原通过(target={target})");
+        println!("[C 段真机] 全部通过");
+    }
+
+    fn orig2_len_mcp(orig: &[u8]) -> usize {
+        serde_json::from_slice::<serde_json::Value>(orig)
+            .ok()
+            .and_then(|d| d.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len()))
+            .unwrap_or(0)
+    }
+}
