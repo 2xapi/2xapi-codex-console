@@ -967,6 +967,9 @@ async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
                     "enabled": l.enabled,
                     "latency": h.map(|h| h.latency_ms).unwrap_or(0),
                     "fails": h.map(|h| h.fails).unwrap_or(0),
+                    // 摘除态显式可见(3 败摘除/1 成恢复;网关请求路径按它跳线)。
+                    // 此处已持有 table 锁,不能调 is_available(内部会再锁 → 死锁)
+                    "available": h.map(|h| !h.is_unhealthy()).unwrap_or(true),
                 })
             })
             .collect()

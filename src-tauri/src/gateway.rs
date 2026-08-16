@@ -877,7 +877,7 @@ fn accel_plan(state: &AppState, base_url: &str, api_key: &str) -> Option<(AccLin
         "official" => {
             let line = {
                 let lines = state.health.lines.lock().unwrap();
-                crate::acclines::match_line(base_url, &lines).cloned()
+                crate::acclines::match_line_healthy(base_url, &lines, &state.health).cloned()
             };
             let mut line = line?;
             let st = state.nodecreds.read().unwrap();
@@ -981,7 +981,7 @@ async fn ensure_line_cred(
         Some((l, _)) => Some(l.clone()),
         None => {
             let lines = state.health.lines.lock().unwrap();
-            crate::acclines::match_line(base_url, &lines).cloned()
+            crate::acclines::match_line_healthy(base_url, &lines, &state.health).cloned()
         }
     };
     let Some(mut l) = base_line else {

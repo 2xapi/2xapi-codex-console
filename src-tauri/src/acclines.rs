@@ -150,6 +150,23 @@ pub fn load_lines(codex_home: &Path) -> AccLines {
 
 // ── 远程拉取 + ed25519 验签(任务书 §五:启动拉 + 60min 刷新 + 本地缓存,失败用缓存)─
 
+/// 远程线路表源配置(`{codex_home}/accel-remote.json`):服务端就绪后写入即生效,
+/// 无需发版。缺失/字段空 = 服务端未就绪,刷新循环静默跳过(按内置/缓存表运行)。
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct RemoteSrc {
+    #[serde(default)]
+    pub service_url: String,
+    #[serde(default)]
+    pub pubkey_hex: String,
+}
+
+fn load_remote_src(codex_home: &Path) -> RemoteSrc {
+    std::fs::read_to_string(codex_home.join("accel-remote.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
 /// 远程拉取:GET `{service_url}/lines.json` → ed25519 验签 → 写本地缓存。
 /// 失败(网络/验签/服务端未就绪)→ 回退本地缓存 → 再失败回退内置表。
 /// 约定(服务端未就绪,本处定义契约):
@@ -299,6 +316,24 @@ pub fn match_line<'a>(base_url: &str, lines: &'a [AccLine]) -> Option<&'a AccLin
     best
 }
 
+/// 请求路径版匹配:命中线中按 priority 升序取第一条**未被摘除**的
+/// (最佳线被摘除 → 次优顶上;全部被摘除 → None=直连)。
+/// 展示类场景仍用 match_line(不受摘除影响)。
+pub fn match_line_healthy<'a>(
+    base_url: &str,
+    lines: &'a [AccLine],
+    health: &HealthState,
+) -> Option<&'a AccLine> {
+    let host = host_of(base_url)?;
+    let mut candidates: Vec<&AccLine> = lines
+        .iter()
+        .filter(|l| l.enabled && l.scope.iter().any(|s| host_matches(&host, s)))
+        .collect();
+    // 稳定排序:同 priority 保表内先后(与 match_line 的「先出现者胜」一致)
+    candidates.sort_by_key(|l| l.priority);
+    candidates.into_iter().find(|l| health.is_available(&l.id))
+}
+
 // ── 健康探测(任务书 §五:每 30s,连续 3 败摘除、1 成恢复)────────
 
 /// 单线健康记录。
@@ -343,7 +378,7 @@ impl HealthState {
             .lock()
             .unwrap()
             .get(line_id)
-            .map(|h| h.fails < FAIL_THRESHOLD)
+            .map(|h| !h.is_unhealthy())
             .unwrap_or(true)
     }
 
@@ -428,6 +463,37 @@ async fn health_cycle(state: &HealthState, client: &reqwest::Client) {
             Err(_) => apply_probe(state, &id, false),
         }
     }
+}
+
+// ── 远程刷新循环(任务书 §五:启动即拉 + 每 60min 刷新;未配置静默跳过)──
+
+/// 单轮刷新(循环体抽出,可测):读 accel-remote.json,未配置 → None(现有表不动);
+/// 已配置 → fetch_lines(remote 失败内部回退缓存/内置)→ set_lines 整体替换。
+async fn refresh_cycle(state: &HealthState, codex_home: &Path) -> Option<AccLines> {
+    let src = load_remote_src(codex_home);
+    if src.service_url.trim().is_empty() || src.pubkey_hex.trim().is_empty() {
+        return None;
+    }
+    let lines = fetch_lines(codex_home, &src.service_url, &src.pubkey_hex)
+        .await
+        .ok()?;
+    state.set_lines(lines.lines.clone());
+    Some(lines)
+}
+
+/// 远程线路表刷新循环(interval 由装配方传,线上 60min;测试可短 interval 或直接
+/// 驱动 refresh_cycle)。启动即拉一轮,再周期刷新。
+pub fn spawn_refresh_loop(
+    state: Arc<HealthState>,
+    codex_home: std::path::PathBuf,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            refresh_cycle(&state, &codex_home).await;
+            tokio::time::sleep(interval).await;
+        }
+    });
 }
 
 // ── 单测(任务书 §五)────────────────────────────────────────
@@ -728,6 +794,95 @@ mod tests {
         assert_eq!(cached.lines[0].id, "remote-a");
         assert!(cached.lines[0].credential.is_none(), "缓存不应含凭证");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn match_line_healthy_skips_removed_and_falls_to_next() {
+        let state = HealthState::new(vec![
+            line("best", "http://a:1", &["api.up.com"], 1, true),
+            line("second", "http://b:1", &["api.up.com"], 2, true),
+        ]);
+        let snap = state.lines.lock().unwrap().clone();
+        // 全健康 → 最佳线
+        assert_eq!(
+            match_line_healthy("https://api.up.com/v1", &snap, &state)
+                .unwrap()
+                .id,
+            "best"
+        );
+        // 最佳线 3 败摘除 → 次优顶上(match_line 不受影响仍指最佳)
+        for _ in 0..FAIL_THRESHOLD {
+            apply_probe(&state, "best", false);
+        }
+        assert_eq!(
+            match_line_healthy("https://api.up.com/v1", &snap, &state)
+                .unwrap()
+                .id,
+            "second"
+        );
+        assert_eq!(
+            match_line("https://api.up.com/v1", &snap).unwrap().id,
+            "best"
+        );
+        // 全部摘除 → None(直连)
+        for _ in 0..FAIL_THRESHOLD {
+            apply_probe(&state, "second", false);
+        }
+        assert!(match_line_healthy("https://api.up.com/v1", &snap, &state).is_none());
+        // 1 成恢复 → 回服务(次优先)
+        apply_probe(&state, "second", true);
+        assert_eq!(
+            match_line_healthy("https://api.up.com/v1", &snap, &state)
+                .unwrap()
+                .id,
+            "second"
+        );
+        apply_probe(&state, "best", true);
+        assert_eq!(
+            match_line_healthy("https://api.up.com/v1", &snap, &state)
+                .unwrap()
+                .id,
+            "best"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_cycle_without_config_is_noop() {
+        let home = sandbox("refresh-noop");
+        let state = HealthState::new(vec![line("keep", "http://x:1", &["*"], 1, true)]);
+        assert!(refresh_cycle(&state, &home).await.is_none());
+        let ls = state.lines.lock().unwrap();
+        assert_eq!(ls.len(), 1);
+        assert_eq!(ls[0].id, "keep");
+    }
+
+    #[tokio::test]
+    async fn refresh_cycle_replaces_lines_from_remote() {
+        use ed25519_dalek::Signer;
+        let home = sandbox("refresh-remote");
+        let (pub_hex, key) = signer();
+        let remote = AccLines {
+            version: 7,
+            lines: vec![line("r1", "http://r:1", &["api.remote.com"], 1, true)],
+        };
+        let body = Arc::new(serde_json::to_vec(&remote).unwrap());
+        let sig = key.sign(body.as_slice());
+        let sig_hex = Arc::new(hex::encode(sig.to_bytes()));
+        let url = spawn_signed_server(body, sig_hex).await;
+        std::fs::write(
+            home.join("accel-remote.json"),
+            serde_json::json!({ "service_url": url, "pubkey_hex": pub_hex }).to_string(),
+        )
+        .unwrap();
+
+        let state = HealthState::new(vec![line("old", "http://old:1", &["*"], 1, true)]);
+        assert!(refresh_cycle(&state, &home).await.is_some());
+        {
+            let ls = state.lines.lock().unwrap();
+            assert_eq!(ls.len(), 1, "远程表整体替换(任务书 §五语义): {ls:?}");
+            assert_eq!(ls[0].id, "r1");
+        }
+        assert!(home.join("acclines-cache.json").exists());
     }
 
     #[tokio::test]

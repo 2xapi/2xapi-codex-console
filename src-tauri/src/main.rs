@@ -144,6 +144,13 @@ fn main() {
                 health_state.clone(),
                 std::time::Duration::from_secs(30),
             );
+            // 任务书 §五:远程线路表刷新(启动即拉 + 每 60min;accel-remote.json
+            // 未配置时静默跳过,不影响内置/缓存表)。
+            crate::acclines::spawn_refresh_loop(
+                health_state.clone(),
+                codex_home.clone(),
+                std::time::Duration::from_secs(3600),
+            );
             axum::serve(listener, router).await.unwrap();
         });
     });
