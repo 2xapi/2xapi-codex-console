@@ -93,8 +93,6 @@
   ecoList: (agent) => request("GET", "/api/desktop/" + agent + "/eco"),
   ecoOp: (agent, body) => request("POST", "/api/desktop/" + agent + "/eco", { body }),
   ecoPresets: () => request("GET", "/api/desktop/eco-presets"),
-  skillList: (agent) => request("GET", "/api/desktop/" + agent + "/skills"),
-  skillOp: (agent, body) => request("POST", "/api/desktop/" + agent + "/skills", { body }),
     desktopHost: async (providerId, way) => {
       const resp = await fetch("/api/desktop/host", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",

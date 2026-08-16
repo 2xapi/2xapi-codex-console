@@ -12,7 +12,6 @@ pub mod codex;
 pub mod cursor;
 pub mod hermes;
 pub mod opencode;
-pub mod skills;
 
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -52,14 +51,6 @@ pub fn display_name(agent: &str) -> &'static str {
 pub fn supported(agent: &str) -> Option<&'static str> {
     let norm = agent.trim().to_ascii_lowercase();
     SUPPORTED.iter().find(|a| **a == norm).copied()
-}
-
-/// 技能(Skills)支持平台(C 段):openclaw=全链,hermes=只读。
-pub const SKILL_AGENTS: &[&str] = &["openclaw", "hermes"];
-
-pub fn skill_supported(agent: &str) -> Option<&'static str> {
-    let norm = agent.trim().to_ascii_lowercase();
-    SKILL_AGENTS.iter().find(|a| **a == norm).copied()
 }
 
 /// 平台载体读写抽象。
@@ -223,14 +214,6 @@ fn spec_summary(spec: &Value) -> String {
 
 /// GET 列表:平台配置实际条目(manual/console)+ 登记表停用条目(console, enabled=false)。
 pub fn list(store: &dyn EcoStore, codex_home: &Path) -> Result<Value, OpError> {
-    list_with_tabs(store, codex_home, skill_supported(store.id()).is_some())
-}
-
-pub fn list_with_tabs(
-    store: &dyn EcoStore,
-    codex_home: &Path,
-    skills_ready: bool,
-) -> Result<Value, OpError> {
     let live = store.read()?;
     let agents = load_registry(codex_home);
     let roster = agent_registry(&agents, store.id());
@@ -273,11 +256,6 @@ pub fn list_with_tabs(
     Ok(json!({
         "agent": store.id(),
         "servers": servers,
-        "tabs": [
-            { "id": "mcp", "label": "MCP 服务器", "ready": true },
-            { "id": "plugins", "label": "插件", "ready": false },
-            { "id": "skills", "label": "技能", "ready": skills_ready }
-        ],
     }))
 }
 
@@ -578,16 +556,10 @@ pub fn presets_json() -> Value {
                 })
             })
             .collect::<Vec<_>>(),
-        "agents": {
-            "mcp": SUPPORTED
-                .iter()
-                .map(|a| json!({ "id": a, "name": display_name(a) }))
-                .collect::<Vec<_>>(),
-            "skills": SKILL_AGENTS
-                .iter()
-                .map(|a| json!({ "id": a, "name": display_name(a) }))
-                .collect::<Vec<_>>(),
-        },
+        "agents": SUPPORTED
+            .iter()
+            .map(|a| json!({ "id": a, "name": display_name(a) }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -781,8 +753,7 @@ mod tests {
         assert!(preset_spec(fs_p, None).is_err(), "filesystem 无参数应 400");
         let spec = preset_spec(fs_p, Some(&serde_json::json!({ "DIR": "/tmp/docs" }))).unwrap();
         assert_eq!(spec["args"][2], "/tmp/docs", "$DIR 占位应被替换");
-        assert_eq!(v["agents"]["mcp"].as_array().unwrap().len(), 9, "MCP 支持 9 平台(C 段含 claude/workbuddy)");
-        assert_eq!(v["agents"]["skills"].as_array().unwrap().len(), 2, "技能支持 2 平台");
+        assert_eq!(v["agents"].as_array().unwrap().len(), 9, "MCP 支持 9 平台(claude/workbuddy 在编,技能已裁撤)");
     }
 
     #[test]
@@ -1069,15 +1040,12 @@ mod real_b {
     }
 }
 
-/// C 段真机 e2e(#[ignore] 手动驱动):
+/// C 段(MCP 部分)真机 e2e(#[ignore] 手动驱动;技能部分已按总部修订裁撤):
 /// - claude-code:~/.claude.json 是 Claude Code CLI 活配置(本机在写),副本上验全链
 ///   +真实文件快速窗口 install→diff mcpServers 外零变化→uninstall 还原
 /// - workbuddy:真实 .mcp.json 副本(connector-proxy 手动条目零触碰)
-/// - hermes 技能:真实 ~/.hermes/skills 扫描(21 项)
-/// - openclaw 技能:真实 CLI list(隔离 HOME)+启停受控段+还原
 #[cfg(test)]
 mod real_c {
-    use crate::agents::eco::skills::*;
     use crate::agents::eco::EcoStore;
     use std::path::PathBuf;
 
@@ -1085,8 +1053,10 @@ mod real_c {
         PathBuf::from(std::env::var("HOME").unwrap_or_default())
     }
 
+    /// C 段(MCP 部分)真机:claude-code 活文件副本+快速窗口;workbuddy 副本。
+    /// 技能部分已按总部修订裁撤(2026-08-17),不再验收。
     #[test]
-    #[ignore = "C 段真机验收:真实载体副本+真实 CLI(隔离 HOME)+活文件快速窗口,手动驱动"]
+    #[ignore = "C 段真机验收:MCP 部分(技能已裁撤),手动驱动"]
     fn eco_real_machine_c() {
         let h = home();
 
@@ -1121,16 +1091,12 @@ mod real_c {
             assert_eq!(doc2.get(k), Some(v), "顶层键 {k} 零触碰");
         }
         crate::agents::eco::uninstall(&store, &t, &t, "fetch").unwrap();
-        let final_ = store.read().unwrap();
-        assert_eq!(final_.len(), before.len());
+        assert_eq!(store.read().unwrap().len(), before.len());
         let _ = std::fs::remove_dir_all(&t);
         println!("[claude-code] 副本全链通过(mcpServers 外顶层键零变化)");
 
-        // 真实文件快速窗口:install→验证→uninstall(mcpServers 原为空,卸载后恢复空)
-        let mcp_before = store.read().unwrap();
-        let _ = mcp_before; // 副本 store;真实窗口直接操作
+        // 真实文件快速窗口:install→验证→uninstall 还原
         let real_store = crate::agents::eco::cursor::JsonStore::at("claude", &cj_real);
-        let had = real_store.read().unwrap();
         let orig2 = std::fs::read(&cj_real).unwrap();
         crate::agents::eco::install(&real_store, &h.join(".codex"), &h.join(".codex").join("config-backups"), "fetch", &spec).unwrap();
         let doc3: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
@@ -1138,14 +1104,8 @@ mod real_c {
         crate::agents::eco::uninstall(&real_store, &h.join(".codex"), &h.join(".codex").join("config-backups"), "fetch").unwrap();
         let doc4: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
         let mcp_now = doc4.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len()).unwrap_or(0);
-        let mcp_was = orig2_len_mcp(&orig2);
+        let mcp_was = serde_json::from_slice::<serde_json::Value>(&orig2).ok().and_then(|d| d.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len())).unwrap_or(0);
         assert_eq!(mcp_now, mcp_was, "uninstall 后 mcpServers 条目数还原");
-        for (k, v) in serde_json::from_slice::<serde_json::Value>(&orig2).unwrap().as_object().unwrap() {
-            if k == "mcpServers" {
-                continue;
-            }
-            assert_eq!(doc4.get(k), Some(v), "真实文件顶层键 {k} 零触碰");
-        }
         println!("[claude-code] 真实窗口过(原 {} 条 → 还原)", mcp_was);
 
         // ── workbuddy:副本(connector-proxy 零触碰)──
@@ -1173,56 +1133,6 @@ mod real_c {
             let _ = std::fs::remove_dir_all(&t2);
             println!("[workbuddy] 副本全链通过(connector-proxy 零触碰)");
         }
-
-        // ── hermes 技能:真实目录扫描(只读)──
-        let hs = HermesSkills::new(&h.join(".hermes"));
-        let skills = hs.list().unwrap();
-        println!("[hermes] 真实技能 {} 项(前 5: {:?})", skills.len(), skills.iter().take(5).map(|s| s.name.as_str()).collect::<Vec<_>>());
-        assert!(skills.len() >= 15, "本机应有 21 项左右");
-
-        // ── openclaw 技能:真实 CLI + 受控段启停 + 还原 ──
-        // 真实 ~/.openclaw(读真实配置,启停写受控段,验后还原)
-        let oc = OpenclawSkills::new(h.join(".openclaw"));
-        let list = oc.list().unwrap();
-        println!("[openclaw] 真实技能 {} 项", list.len());
-        assert!(!list.is_empty(), "CLI 应列出 bundled 技能");
-        let cfg_existed = h.join(".openclaw/openclaw.json").exists();
-        let cfg_orig = if cfg_existed { std::fs::read_to_string(h.join(".openclaw/openclaw.json")).unwrap_or_default() } else { String::new() };
-        // 受控段启停(bundled 技能 apple-notes;写 skills.entries 后还原)
-        let target = list.iter().find(|s| s.name == "apple-notes").map(|s| s.name.clone())
-            .unwrap_or_else(|| list[0].name.clone());
-        let _ = oc.set_enabled(&target, false).unwrap();
-        let cfg = std::fs::read_to_string(h.join(".openclaw/openclaw.json")).unwrap();
-        assert!(cfg.contains(&format!("\"{target}\"")), "受控段写入");
-        // 还原:删掉我们写的条目(受控段只含我们的键;整段空则移除)
-        let mut doc: serde_json::Value = serde_json::from_str(&cfg).unwrap();
-        if let Some(entries) = doc.get_mut("skills").and_then(|s| s.get_mut("entries")).and_then(|e| e.as_object_mut()) {
-            entries.remove(&target);
-            if entries.is_empty() {
-                if let Some(sk) = doc.get_mut("skills").and_then(|s| s.as_object_mut()) {
-                    sk.remove("entries");
-                    if sk.is_empty() {
-                        doc.as_object_mut().unwrap().remove("skills");
-                    }
-                }
-            }
-        }
-        if doc.as_object().map(|o| o.is_empty()).unwrap_or(false) && !cfg_existed {
-            let _ = std::fs::remove_file(h.join(".openclaw/openclaw.json"));
-        } else {
-            std::fs::write(h.join(".openclaw/openclaw.json"), serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
-        }
-        if !cfg_existed {
-            assert!(!h.join(".openclaw/openclaw.json").exists(), "新建的 openclaw.json 应删除(零残留)");
-        }
-        println!("[openclaw] 受控段启停+还原通过(target={target})");
-        println!("[C 段真机] 全部通过");
-    }
-
-    fn orig2_len_mcp(orig: &[u8]) -> usize {
-        serde_json::from_slice::<serde_json::Value>(orig)
-            .ok()
-            .and_then(|d| d.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len()))
-            .unwrap_or(0)
+        println!("[C 段真机(MCP 部分)] 全部通过");
     }
 }
