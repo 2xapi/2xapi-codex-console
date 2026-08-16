@@ -486,7 +486,16 @@ async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str, agent: &st
             (suffix.to_string(), body_bytes.to_vec(), None)
         };
 
-    let url = format!("{}/{}", provider.base_url.trim_end_matches('/'), target_suffix);
+    // /v1 双形态(与 dispatch_anthropic/dispatch_gemini 同规则;opencode 真机验收发现:
+    // 裸域 chat 通路曾打到中转站 Web UI——2xapi.cc.cd 实测仅 /v1 形态,DeepSeek 等挂载
+    // 根的站两形态均可)。responses 通路维持裸拼(2xa 实测 /responses 直打可通,
+    // 现网 codex responses 供应商全量在用,不动)。
+    let base = provider.base_url.trim_end_matches('/');
+    let url = if target_suffix == "chat/completions" && !base.ends_with("/v1") {
+        format!("{base}/v1/{target_suffix}")
+    } else {
+        format!("{base}/{target_suffix}")
+    };
 
     // 01-D3：注入 provider.api_key（覆盖任何来源的凭证）；请求构建抽为闭包以支持换线重试
     let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
@@ -1699,7 +1708,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
         let app = Router::new().route(
-            "/chat/completions",
+            "/v1/chat/completions",
             post(move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
                 let seen = seen_clone.clone();
                 async move {
@@ -1823,6 +1832,97 @@ mod tests {
         let (state, _providers_path, root) = make_state("hermes-none");
         let resp = proxy_hermes_chat(State(Arc::new(state)), req_post_hermes("{}").await).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 通用 dispatch /v1 双形态(opencode 真机验收发现:裸域 chat 通路曾打到中转站 Web UI)──
+
+    /// 双路径 mock:记录命中的路径("/v1" 或 "bare")。
+    async fn mock_dual_chat_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s_v1 = seen.clone();
+        let s_bare = seen.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |_h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                    let seen = s_v1.clone();
+                    async move {
+                        seen.lock().unwrap().push("/v1".into());
+                        (StatusCode::OK, "OK_V1")
+                    }
+                }),
+            )
+            .route(
+                "/chat/completions",
+                post(move |_h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                    let seen = s_bare.clone();
+                    async move {
+                        seen.lock().unwrap().push("bare".into());
+                        (StatusCode::OK, "OK_BARE")
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), seen)
+    }
+
+    async fn req_post_opencode(body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/opencode/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn add_opencode_provider(path: &std::path::Path, base_url: &str) -> String {
+        let input = ProviderInput {
+            name: "OcT".into(),
+            agent: "opencode".into(),
+            base_url: base_url.into(),
+            api_key: "sk-oc-secret".into(),
+            model: "glm-5".into(),
+            wire_api: crate::providers::WireApi::ChatCompletions,
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        };
+        let p = providers::create(path, input).unwrap();
+        providers::set_active(path, &p.id);
+        p.id
+    }
+
+    /// 裸域供应商 → 上游命中 {base}/v1/chat/completions(2xapi.cc.cd 实测仅 /v1 形态)。
+    #[tokio::test]
+    async fn dispatch_chat_bare_base_gets_v1_path() {
+        let (base, seen) = mock_dual_chat_upstream().await;
+        let (state, providers_path, root) = make_state("oc-v1-bare");
+        add_opencode_provider(&providers_path, &base); // 裸域,无 /v1
+        let resp = proxy_opencode_chat(State(Arc::new(state)), req_post_opencode("{\"model\":\"glm-5\"}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK, "裸域应补 /v1 命中");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"OK_V1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(seen.lock().unwrap().first().map(|s| s.as_str()), Some("/v1"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// base 带 /v1 → 直拼 chat/completions,不重复叠加(两种写法收敛到同一 URL,命中 /v1 路由一次)。
+    #[tokio::test]
+    async fn dispatch_chat_v1_base_appends_directly() {
+        let (base, seen) = mock_dual_chat_upstream().await;
+        let (state, providers_path, root) = make_state("oc-v1-suffix");
+        add_opencode_provider(&providers_path, &format!("{base}/v1"));
+        let resp = proxy_opencode_chat(State(Arc::new(state)), req_post_opencode("{\"model\":\"glm-5\"}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK, "带 /v1 的 base 应直拼(非 /v1/v1 双叠,否则 404)");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"OK_V1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(seen.lock().unwrap().first().map(|s| s.as_str()), Some("/v1"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
