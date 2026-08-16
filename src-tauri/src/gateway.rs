@@ -417,7 +417,8 @@ async fn dispatch_gemini(state: &AppState, model_action: &str, req: Request<Body
 /// hermes 接入(B 阶段):`/hermes/chat/completions` 走同一 dispatch,agent="hermes"。
 async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str, agent: &str) -> Response<Body> {
     // FR-4.9 热切换：每次都重新读 active
-    let agent_label = match agent { "hermes" => "Hermes", _ => "Codex" };
+    // 503 文案用注册表显示名(opencode/openclaw 等此前误报「Codex 供应商」,openclaw 真机验收发现)
+    let agent_label = crate::agents::find(agent).map(|m| m.name).unwrap_or("Codex");
     let provider = match crate::providers::get_provider_for_agent(&state.providers_path, agent) {
         Some(p) => p,
         None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, &format!("请先选择 {agent_label} 供应商")),
@@ -1794,6 +1795,25 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("Hermes 通路暂不支持"), "人话错误: {body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// agent_label 注册表化(opencode 真机验收发现:此前误报「请先选择 Codex 供应商」)。
+    #[tokio::test]
+    async fn dispatch_503_uses_agent_registry_label() {
+        let (state, _providers_path, root) = make_state("label-opencode");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/opencode/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = proxy_opencode_chat(State(Arc::new(state)), req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("请先选择 OpenCode 供应商"), "应报平台名: {body}");
+        assert!(!body.contains("Codex 供应商"), "不得误报 Codex: {body}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
