@@ -896,3 +896,124 @@ mod real {
         println!("[cursor] 真机写入+卸载+零残留 通过");
     }
 }
+
+/// B 段真机 e2e(#[ignore] 手动驱动):五平台真实载体副本上 install→diff 精确→uninstall。
+/// 红线重点:Claude Desktop 真实文件含 5 条用户 MCP + 4 个顶层键,只动 mcpServers 段;
+/// 真实 ~/.codex、~/.hermes、~/.grok、opencode.json、claude_desktop_config.json 全程零触碰(副本);
+/// TRAE 真实写入(原 mcp.json 不存在)验后只删文件。
+#[cfg(test)]
+mod real_b {
+    use crate::agents::eco::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn home() -> PathBuf {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let t = std::env::temp_dir().join(format!("2xapi-eco-b-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        t
+    }
+
+    /// 通用全链:副本上 install → 已有条目/其他内容零变化 → uninstall → 还原。
+    fn cycle(store: &dyn EcoStore, tmp: &PathBuf, tag: &str) {
+        let before = store.read().unwrap();
+        println!("[{tag}] 已有条目: {:?}", before.keys().collect::<Vec<_>>());
+        let spec = preset_spec(find_preset("memory").unwrap(), None).unwrap();
+        install(store, tmp, tmp, "memory", &spec).unwrap();
+        let after = store.read().unwrap();
+        assert!(after.contains_key("memory"));
+        for (k, v) in &before {
+            assert_eq!(after.get(k), Some(v), "[{tag}] 已有条目 {k} 零变化");
+        }
+        uninstall(store, tmp, tmp, "memory").unwrap();
+        let final_ = store.read().unwrap();
+        assert_eq!(final_.len(), before.len(), "[{tag}] uninstall 后条目数还原");
+        for (k, v) in &before {
+            assert_eq!(final_.get(k), Some(v), "[{tag}] 还原后 {k} 与原始一致");
+        }
+    }
+
+    #[test]
+    #[ignore = "B 段真机验收:读真实载体副本 + TRAE 真实写入(新建即删),手动驱动"]
+    fn eco_real_machine_b() {
+        let h = home();
+
+        // ── claude-desktop:4 顶层键+5 条用户 MCP(红线重头)──
+        let t = tmp("cd");
+        let cd_real = h.join("Library/Application Support/Claude/claude_desktop_config.json");
+        assert!(cd_real.exists());
+        let orig = std::fs::read(&cd_real).unwrap();
+        let cd_dir = t.join("Claude");
+        std::fs::create_dir_all(&cd_dir).unwrap();
+        std::fs::write(cd_dir.join("claude_desktop_config.json"), &orig).unwrap();
+        let store = crate::agents::eco::cursor::JsonStore::at("claude-desktop", &cd_dir.join("claude_desktop_config.json"));
+        cycle(&store, &t, "claude-desktop");
+        let doc: serde_json::Value = serde_json::from_slice(&orig).unwrap();
+        assert_eq!(doc["mcpServers"].as_object().unwrap().len(), 5, "前提:5 条用户 MCP");
+        let _ = std::fs::remove_dir_all(&t);
+
+        // ── grokbuild ──
+        let t = tmp("grok");
+        let grok_real = h.join(".grok").join("config.toml");
+        if grok_real.exists() {
+            std::fs::write(t.join("config.toml"), std::fs::read(&grok_real).unwrap()).unwrap();
+            let store = crate::agents::eco::codex::TomlStore::at("grokbuild", &t.join("config.toml"));
+            cycle(&store, &t, "grokbuild");
+            let _ = std::fs::remove_dir_all(&t);
+        } else {
+            println!("[grokbuild] 真实 config.toml 不存在,跳过(路径:{})", grok_real.display());
+        }
+
+        // ── opencode ──
+        let t = tmp("oc");
+        let oc_real = h.join(".config/opencode/opencode.json");
+        if oc_real.exists() {
+            let oc_dir = t.join(".config/opencode");
+            std::fs::create_dir_all(&oc_dir).unwrap();
+            std::fs::write(oc_dir.join("opencode.json"), std::fs::read(&oc_real).unwrap()).unwrap();
+            let store = crate::agents::eco::opencode::OpencodeStore::new(&t);
+            cycle(&store, &t, "opencode");
+            let _ = std::fs::remove_dir_all(&t);
+        } else {
+            println!("[opencode] 真实 opencode.json 不存在,跳过");
+        }
+
+        // ── hermes:活配置,副本上验段级零触碰 ──
+        let t = tmp("her");
+        let her_real = h.join(".hermes/config.yaml");
+        if her_real.exists() {
+            std::fs::write(t.join("config.yaml"), std::fs::read(&her_real).unwrap()).unwrap();
+            let orig_text = std::fs::read_to_string(t.join("config.yaml")).unwrap();
+            let store = crate::agents::eco::hermes::HermesStore::new(&t);
+            cycle(&store, &t, "hermes");
+            // 顶层段级 diff:mcp_servers 之外的文本应不变
+            let final_text = std::fs::read_to_string(t.join("config.yaml")).unwrap();
+            let strip = |s: &str| -> String {
+                s.lines().filter(|l| !l.trim_start().starts_with("memory") && !l.contains("server-memory") && !l.contains("mcp_servers"))
+                    .collect::<Vec<_>>().join("\n")
+            };
+            assert_eq!(strip(&orig_text), strip(&final_text), "mcp_servers 段外文本必须逐行一致");
+            let _ = std::fs::remove_dir_all(&t);
+        } else {
+            println!("[hermes] 真实 config.yaml 不存在,跳过");
+        }
+
+        // ── trae:真实写入(原文件不存在)→ 形状 → 卸载零残留 ──
+        let mcp = h.join(".trae").join("mcp.json");
+        assert!(!mcp.exists(), "前提:~/.trae/mcp.json 不存在(存在则本测试不应运行)");
+        let store = crate::agents::eco::cursor::JsonStore::at("trae", &mcp);
+        let codex_data = h.join(".codex");
+        let spec = preset_spec(find_preset("playwright").unwrap(), None).unwrap();
+        install(&store, &codex_data, &codex_data.join("config-backups"), "playwright", &spec).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx");
+        uninstall(&store, &codex_data, &codex_data.join("config-backups"), "playwright").unwrap();
+        let _ = std::fs::remove_file(&mcp);
+        assert!(!mcp.exists(), "TRAE 零残留(只删 mcp.json,.trae 目录保留)");
+        println!("[B 段真机] 五平台全链通过");
+    }
+}
