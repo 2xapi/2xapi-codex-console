@@ -1716,7 +1716,8 @@ async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
 // 失败 {ok:false, error:{code,message}})。Key 只在响应里,不落盘、不进 ~/.claude、不进日志。
 async fn handle_desktop_claude_start(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let way = body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim();
-    match crate::desktop::claude_start(&s.providers_path, way) {
+    let pid = body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    match crate::desktop::claude_start(&s.providers_path, way, &pid) {
         Ok(data) => {
             let mut v = data;
             if let Value::Object(m) = &mut v {

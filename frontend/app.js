@@ -445,10 +445,10 @@ function claudeEnvHtml() {
   var base = env.ANTHROPIC_BASE_URL || env.baseUrl || "http://127.0.0.1:8787/anthropic";
   var rawTok = env.ANTHROPIC_AUTH_TOKEN || "";
   var tok = rawTok ? maskKey(rawTok) : (env.authTokenMasked || (p && p.apiKeyMasked) || "");
-  var model = env.ANTHROPIC_DEFAULT_MODEL || env.model || (p && p.model) || c.model || "";
+  var model = env.ANTHROPIC_MODEL || env.model || (p && p.model) || c.model || "";
   var rows = '<div><div class="k">ANTHROPIC_BASE_URL</div><div class="v mono">' + esc(base) + '</div></div>';
   if (tok) rows += '<div><div class="k">ANTHROPIC_AUTH_TOKEN</div><div class="v mono">' + esc(tok) + '</div></div>';
-  if (model) rows += '<div><div class="k">ANTHROPIC_DEFAULT_MODEL</div><div class="v mono">' + esc(model) + '</div></div>';
+  if (model) rows += '<div><div class="k">ANTHROPIC_MODEL</div><div class="v mono">' + esc(model) + '</div></div>';
   /* 可复制启动命令:界面掩码展示,「复制」取完整命令(含 Key)进剪贴板 */
   var cmdHtml = "";
   if (c.command) {
@@ -837,7 +837,7 @@ async function doClaudeStart(providerId) {
   if (!pid) { showToast("请先选择或新建一个供应商", "error"); return; }
   state.busy = "claude-start"; render();
   try {
-    var r = await api.claudeStart(claudeWay());
+    var r = await api.claudeStart(claudeWay(), pid);
     state.claude = {
       started: true,
       way: r.way || claudeWay(),

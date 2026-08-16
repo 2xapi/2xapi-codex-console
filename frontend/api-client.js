@@ -116,10 +116,10 @@
     // ── Claude 注入式托管(Claude 批次:后端返回注入信息,前端展示/复制;停用=前端本地态)──
     // claude-start 契约:成功 {ok:true, command, env:{ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN}, way, providerId, providerName, model}
     //   —— 字段在顶层(不走 data 信封);失败 {ok:false, error:{code,message}}(4xx)。Key 只在响应,不落盘。
-    claudeStart: async (way) => {
+    claudeStart: async (way, providerId) => {
       const resp = await fetch("/api/desktop/claude-start", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
-        body: JSON.stringify({ way: way || "" }),
+        body: JSON.stringify({ way: way || "", providerId: providerId || "" }),
       });
       const payload = await resp.json().catch(() => ({}));
       if (payload && payload.ok === true) {

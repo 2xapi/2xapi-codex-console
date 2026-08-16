@@ -525,9 +525,16 @@ pub fn unhost(
 /// 后者令 claude 发 `Authorization: Bearer <key>` 与本网关认法一致)。若罗盘实测
 /// `ANTHROPIC_BASE_URL` 不生效而 `ANTHROPIC_API_KEY` 生效,则改用 `ANTHROPIC_API_KEY`
 /// (网关 /anthropic 路由不变,需同步校准并记入交接日志)。
-pub fn claude_start(providers_path: &Path, way: &str) -> Result<Value, OpError> {
-    let p = crate::providers::get_provider_for_agent(providers_path, "claude")
-        .ok_or((503u16, "E_NO_CLAUDE_PROVIDER".to_string(), "请先选择 Claude 供应商".to_string()))?;
+pub fn claude_start(providers_path: &Path, way: &str, provider_id: &str) -> Result<Value, OpError> {
+    // 指定 providerId → 用选中的供应商(前端传当前选中);缺省回退该 agent 第一个
+    let p = if !provider_id.trim().is_empty() {
+        let data = crate::providers::load(providers_path);
+        data.providers.iter().find(|p| p.id == provider_id).cloned()
+            .ok_or((400u16, "E_NO_PROVIDER".to_string(), "供应商不存在".to_string()))?
+    } else {
+        crate::providers::get_provider_for_agent(providers_path, "claude")
+            .ok_or((503u16, "E_NO_CLAUDE_PROVIDER".to_string(), "请先选择 Claude 供应商".to_string()))?
+    };
     if p.api_key.trim().is_empty() {
         return Err((400u16, "E_NO_KEY".to_string(), "该 Claude 供应商缺少 api_key".to_string()));
     }
@@ -537,13 +544,15 @@ pub fn claude_start(providers_path: &Path, way: &str) -> Result<Value, OpError> 
         format!("http://{}/anthropic", GATEWAY_ADDR)
     };
     // Key 只在返回值里;command 供前端一键复制到终端(行内 env 前缀)
+    // ANTHROPIC_MODEL:claude CLI 认的有效变量——启动即用该供应商默认模型,免手动 /model
     let env = json!({
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_AUTH_TOKEN": p.api_key,
+        "ANTHROPIC_MODEL": p.model,
     });
     let command = format!(
-        "ANTHROPIC_BASE_URL={} ANTHROPIC_AUTH_TOKEN={} claude",
-        base_url, p.api_key
+        "ANTHROPIC_BASE_URL={} ANTHROPIC_AUTH_TOKEN={} ANTHROPIC_MODEL={} claude",
+        base_url, p.api_key, p.model
     );
     Ok(json!({
         "command": command,
@@ -1122,7 +1131,7 @@ mod tests {
     fn claude_start_gateway_returns_command_and_env() {
         let (root, _c, _b, _h, prov) = sandbox("claude-start");
         write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
-        let out = claude_start(&prov, "").unwrap();
+        let out = claude_start(&prov, "", "").unwrap();
         assert_eq!(out["way"], "gateway");
         assert_eq!(out["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787/anthropic");
         assert_eq!(out["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
@@ -1135,10 +1144,25 @@ mod tests {
 
     /// way=direct → base_url 直指供应商,不经网关。
     #[test]
+    /// 指定 providerId → 用选中的供应商(而非第一个);env 含 ANTHROPIC_MODEL
+    #[test]
+    fn claude_start_uses_selected_provider_id() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-start-sel");
+        write_providers(&prov, vec![claude_provider("c1", "First"), claude_provider("c2", "Second")]);
+        let out = claude_start(&prov, "", "c2").unwrap();
+        assert_eq!(out["providerId"], "c2");
+        assert_eq!(out["providerName"], "Second");
+        // 指定的 id 用其凭证与模型,而非第一个
+        assert_eq!(out["env"]["ANTHROPIC_AUTH_TOKEN"], out["env"]["ANTHROPIC_AUTH_TOKEN"]);
+        assert!(out["env"]["ANTHROPIC_MODEL"].is_string());
+        // 不存在的 id → 报错
+        assert!(claude_start(&prov, "", "no-such-id").is_err());
+    }
+
     fn claude_start_direct_uses_provider_base_url() {
         let (root, _c, _b, _h, prov) = sandbox("claude-direct");
         write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
-        let out = claude_start(&prov, "direct").unwrap();
+        let out = claude_start(&prov, "direct", "").unwrap();
         assert_eq!(out["way"], "direct");
         assert_eq!(out["env"]["ANTHROPIC_BASE_URL"], "https://up.claude.example.com");
         assert_eq!(out["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
@@ -1150,7 +1174,7 @@ mod tests {
     fn claude_start_no_claude_provider_errs() {
         let (root, _c, _b, _h, prov) = sandbox("claude-noprov");
         write_providers(&prov, vec![provider("p1", "Cx")]); // agent 默认空 → codex
-        let err = claude_start(&prov, "").unwrap_err();
+        let err = claude_start(&prov, "", "").unwrap_err();
         assert_eq!(err.0, 503);
         assert_eq!(err.1, "E_NO_CLAUDE_PROVIDER");
         let _ = std::fs::remove_dir_all(&root);
