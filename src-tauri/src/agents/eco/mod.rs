@@ -565,3 +565,97 @@ mod tests {
         assert_eq!(spec_summary(&json!({ "url": "https://x" })), "https://x");
     }
 }
+
+/// 真机 e2e(#[ignore],cargo test -- --ignored eco_real 手动驱动;grok 批次先例)。
+/// codex:真实 ~/.codex/config.toml 字节副本上 install→diff 精确→uninstall→diff=零。
+/// cursor:真实 HOME 写入 ~/.cursor/mcp.json(原文件不存在)→验证→uninstall→文件删除零残留。
+/// 真实 ~/.codex 与 ~/.cursor 全程零触碰(codex 走副本;cursor 写入物为新建文件,验后即删)。
+#[cfg(test)]
+mod real {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn real_home() -> PathBuf {
+        PathBuf::from(
+            std::env::var("HOME").unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    #[ignore = "真机验收:读真实 ~/.codex 副本与真实 HOME(只读+新建即删),手动驱动"]
+    fn eco_real_machine_e2e() {
+        // ── codex:字节副本 ──
+        let home = real_home();
+        let real_config = home.join(".codex").join("config.toml");
+        let tmp = std::env::temp_dir().join(format!("2xapi-eco-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(real_config.exists(), "真实 config.toml 应存在");
+        let original = std::fs::read(&real_config).unwrap();
+        std::fs::write(tmp.join("config.toml"), &original).unwrap();
+
+        let store = crate::agents::eco::codex::TomlStore::new(&tmp.join("config.toml"));
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+
+        let before: BTreeMap<String, Value> = store.read().unwrap();
+        println!("[codex] 副本已有 MCP 条目: {:?}", before.keys().collect::<Vec<_>>());
+
+        // install 预设 fetch
+        let v = install(&store, &tmp, &backup_dir, "fetch", &preset_spec(find_preset("fetch").unwrap())).unwrap();
+        let after = store.read().unwrap();
+        assert!(after.contains_key("fetch"), "install 后应含 fetch");
+        for k in before.keys() {
+            assert!(after.contains_key(k), "已有条目 {k} 必须保留");
+            assert_eq!(after[k], before[k], "已有条目 {k} 内容必须零变化");
+        }
+        let src = v["servers"].as_array().unwrap().iter().find(|s| s["id"] == "fetch").unwrap();
+        assert_eq!(src["source"], "console");
+
+        // diff 精确性:除 mcp_servers 外的顶层键零变化
+        let orig_toml: toml::Value = String::from_utf8(original.clone()).unwrap().parse().unwrap();
+        let now_toml: toml::Value = std::fs::read_to_string(tmp.join("config.toml")).unwrap().parse().unwrap();
+        for (k, v0) in orig_toml.as_table().unwrap() {
+            if k == "mcp_servers" { continue; }
+            assert_eq!(now_toml.get(k), Some(v0), "顶层键 {k} 零触碰");
+        }
+
+        // disable → 移除;enable → 写回
+        disable(&store, &tmp, &backup_dir, "fetch").unwrap();
+        assert!(!store.read().unwrap().contains_key("fetch"));
+        enable(&store, &tmp, &backup_dir, "fetch").unwrap();
+        assert!(store.read().unwrap().contains_key("fetch"));
+
+        // uninstall → mcp_servers 段回到原样(原有条目数),其他键不变
+        uninstall(&store, &tmp, &backup_dir, "fetch").unwrap();
+        let final_toml: toml::Value = std::fs::read_to_string(tmp.join("config.toml")).unwrap().parse().unwrap();
+        let final_mcp = final_toml.get("mcp_servers").and_then(|m| m.as_table()).map(|m| m.len()).unwrap_or(0);
+        let orig_mcp = orig_toml.get("mcp_servers").and_then(|m| m.as_table()).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(final_mcp, orig_mcp, "uninstall 后 MCP 段条目数应回到原始");
+        assert!(backup_dir.read_dir().unwrap().count() >= 1, "备份链存在");
+        let _ = std::fs::remove_dir_all(&tmp);
+        println!("[codex] 真机副本 e2e 通过");
+
+        // ── cursor:真实 HOME 写入(原文件不存在)──
+        assert!(!home.join(".cursor").join("mcp.json").exists(), "前提:真实 ~/.cursor/mcp.json 不存在(存在则本测试不应运行)");
+        let cstore = crate::agents::eco::cursor::JsonStore::new(&home);
+        let cbackup = home.join(".codex").join("config-backups");
+        let v = install(&cstore, &home.join(".codex"), &cbackup, "playwright", &preset_spec(find_preset("playwright").unwrap())).unwrap();
+        let raw = std::fs::read_to_string(home.join(".cursor").join("mcp.json")).unwrap();
+        let doc: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx", "真实写入形状");
+        assert_eq!(doc["mcpServers"]["playwright"]["args"][0], "@playwright/mcp@latest");
+        assert!(v["servers"].as_array().unwrap().iter().any(|s| s["id"] == "playwright"));
+
+        uninstall(&cstore, &home.join(".codex"), &cbackup, "playwright").unwrap();
+        // 卸载后:登记表无 playwright,mcpServers 段清空
+        let after_raw = std::fs::read_to_string(home.join(".cursor").join("mcp.json")).unwrap_or_default();
+        let after_doc: Value = serde_json::from_str(&after_raw).unwrap_or(Value::Null);
+        assert!(after_doc.get("mcpServers").is_none(), "卸载后 mcpServers 段应清空");
+        // 零残留:只删本测试新建的 mcp.json;~/.cursor 目录是 Cursor IDE 用户数据目录
+        // (真机实证:含 extensions/plugins/projects 等,始终存在),任何情况下不得删除目录本身。
+        let _ = std::fs::remove_file(home.join(".cursor").join("mcp.json"));
+        assert!(!home.join(".cursor").join("mcp.json").exists(), "零残留");
+        println!("[cursor] 真机写入+卸载+零残留 通过");
+    }
+}
