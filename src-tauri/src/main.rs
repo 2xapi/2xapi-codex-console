@@ -1,3 +1,6 @@
+// Windows GUI 程序不弹控制台窗口(release 生效,debug 保留控制台便于排障)
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod server;
 // M8:launcher 模块根为 launcher/mod.rs。显式 #[path] 是为了兼容旧 launcher.rs
 // 还未删除的过渡期(rustc 见到两者并存会报 ambiguous);删除旧文件后此写法同样有效。
@@ -22,7 +25,12 @@ use std::net::TcpListener;
 use tauri::{Manager, WebviewWindowBuilder};
 
 fn codex_home() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
+    // Windows 无 HOME 环境变量 → 回退 USERPROFILE,否则 home 解析为空导致 .codex 写错位置
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .unwrap_or_default();
     let h = std::env::var("CODEX_HOME").unwrap_or_else(|_| format!("{}/.codex", home));
     std::path::PathBuf::from(h)
 }
