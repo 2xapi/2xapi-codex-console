@@ -44,6 +44,8 @@ pub struct AppState {
     pub hermes_home: PathBuf,
     /// gemini 配置载体根(~/.gemini 所在;adapter 内 join(".gemini");测试传 tempdir)。
     pub gem_home: PathBuf,
+    /// grok 配置根(~/.grok;adapter 内 join("config.toml");测试传 tempdir)。
+    pub grok_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -929,6 +931,7 @@ mod tests {
             wb_home: PathBuf::from("/tmp/2xapi-m0-wb-home"),
             hermes_home: PathBuf::from("/tmp/2xapi-m0-hermes-home"),
             gem_home: PathBuf::from("/tmp/2xapi-m0-gem-home"),
+            grok_home: PathBuf::from("/tmp/2xapi-m0-grok-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1136,7 +1139,7 @@ mod tests {
 
         let soon = app
             .clone()
-            .oneshot(Request::builder().uri("/api/desktop/grokbuild/state").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/api/desktop/opencode/state").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(soon.status(), StatusCode::NOT_IMPLEMENTED);
@@ -1221,6 +1224,7 @@ mod tests {
             wb_home: root.clone(),
             hermes_home: root.join("hermes"),
             gem_home: root.clone(),
+            grok_home: root.join("grok"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1232,6 +1236,72 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// grokbuild 泛化路由 e2e:建 agent=grokbuild 供应商 → host 写 ~/.grok TOML → state 托管中 → unhost 还原(隔离 grok_home)
+    #[tokio::test]
+    async fn grokbuild_routes_e2e() {
+        let (state, root) = unique_state("grok-e2e");
+        let app = build_router(state.clone());
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"GrokT","agent":"grokbuild","baseUrl":"https://xai.example.com","apiKey":"sk-grok-test","model":"grok-4"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK, "agent=grokbuild 供应商应可建(available=true)");
+        let cv = body_json(created).await;
+        let pid = cv["data"]["id"].as_str().unwrap().to_string();
+
+        let hosted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/desktop/grokbuild/host")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"providerId": pid, "way": "gateway"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hosted.status(), StatusCode::OK);
+        let hv = body_json(hosted).await;
+        assert_eq!(hv["data"]["hosted"], Value::Bool(true));
+
+        let st = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/grokbuild/state").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let sv = body_json(st).await;
+        assert!(!sv["data"].is_null(), "host 后 state 应非 null");
+
+        let un = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/desktop/grokbuild/unhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(un.status(), StatusCode::OK);
+        let uv = body_json(un).await;
+        assert!(uv["data"]["restored"].is_boolean(), "unhost 应返回 restored 字段:{uv}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2052,6 +2122,7 @@ async fn handle_agent_state(
         "workbuddy" => ok_env(crate::agents::workbuddy::state(&s.wb_home)),
         "hermes" => ok_env(crate::agents::hermes::detect_state(&s.hermes_home.join("config.yaml"))),
         "gemini" => ok_env(crate::agents::gemini::state(&s.gem_home)),
+        "grokbuild" => ok_env(crate::agents::grok::state(&s.grok_home)),
         _ => agent_unsupported_response(),
     }
 }
@@ -2082,6 +2153,11 @@ async fn handle_agent_host(
             body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
             body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
         )),
+        "grokbuild" => agent_op_response(crate::agents::grok::host(
+            &s.grok_home, &s.backup_dir, &s.providers_path,
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -2101,6 +2177,7 @@ async fn handle_agent_unhost(
             &s.hermes_home.join("config.yaml"), &s.backup_dir, &s.providers_path,
         )),
         "gemini" => agent_op_response(crate::agents::gemini::unhost(&s.gem_home, &s.backup_dir)),
+        "grokbuild" => agent_op_response(crate::agents::grok::unhost(&s.grok_home, &s.backup_dir)),
         _ => agent_unsupported_response(),
     }
 }

@@ -220,6 +220,7 @@ fn api_backend_for(provider: &Provider) -> &'static str {
         WireApi::Responses => "responses",
         WireApi::ChatCompletions => "chat_completions",
         WireApi::Anthropic => DEFAULT_API_BACKEND, // Grok 不说 Anthropic 协议,回退默认
+        WireApi::Gemini => DEFAULT_API_BACKEND, // Grok 不说 Gemini 协议,回退默认
     }
 }
 

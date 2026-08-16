@@ -8,6 +8,7 @@
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
 
 pub mod gemini;
+pub mod grok;
 pub mod hermes;
 pub mod workbuddy;
 
@@ -67,7 +68,8 @@ static REGISTRY: &[AgentMeta] = &[
         id: "grokbuild",
         name: "Grok Build",
         tip: "Grok Build(即将上线)",
-        available: false,
+        // 配置引擎+接线已并入(本批);前端世界批次交付时 frontend_ready 翻 true
+        available: true,
         frontend_ready: false,
         egress: "chat",
         hosting: "config",
@@ -179,7 +181,10 @@ mod tests {
     /// +frontend_ready=false,其前端批次交付时翻 frontend_ready,本断言不动)。顺序 = REGISTRY 声明序。
     #[test]
     fn supported_ids_are_backend_merged() {
-        assert_eq!(supported_ids(), vec!["codex", "claude", "gemini", "hermes", "workbuddy"]);
+        assert_eq!(
+            supported_ids(),
+            vec!["codex", "claude", "gemini", "grokbuild", "hermes", "workbuddy"]
+        );
     }
 
     /// 前端世界就绪 = 可点亮导航:恰为 codex/claude/hermes(gemini/workbuddy 后端先行、前端未交付)。
