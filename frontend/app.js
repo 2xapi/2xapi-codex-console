@@ -260,8 +260,8 @@ function renderTopAuth() {
   var topBal = "";
   if (state.balShow) {
     var v = (bal == null) ? "…" : "$" + bal.toFixed(2);
-    var col = (bal != null && bal < 1) ? "var(--c-err)" : "var(--c-official)";
-    topBal = '<span class="chip" title="2xapi 账号余额(设置→账号 可关)" style="margin-right:6px">余额 <b style="color:' + col + '">' + v + '</b></span>';
+    var low = (bal != null && bal < 1) ? " low" : "";
+    topBal = '<button class="bal-top' + low + '" data-a="user-menu" title="2xapi 账号余额 · 点击打开账号菜单(设置→账号 可隐藏)">' + v + '</button>';
   }
   el.innerHTML = topBal + '<div class="userbox">'
     + '<button class="avatar" data-a="user-menu" title="账号菜单">' + esc(initial) + '</button>'
