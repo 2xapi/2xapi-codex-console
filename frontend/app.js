@@ -848,6 +848,48 @@ function renderModelRows() {
   }).join("");
   tb.innerHTML = rows || '<tr><td colspan="3" style="color:var(--muted)">还没有模型;点「拉取模型」自动填写。</td></tr>';
 }
+/* ── 预设供应商选择层(presets.js 目录:2xapi 置顶+27 家厂商;选中回填编辑弹窗) ── */
+var presetQuery = "";
+function openPresetPicker() {
+  if (!window.PRESETS || !window.PRESETS.length) { openEdit(null); return; }
+  presetQuery = "";
+  document.getElementById("presetSearch").value = "";
+  document.getElementById("presetMask").style.display = "";
+  renderPresetGrid();
+}
+function closePresetPicker() {
+  document.getElementById("presetMask").style.display = "none";
+}
+function renderPresetGrid() {
+  var q = presetQuery.trim().toLowerCase();
+  var list = window.PRESETS.filter(function (p) {
+    return !q || p.name.toLowerCase().indexOf(q) >= 0 || (p.baseUrl || "").toLowerCase().indexOf(q) >= 0;
+  });
+  document.getElementById("presetGrid").innerHTML = list.map(function (p) {
+    var top = p.top ? " top" : "";
+    return '<button class="preset-item' + top + '" data-a="preset-pick" data-id="' + esc(p.id) + '">'
+      + '<img src="' + esc(p.logo) + '" alt="">'
+      + '<span class="pn">' + esc(p.name) + '</span>'
+      + '<span class="pe">' + esc((p.baseUrl || "自填端点").replace(/^https?:\/\//, "").split("/")[0] || "自填端点") + '</span>'
+      + '</button>';
+  }).join("") || '<div class="sub" style="padding:20px;text-align:center">没有匹配的预设</div>';
+}
+function applyPreset(pid) {
+  var p = (window.PRESETS || []).find(function (x) { return x.id === pid; });
+  closePresetPicker();
+  openEdit(null); /* 先建空草稿,再回填 */
+  if (!p) return;
+  state.edit.name = p.name;
+  state.edit.baseUrl = p.baseUrl || "";
+  state.edit.wireApi = p.proto === "chat" ? "chat_completions" : p.proto;
+  state.edit.iconColor = p.iconColor || null;
+  document.getElementById("eName").value = p.name;
+  document.getElementById("eUrl").value = p.baseUrl || "";
+  var w = document.getElementById("eWire");
+  if (w) w.value = (p.proto === "chat" ? "chat_completions" : p.proto);
+  showToast("已填入「" + p.name + "」预设:补上 API Key,点「拉取模型」选默认模型即可", "ok");
+}
+
 function openEdit(id) {
   var p = id ? lineOf(id) : null;
   var isC = state.agent === "claude";
@@ -906,6 +948,7 @@ async function doSaveEdit() {
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
     wireApi: (function () { var w = document.getElementById("eWire"); var v = w ? w.value : "auto"; return v === "auto" ? state.edit.wireApi : v; })(), models: models,
     proxyUrl: "", timeoutSecs: null, notes: "", reasoning_levels: [],
+    iconColor: state.edit.iconColor || null,
     agent: state.agent,
   };
   state.busy = "save"; render();
@@ -1448,7 +1491,10 @@ document.addEventListener("click", function (ev) {
     case "imp-close": document.getElementById("impMask").style.display = "none"; state.importBusy = false; break;
     case "imp-do": doImport(); break;
     case "edit": openEdit(t.dataset.id); break;
-    case "new": openEdit(null); break;
+    case "new": openPresetPicker(); break;
+    case "preset-pick": applyPreset(t.dataset.id); break;
+    case "preset-close": closePresetPicker(); break;
+    case "preset-manual": closePresetPicker(); openEdit(null); break;
     case "edit-save": doSaveEdit(); break;
     case "close-edit": closeEdit(); break;
     case "mfetch": doFetchModels(); break;
@@ -1649,3 +1695,9 @@ function injectNavAgents() {
 }
 injectNavAgents();
 refreshAll().then(render).catch(function (e) { console.error(e); render(); });
+
+/* 预设层搜索框绑定(input 事件,委托外单独绑) */
+document.getElementById("presetSearch").addEventListener("input", function (e) {
+  presetQuery = e.target.value || "";
+  renderPresetGrid();
+});

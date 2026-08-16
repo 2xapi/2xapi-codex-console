@@ -51,6 +51,19 @@
 </div>
 
 <!-- 编辑供应商弹窗 -->
+<!-- 预设供应商选择层 -->
+<div class="mask" id="presetMask" style="display:none">
+  <div class="box preset-box">
+    <h3>新建供应商 · 从预设选择</h3>
+    <input id="presetSearch" class="mono" placeholder="搜索厂商或端点…" autocomplete="off">
+    <div class="preset-grid no-bar" id="presetGrid"></div>
+    <div class="btn-row" style="justify-content:space-between;margin-top:10px">
+      <button class="btn" data-a="preset-manual">手动填写(不用预设)</button>
+      <button class="btn" data-a="preset-close">取消</button>
+    </div>
+  </div>
+</div>
+
 <div class="mask" id="editMask" style="display:none">
   <div class="box">
     <h3 id="editTitle">编辑供应商</h3>
@@ -116,6 +129,7 @@
 </div>
 
 <script src="./api-client.js"></script>
+<script src="./presets.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>
