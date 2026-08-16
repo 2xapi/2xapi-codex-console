@@ -17,9 +17,11 @@ mod backups;
 mod history;
 mod gateway;
 mod gateway_conv;
+mod gateway_gemini_conv;
 mod diagnose;
 mod acclines;
 mod nodecreds;
+mod agents;
 
 use std::net::TcpListener;
 use tauri::{Manager, WebviewWindowBuilder};
@@ -66,6 +68,18 @@ fn main() {
         backup_dir: backup_dir.clone(),
         providers_path: providers_path.clone(),
         codex_home: codex_home.clone(),
+        // workbuddy 双载体(~/.codebuddy 与 ~/.workbuddy)的公共根;测试传 tempdir(server/gateway 测试态)
+        wb_home: std::path::PathBuf::from(
+            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .unwrap_or_default(),
+        ),
+        // gemini 载体根(~/.gemini 所在);测试传 tempdir
+        gem_home: std::path::PathBuf::from(
+            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .unwrap_or_default(),
+        ),
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,

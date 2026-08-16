@@ -1380,4 +1380,24 @@ document.addEventListener("input", function (ev) {
 
 /* ── 启动 ── */
 try { state.balShow = localStorage.getItem("2xapi.balShow") !== "off"; } catch (e) {}
+/* ── 多平台导航数据驱动(A 阶段,方案 §2.3 + D3):从注册表拉取未实现平台,在 claude 按钮后插入
+ * 「即将上线」占位按钮(首字母标,disabled)。codex/claude 真实按钮保留静态 DOM 零改动;
+ * 拉取失败或为空 → 维持现状(行为零变化)。幂等:只注入一次。── */
+function injectUpcomingAgents() {
+  return api.agents().then(function (reg) {
+    var upcoming = ((reg && reg.agents) || []).filter(function (m) { return !m.available; });
+    var anchor = document.querySelector('.nav .nav-btn.agent[data-g="claude"]');
+    if (!anchor || !upcoming.length || anchor.dataset.upcomingDone) return;
+    anchor.dataset.upcomingDone = "1";
+    var html = upcoming.map(function (m) {
+      var g = (m.name || "?").trim().charAt(0).toUpperCase();
+      return '<button class="nav-btn" disabled style="--ac:#8a8f98" title="' + esc(m.name) + '">'
+        + '<span style="display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;font-size:11px;font-weight:600;color:#8a8f98">' + esc(g) + '</span>'
+        + '<span class="tip">' + esc(m.tip || ((m.name || "") + "(即将上线)")) + '</span>'
+        + '</button>';
+    }).join("");
+    anchor.insertAdjacentHTML("afterend", html);
+  }).catch(function (e) { console.warn("agents 注册表拉取失败,维持静态导航", e); });
+}
+injectUpcomingAgents();
 refreshAll().then(render).catch(function (e) { console.error(e); render(); });
