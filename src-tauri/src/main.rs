@@ -73,6 +73,7 @@ fn main() {
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default(),
         ),
+        hermes_home: crate::agents::hermes::hermes_home(),
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,

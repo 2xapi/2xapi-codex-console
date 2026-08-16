@@ -23,15 +23,22 @@ use crate::server::AppState;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 pub async fn proxy_responses(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
-    dispatch(&s, req, "responses").await
+    dispatch(&s, req, "responses", "codex").await
 }
 
 pub async fn proxy_chat(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
-    dispatch(&s, req, "chat/completions").await
+    dispatch(&s, req, "chat/completions", "codex").await
 }
 
 pub async fn proxy_models(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
-    dispatch(&s, req, "models").await
+    dispatch(&s, req, "models", "codex").await
+}
+
+/// Hermes 流量转发入口(`/hermes/chat/completions` 与 `/hermes/v1/chat/completions`,server.rs 注册)。
+/// hermes 条目 base_url=网关+/hermes,OpenAI SDK 自动追加 `/chat/completions` 命中此处;
+/// 与 Codex 共用 dispatch(取数按 agent=hermes 过滤,加速/407 体系同享)。
+pub async fn proxy_hermes_chat(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    dispatch(&s, req, "chat/completions", "hermes").await
 }
 
 /// Claude 流量转发入口(`/anthropic/v1/messages` 与 `/anthropic/messages`,server.rs 注册)。
@@ -132,18 +139,25 @@ async fn dispatch_anthropic(state: &AppState, req: Request<Body>) -> Response<Bo
     }
 }
 
-/// 统一转发(Codex 路径 `/v1/*`):取 agent=codex 的 active 供应商 → 注入凭证 → 转发 → 流式透传响应。
-/// 本期语义(Claude 接入):按 agent 过滤取供应商,见 providers::get_provider_for_agent——
-/// 全局 active 若是 claude,`/v1/*` 取 codex 首个,不把 Codex 流量发给 claude 供应商。
-async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str) -> Response<Body> {
+/// 统一转发(Codex 路径 `/v1/*`):取 agent 的 active 供应商 → 注入凭证 → 转发 → 流式透传响应。
+/// 语义(按 agent 过滤取供应商,见 providers::get_provider_for_agent)——
+/// 全局 active 若属其他 agent,取本 agent sort_index 最小者,不串台。
+/// hermes 接入(B 阶段):`/hermes/chat/completions` 走同一 dispatch,agent="hermes"。
+async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str, agent: &str) -> Response<Body> {
     // FR-4.9 热切换：每次都重新读 active
-    let provider = match crate::providers::get_provider_for_agent(&state.providers_path, "codex") {
+    let agent_label = match agent { "hermes" => "Hermes", _ => "Codex" };
+    let provider = match crate::providers::get_provider_for_agent(&state.providers_path, agent) {
         Some(p) => p,
-        None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择 Codex 供应商"),
+        None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, &format!("请先选择 {agent_label} 供应商")),
     };
     // Official 不应经网关（01-D1）；防御性拒绝
     if provider.access_mode == AccessMode::Official {
         return err_resp(StatusCode::BAD_REQUEST, "Official 模式不走网关");
+    }
+    // hermes 通路(OpenAI Chat 形态)暂不支持 Responses 型上游(需 chat→responses 转换,未做):
+    // 明确报错不静默(人话错误映射原则),提示换 Chat 兼容供应商
+    if agent == "hermes" && provider.wire_api == crate::providers::WireApi::Responses {
+        return err_resp(StatusCode::BAD_REQUEST, "该供应商为 Responses 协议,Hermes 通路暂不支持,请换 Chat 兼容协议的供应商");
     }
 
     // ── 阶段 4 加速装配:决定走哪条线路,并备好直连兜底 ──
@@ -753,6 +767,7 @@ mod tests {
             providers_path: providers_path.clone(),
             codex_home: root.join("codex"),
             wb_home: root.clone(),
+            hermes_home: root.join("hermes"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(crate::server::AccelCfg::default())),
@@ -1075,6 +1090,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── Hermes 接入(/hermes/chat/completions 专属入口,共用 dispatch)──
+
+    async fn mock_chat_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                let seen = seen_clone.clone();
+                async move {
+                    let auth = h
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from)
+                        .unwrap_or_default();
+                    seen.lock().unwrap().push(auth);
+                    (StatusCode::OK, "{\"id\":\"chatcmpl-ok\"}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), seen)
+    }
+
+    async fn req_post_hermes(body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/hermes/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn add_hermes_provider(path: &std::path::Path, base_url: &str, api_key: &str) -> String {
+        let input = ProviderInput {
+            name: "HermesT".into(),
+            agent: "hermes".into(),
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: "glm-5".into(),
+            wire_api: crate::providers::WireApi::ChatCompletions,
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        };
+        let p = providers::create(path, input).unwrap();
+        providers::set_active(path, &p.id);
+        p.id
+    }
+
+    /// Hermes 接入:全局 active 是 codex,但存在 hermes 供应商 → /hermes/* 仍取 hermes(不串台)。
+    #[tokio::test]
+    async fn hermes_route_uses_hermes_provider_even_when_active_is_codex() {
+        let (base, seen) = mock_chat_upstream().await;
+        let (state, providers_path, root) = make_state("hermes-isolate");
+        let input_cx = ProviderInput {
+            name: "Cx".into(),
+            agent: "codex".into(),
+            base_url: "http://127.0.0.1:9".into(), // 若误发到 codex 会立刻失败
+            api_key: "sk-codex-key".into(),
+            model: "gpt-test".into(),
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        };
+        let p_cx = providers::create(&providers_path, input_cx).unwrap();
+        let _p_hm = add_hermes_provider(&providers_path, &base, "sk-hermes-secret");
+        providers::set_active(&providers_path, &p_cx.id);
+
+        let resp = proxy_hermes_chat(State(Arc::new(state)), req_post_hermes("{\"model\":\"glm-5\"}").await).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"{\"id\":\"chatcmpl-ok\"}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(seen.lock().unwrap().first().map(|a| a.as_str()), Some("Bearer sk-hermes-secret"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Hermes 接入:Responses 型供应商 → 400 人话错误(不静默)。
+    #[tokio::test]
+    async fn hermes_route_rejects_responses_wire_provider() {
+        let (state, providers_path, root) = make_state("hermes-resp");
+        let input = ProviderInput {
+            name: "HmR".into(),
+            agent: "hermes".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-x".into(),
+            model: "m".into(),
+            wire_api: crate::providers::WireApi::Responses, // 默认值,但显式标注意图
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        };
+        let p = providers::create(&providers_path, input).unwrap();
+        providers::set_active(&providers_path, &p.id);
+
+        let resp = proxy_hermes_chat(State(Arc::new(state)), req_post_hermes("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("Hermes 通路暂不支持"), "人话错误: {body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Hermes 接入:无 hermes 供应商 → 503。
+    #[tokio::test]
+    async fn hermes_route_no_hermes_provider_returns_503() {
+        let (state, _providers_path, root) = make_state("hermes-none");
+        let resp = proxy_hermes_chat(State(Arc::new(state)), req_post_hermes("{}").await).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── R1 /anthropic 加速接线(与 Codex 同一体系,四个必测场景)──
 
     // ⑴ anthropic + official 命中 → 请求经代理转发到上游。mock 代理校验 Basic auth
@@ -1205,6 +1334,7 @@ mod tests {
             providers_path: s.providers_path.clone(),
             codex_home: s.codex_home.clone(),
             wb_home: s.wb_home.clone(),
+            hermes_home: s.hermes_home.clone(),
             launcher: s.launcher.clone(),
             health: s.health.clone(),
             accel: s.accel.clone(),

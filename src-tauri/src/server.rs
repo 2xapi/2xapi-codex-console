@@ -40,6 +40,8 @@ pub struct AppState {
     pub codex_home: PathBuf,
     /// workbuddy 双配置载体(~/.codebuddy 与 ~/.workbuddy)的公共根(即用户 home;测试传 tempdir)。
     pub wb_home: PathBuf,
+    /// hermes 配置根(HERMES_HOME 优先,默认 ~/.hermes;测试传 tempdir,杜绝写真实活配置)。
+    pub hermes_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -67,6 +69,9 @@ pub fn build_router(state: AppState) -> Router {
         // --- 网关代理 /anthropic/*（Claude 接入；Claude Code 以 /anthropic 为 base 会请求 /anthropic/v1/messages）---
         .route("/anthropic/v1/messages", post(crate::gateway::proxy_anthropic))
         .route("/anthropic/messages", post(crate::gateway::proxy_anthropic))
+        // --- 网关代理 /hermes/*（Hermes 接入;hermes 条目 base_url=网关+/hermes,SDK 追加 /chat/completions）---
+        .route("/hermes/v1/chat/completions", post(crate::gateway::proxy_hermes_chat))
+        .route("/hermes/chat/completions", post(crate::gateway::proxy_hermes_chat))
         // --- Health & session ---
         .route("/api/health", get(handle_health))
         .route("/api/session", get(handle_session))
@@ -918,6 +923,7 @@ mod tests {
             providers_path: PathBuf::from("/tmp/2xapi-m0-providers.json"),
             codex_home: PathBuf::from("/tmp/2xapi-m0-codex-home"),
             wb_home: PathBuf::from("/tmp/2xapi-m0-wb-home"),
+            hermes_home: PathBuf::from("/tmp/2xapi-m0-hermes-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1007,6 +1013,86 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let cli: Value = serde_json::from_str(&std::fs::read_to_string(root.join(".codebuddy/models.json")).unwrap()).unwrap();
         assert!(cli["models"].as_array().unwrap().is_empty(), "unhost 后条目移除");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// hermes 泛化路由 e2e:host 写 YAML 条目+指针 → state 报托管 → unhost 还原(隔离 hermes_home)
+    #[tokio::test]
+    async fn hermes_routes_e2e() {
+        let (state, root) = unique_state("hermes-e2e");
+        let app = build_router(state);
+        let hermes_dir = root.join("hermes");
+        std::fs::create_dir_all(&hermes_dir).unwrap();
+        let original_yaml = "model:\n  provider: openai-api\n  default: gpt-5.5\nagent:\n  reasoning_effort: max\n_config_version: 33\nmcp_servers: {}\n";
+        std::fs::write(hermes_dir.join("config.yaml"), original_yaml).unwrap();
+        std::fs::write(
+            root.join("providers.json"),
+            serde_json::json!({"providers": [{"id": "hp", "name": "测站", "agent": "hermes",
+                "base_url": "https://2xa.example/v1", "api_key": "sk-h", "model": "glm-5"}]}).to_string(),
+        )
+        .unwrap();
+
+        // host(gateway)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/hermes/host")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"providerId":"hp","way":"gateway"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["data"]["hosted"], Value::Bool(true));
+        assert_eq!(v["data"]["pointerSwitched"], Value::Bool(true), "官方指针应切换");
+        let yaml = std::fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
+        assert!(yaml.contains("2xapi-gateway"));
+        assert!(yaml.contains("http://127.0.0.1:8787/hermes"));
+        assert!(!yaml.contains("sk-h"), "真 Key 不得落盘");
+        assert!(yaml.contains("_config_version: 33"), "用户字段保留");
+
+        // state
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/hermes/state").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["data"]["hosting"]["way"].as_str(), Some("gateway"));
+
+        // way=direct 拒绝(叠加平台仅 gateway)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/hermes/host")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"providerId":"hp","way":"direct"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 网关专属入口存在(405 证路由注册;POST 语义在 gateway 测试覆盖)
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri("/hermes/chat/completions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // unhost → 指针回官方、条目移除
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().method("POST").uri("/api/desktop/hermes/unhost").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let yaml = std::fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
+        assert!(!yaml.contains("2xapi-gateway"));
+        assert!(yaml.contains("provider: openai-api"), "指针恢复官方默认");
+        assert!(yaml.contains("_config_version: 33"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1128,6 +1214,7 @@ mod tests {
             providers_path: root.join("providers.json"),
             codex_home: root.join("codex"),
             wb_home: root.clone(),
+            hermes_home: root.join("hermes"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1957,6 +2044,7 @@ async fn handle_agent_state(
     match agent.as_str() {
         "codex" => ok_env(crate::desktop::state(&s.config_path, &s.providers_path, &s.codex_home)),
         "workbuddy" => ok_env(crate::agents::workbuddy::state(&s.wb_home)),
+        "hermes" => ok_env(crate::agents::hermes::detect_state(&s.hermes_home.join("config.yaml"))),
         _ => agent_unsupported_response(),
     }
 }
@@ -1977,6 +2065,11 @@ async fn handle_agent_host(
             body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
             body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
         )),
+        "hermes" => agent_op_response(crate::agents::hermes::host(
+            &s.hermes_home.join("config.yaml"), &s.backup_dir, &s.providers_path,
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -1992,6 +2085,9 @@ async fn handle_agent_unhost(
     match agent.as_str() {
         "codex" => desktop_unhost_impl(&s),
         "workbuddy" => agent_op_response(crate::agents::workbuddy::unhost(&s.wb_home, &s.backup_dir)),
+        "hermes" => agent_op_response(crate::agents::hermes::unhost(
+            &s.hermes_home.join("config.yaml"), &s.backup_dir, &s.providers_path,
+        )),
         _ => agent_unsupported_response(),
     }
 }
