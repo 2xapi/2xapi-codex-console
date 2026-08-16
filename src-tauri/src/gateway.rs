@@ -41,6 +41,17 @@ pub async fn proxy_hermes_chat(State(s): State<Arc<AppState>>, req: Request<Body
     dispatch(&s, req, "chat/completions", "hermes").await
 }
 
+/// OpenCode 流量转发入口(`/opencode/*`;opencode 条目 baseURL=网关+/opencode/v1,
+/// npm openai-compatible 追加 /chat/completions)。取 agent=opencode 的 active 供应商。
+pub async fn proxy_opencode_chat(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    dispatch(&s, req, "chat/completions", "opencode").await
+}
+
+/// OpenClaw 流量转发入口(`/openclaw/*`;条目 api=openai-completions,baseURL=网关+/openclaw/v1)。
+pub async fn proxy_openclaw_chat(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    dispatch(&s, req, "chat/completions", "openclaw").await
+}
+
 /// Claude 流量转发入口(`/anthropic/v1/messages` 与 `/anthropic/messages`,server.rs 注册)。
 pub async fn proxy_anthropic(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     dispatch_anthropic(&s, req).await
@@ -1009,6 +1020,8 @@ mod tests {
             hermes_home: root.join("hermes"),
             gem_home: root.clone(),
             grok_home: root.join("grok"),
+            oc_home: root.join("ochome"),
+            oclaw_home: root.join("oclaw"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(crate::server::AccelCfg::default())),
@@ -1903,6 +1916,8 @@ mod tests {
             hermes_home: s.hermes_home.clone(),
             gem_home: s.gem_home.clone(),
             grok_home: s.grok_home.clone(),
+            oc_home: s.oc_home.clone(),
+            oclaw_home: s.oclaw_home.clone(),
             launcher: s.launcher.clone(),
             health: s.health.clone(),
             accel: s.accel.clone(),
