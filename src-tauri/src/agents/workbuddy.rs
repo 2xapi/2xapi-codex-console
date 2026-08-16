@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// 本产品在 models.json 里的身份标记:条目 vendor 与 id 均用它,unhost 按 vendor 整集移除。
 pub const VENDOR: &str = "2xapi-gateway";
 /// 网关 Chat 入口(gateway.rs 根路径直收 /chat/completions)。
-const GATEWAY_CHAT_URL: &str = "http://127.0.0.1:8787/chat/completions";
+const GATEWAY_CHAT_URL: &str = "http://127.0.0.1:8787/workbuddy/v1/chat/completions";
 
 type OpError = (u16, String, String);
 

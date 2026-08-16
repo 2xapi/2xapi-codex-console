@@ -52,6 +52,17 @@ pub async fn proxy_openclaw_chat(State(s): State<Arc<AppState>>, req: Request<Bo
     dispatch(&s, req, "chat/completions", "openclaw").await
 }
 
+/// Grok Build 流量转发入口(`/grokbuild/*`;~/.grok TOML base_url=网关+/grokbuild,
+/// api_backend=responses 时 CLI 追加 /responses)。取 agent=grokbuild 的 active 供应商。
+pub async fn proxy_grokbuild_responses(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    dispatch(&s, req, "responses", "grokbuild").await
+}
+
+/// WorkBuddy 流量转发入口(`/workbuddy/*`;models.json 条目 url=完整地址直指本入口)。
+pub async fn proxy_workbuddy_chat(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    dispatch(&s, req, "chat/completions", "workbuddy").await
+}
+
 /// Claude 流量转发入口(`/anthropic/v1/messages` 与 `/anthropic/messages`,server.rs 注册)。
 pub async fn proxy_anthropic(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     dispatch_anthropic(&s, req).await
@@ -65,7 +76,18 @@ pub async fn proxy_anthropic(State(s): State<Arc<AppState>>, req: Request<Body>)
 /// - R1 加速接线:与 Codex 同一体系——accel_plan 命中 → 首选 build_line_client;连接层失败且
 ///   未写首字节 → 直连重试一次;407 → per-Key 重签判别/降级直连/人话化 502(共用 send_with_accel)。
 async fn dispatch_anthropic(state: &AppState, req: Request<Body>) -> Response<Body> {
-    let provider = match crate::providers::get_provider_for_agent(&state.providers_path, "claude") {
+    dispatch_anthropic_for(state, req, "claude").await
+}
+
+/// Claude Desktop 流量入口(`/claude-desktop/*`;3p profile baseUrl=网关+/claude-desktop,
+/// app 追加 /v1/messages)。per-agent 取供应商,与 Claude Code 的 /anthropic/* 不串台。
+pub async fn proxy_claude_desktop_messages(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    dispatch_anthropic_for(&s, req, "claude-desktop").await
+}
+
+/// Anthropic 协议转发(agent 参数化:Claude Code 与 Claude Desktop 各自取各自 active)。
+async fn dispatch_anthropic_for(state: &AppState, req: Request<Body>, agent: &str) -> Response<Body> {
+    let provider = match crate::providers::get_provider_for_agent(&state.providers_path, agent) {
         Some(p) => p,
         None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择 Claude 供应商"),
     };
@@ -1022,6 +1044,7 @@ mod tests {
             grok_home: root.join("grok"),
             oc_home: root.join("ochome"),
             oclaw_home: root.join("oclaw"),
+            cd_home: root.join("cdsupport"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(crate::server::AccelCfg::default())),
@@ -1918,6 +1941,7 @@ mod tests {
             grok_home: s.grok_home.clone(),
             oc_home: s.oc_home.clone(),
             oclaw_home: s.oclaw_home.clone(),
+            cd_home: s.cd_home.clone(),
             launcher: s.launcher.clone(),
             health: s.health.clone(),
             accel: s.accel.clone(),
