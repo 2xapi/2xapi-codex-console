@@ -226,8 +226,9 @@ async fn dispatch_gemini(state: &AppState, model_action: &str, req: Request<Body
         return gemini_err(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", "Official 模式不走网关");
     }
 
-    // ── 加速装配(与 dispatch_anthropic 同款)──
+    // ── 加速装配(与 dispatch 同源):per-Key 凭证覆盖/确保(缺失或超 12h → 同步签发)+407 判别/降级 ──
     let line = accel_plan(state, &provider.base_url, &provider.api_key);
+    let line = ensure_line_cred(state, line, &provider.base_url, &provider.api_key).await;
     let direct_client = match build_client(&provider) {
         Ok(c) => c,
         Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("build client: {e}")),
@@ -486,7 +487,15 @@ async fn dispatch(state: &AppState, req: Request<Body>, suffix: &str, agent: &st
             (suffix.to_string(), body_bytes.to_vec(), None)
         };
 
-    let url = format!("{}/{}", provider.base_url.trim_end_matches('/'), target_suffix);
+    // chat 上游路径补 /v1(真机实证 2026-08-16:2xa.cc.cd 的 /chat/completions 404,/v1/chat/completions 通;
+    // DeepSeek 等根路径站两写皆通——带 /v1 后缀续接、不带补齐,同 dispatch_anthropic 规则)。
+    // responses 不动:2xa 的 /responses 根路径在役(codex 主链),改了会破坏现有流量。
+    let base = provider.base_url.trim_end_matches('/');
+    let url = if target_suffix == "chat/completions" && !base.ends_with("/v1") {
+        format!("{base}/v1/{target_suffix}")
+    } else {
+        format!("{base}/{target_suffix}")
+    };
 
     // 01-D3：注入 provider.api_key（覆盖任何来源的凭证）；请求构建抽为闭包以支持换线重试
     let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
@@ -1570,11 +1579,14 @@ mod tests {
         let provs = v.get("providers").and_then(|p| p.as_array()).expect("providers 数组");
         let entry = provs
             .iter()
-            .find(|p| p.get("base_url").and_then(|b| b.as_str()).map(|s| s.contains("2xapi.cc.cd")).unwrap_or(false) && p.get("api_key").and_then(|k| k.as_str()).map(|s| !s.is_empty()).unwrap_or(false))
-            .expect("未找到带 Key 的 2xapi.cc.cd 供应商");
+            .find(|p| {
+                let base_2xa = p.get("base_url").and_then(|b| b.as_str()).map(|s| s.contains("2xa")).unwrap_or(false);
+                base_2xa && p.get("api_key").and_then(|k| k.as_str()).map(|s| !s.is_empty()).unwrap_or(false)
+            })
+            .expect("未找到带 Key 的 2xa 系供应商");
         let real_key = entry["api_key"].as_str().unwrap().to_string();
         let model = entry["model"].as_str().unwrap_or("deepseek-chat").to_string();
-        let upstream_base = entry["base_url"].as_str().unwrap_or("https://2xapi.cc.cd").to_string();
+        let upstream_base = entry["base_url"].as_str().unwrap_or("https://2xa.cc.cd").to_string();
         eprintln!("[E2E] 上游 = {upstream_base} 模型 = {model}");
 
         // 2. 隔离环境:临时 providers.json(仅 1 个 gemini 供应商)+ 临时 HOME
@@ -1605,6 +1617,8 @@ mod tests {
                 .env("GOOGLE_GEMINI_BASE_URL", format!("http://127.0.0.1:{port}"))
                 .env("GEMINI_CLI_TRUST_WORKSPACE", "true")
                 .env("GEMINI_MODEL", &model)
+                // CLI 辅助/摘要模型默认 gemini-3.1-flash-lite,上游 Key 组通常没有 → 指向同组模型
+                .env("GEMINI_SMALL_MODEL", &model)
                 .output(),
         )
         .await
@@ -1698,21 +1712,28 @@ mod tests {
     async fn mock_hermes_chat_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
-                let seen = seen_clone.clone();
-                async move {
-                    let auth = h
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .map(String::from)
-                        .unwrap_or_default();
-                    seen.lock().unwrap().push(auth);
-                    (StatusCode::OK, "{\"id\":\"chatcmpl-ok\"}")
+        // 双路径监听:dispatch 对 base 不带 /v1 的 chat 上游补 /v1(2026-08-16 修正),两写都接
+        let make_handler = {
+            let seen = seen_clone.clone();
+            move || {
+                let seen = seen.clone();
+                move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        let auth = h
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from)
+                            .unwrap_or_default();
+                        seen.lock().unwrap().push(auth);
+                        (StatusCode::OK, "{\"id\":\"chatcmpl-ok\"}")
+                    }
                 }
-            }),
-        );
+            }
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(make_handler()))
+            .route("/v1/chat/completions", post(make_handler()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1944,6 +1965,47 @@ mod tests {
         assert_eq!(up_seen.lock().unwrap().len(), 1, "直连重试恰好命中上游一次");
         assert!(!px_seen.lock().unwrap().is_empty(), "首发应打到代理(收到 407)");
         let entry = state.nodecreds.read().unwrap().get_for_key("sk-claude-full-0006").cloned().unwrap();
+        assert!(entry.degraded_to_direct, "QuotaFull 应记 degraded_to_direct");
+        assert_eq!(entry.quota_used_bytes, 777, "快照 used 应回写");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// gemini per-Key 407/配额满:降级直连且响应转换回 Gemini 形态(对齐 anthropic 同款测试)。
+    #[tokio::test]
+    async fn gemini_per_key_407_quota_full_degrades_direct() {
+        let issue = crate::server::spawn_issue_mock(
+            "403 Forbidden",
+            r#"{"error":"该账号本月已用满 10G","quotaUsedBytes":777,"quotaTotalBytes":888}"#,
+        )
+        .await;
+        let _g = crate::server::set_issue_base_for_tests(&issue);
+        let chat_resp = r#"{"id":"c1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"收到"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#;
+        let (up_base, up_seen) = mock_chat_upstream(chat_resp, "application/json").await;
+        let (px_url, px_seen) = mock_proxy(Some(("right", "right"))).await;
+        let (state, providers_path, root) = make_state("gem-pk-403");
+        add_gemini_provider(&providers_path, &up_base, "sk-gem-full-0006", crate::providers::WireApi::ChatCompletions);
+        put_cred(&state, "sk-gem-full-0006", "stale-user", "stale-pass", false); // 代理侧为错 → 407
+        set_accel(
+            &state,
+            "official",
+            vec![test_line("l1", &px_url, &["127.0.0.1"], Some(Cred { user: "x".into(), pass: "y".into() }))],
+            "",
+        );
+
+        let resp = proxy_gemini(
+            State(Arc::new(state.clone())),
+            axum::extract::Path("m:generateContent".into()),
+            req_gemini("m:generateContent", None, r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#.into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "配额满降级直连应 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "收到", "降级直连响应应完整转换回 Gemini 形态:\n{v}");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(up_seen.lock().unwrap().len(), 1, "直连重试恰好命中上游一次");
+        assert!(!px_seen.lock().unwrap().is_empty(), "首发应打到代理(收到 407)");
+        let entry = state.nodecreds.read().unwrap().get_for_key("sk-gem-full-0006").cloned().unwrap();
         assert!(entry.degraded_to_direct, "QuotaFull 应记 degraded_to_direct");
         assert_eq!(entry.quota_used_bytes, 777, "快照 used 应回写");
         let _ = std::fs::remove_dir_all(&root);
