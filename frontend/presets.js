@@ -3,7 +3,7 @@ window.PRESETS = [
   {id:"2xapi",name:"2xapi(官方)",logo:"assets/logos/2xapi.svg",iconColor:"#3D7EFF",baseUrl:"https://2xapi.cc.cd",proto:"chat",top:true},
   {id:"openai",name:"OpenAI",logo:"assets/logos/openai.svg",iconColor:"#10A37F",baseUrl:"https://api.openai.com/v1",proto:"responses",top:false},
   {id:"anthropic",name:"Anthropic (Claude)",logo:"assets/logos/anthropic.svg",iconColor:"#CC785C",baseUrl:"https://api.anthropic.com/v1",proto:"anthropic",top:false},
-  {id:"gemini",name:"Google (Gemini)",logo:"assets/logos/gemini.svg",iconColor:"#4285F4",baseUrl:"https://generativelanguage.googleapis.com/",proto:"gemini",top:false},
+  {id:"gemini",name:"Google (Gemini)",logo:"assets/logos/gemini.svg",iconColor:"#4285F4",baseUrl:"https://generativelanguage.googleapis.com",proto:"gemini",top:false},
   {id:"xai",name:"xAI (Grok)",logo:"assets/logos/xai.svg",iconColor:"#000000",baseUrl:"https://api.x.ai/v1",proto:"chat",top:false},
   {id:"meta",name:"Meta (Llama)",logo:"assets/logos/meta.svg",iconColor:"#0866FF",baseUrl:"https://api.llama.com/compat/v1",proto:"chat",top:false},
   {id:"mistral",name:"Mistral AI",logo:"assets/logos/mistral.svg",iconColor:"#FF7000",baseUrl:"https://api.mistral.ai/v1",proto:"chat",top:false},
