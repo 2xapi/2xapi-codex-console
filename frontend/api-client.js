@@ -87,6 +87,8 @@
     // ── 桌面版托管开关（阶段 1，任务书 §1.1）──
     // host/unhost 的错误形态为 {"error": code, "message": msg}（非 04 信封），需单独剥出 code
     desktopState: () => request("GET", "/api/desktop/state"),
+  // 多平台注册表(A 阶段,D3 导航数据源):{agents:[{id,name,tip,available,egress,hosting}]}
+  agents: () => request("GET", "/api/desktop/agents"),
     desktopHost: async (providerId, way) => {
       const resp = await fetch("/api/desktop/host", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",

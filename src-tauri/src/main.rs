@@ -20,6 +20,7 @@ mod gateway_conv;
 mod diagnose;
 mod acclines;
 mod nodecreds;
+mod agents;
 
 use std::net::TcpListener;
 use tauri::{Manager, WebviewWindowBuilder};

@@ -101,6 +101,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/desktop/unhost", post(handle_desktop_unhost))
         // --- Claude 注入式启动(批「Claude 接入」§3;返回启动命令+env,不真正 spawn)---
         .route("/api/desktop/claude-start", post(handle_desktop_claude_start))
+        // --- 多平台 agent 注册表 + 泛化路由(方案 §2.1,A 阶段;具名路由保留为别名,B 阶段新平台挂 :agent 段)---
+        .route("/api/desktop/agents", get(handle_desktop_agents))
+        .route("/api/desktop/:agent/state", get(handle_agent_state))
+        .route("/api/desktop/:agent/host", post(handle_agent_host))
+        .route("/api/desktop/:agent/unhost", post(handle_agent_unhost))
+        .route("/api/desktop/:agent/start", post(handle_agent_start))
         // --- Backups & history ---
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
@@ -916,6 +922,87 @@ mod tests {
         }
     }
 
+    /// A 阶段:GET /api/desktop/agents 返回 8 平台注册表(导航数据源,D3「一次全亮」)
+    #[tokio::test]
+    async fn desktop_agents_returns_registry() {
+        let app = build_router(dummy_state());
+        let resp = app
+            .oneshot(Request::builder().uri("/api/desktop/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v["data"]["agents"].as_array().unwrap();
+        assert_eq!(arr.len(), 8);
+        assert_eq!(arr[0]["id"], "codex");
+        assert_eq!(arr[0]["available"], Value::Bool(true));
+        assert_eq!(arr[1]["id"], "claude");
+        assert_eq!(arr[1]["available"], Value::Bool(true));
+        assert!(!arr.iter().any(|m| m["id"] == "pi"), "pi 已裁撤不得出现");
+    }
+
+    /// A 阶段:泛化路由 /api/desktop/codex/state 与旧具名路由响应完全一致(别名等价)
+    #[tokio::test]
+    async fn agent_state_alias_equals_legacy() {
+        let app = build_router(dummy_state());
+        let legacy = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/state").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let generic = app
+            .oneshot(Request::builder().uri("/api/desktop/codex/state").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK);
+        assert_eq!(generic.status(), StatusCode::OK);
+        let lb = axum::body::to_bytes(legacy.into_body(), usize::MAX).await.unwrap();
+        let gb = axum::body::to_bytes(generic.into_body(), usize::MAX).await.unwrap();
+        let lv: Value = serde_json::from_slice(&lb).unwrap();
+        let gv: Value = serde_json::from_slice(&gb).unwrap();
+        assert_eq!(lv, gv, "泛化路由与旧路由响应必须一致");
+    }
+
+    /// A 阶段:泛化路由拒绝规则——未知平台 404 / 未实现平台 501 / claude 无 host 400
+    #[tokio::test]
+    async fn agent_routes_reject_rules() {
+        let app = build_router(dummy_state());
+        let unknown = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/cursor/state").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let soon = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/gemini/state").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(soon.status(), StatusCode::NOT_IMPLEMENTED);
+        let sb = axum::body::to_bytes(soon.into_body(), usize::MAX).await.unwrap();
+        let sv: Value = serde_json::from_slice(&sb).unwrap();
+        assert_eq!(sv["error"], "E_AGENT_NOT_IMPLEMENTED");
+
+        let nohost = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/desktop/claude/host")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"providerId":"x","way":"gateway"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nohost.status(), StatusCode::BAD_REQUEST);
+        let nb = axum::body::to_bytes(nohost.into_body(), usize::MAX).await.unwrap();
+        let nv: Value = serde_json::from_slice(&nb).unwrap();
+        assert_eq!(nv["error"], "E_AGENT_UNSUPPORTED");
+    }
+
     /// M0 DoD③ 证据：GET /health 返回 200 + {status:"ok", active_provider_id:null, access_mode:null}
     #[tokio::test]
     async fn gateway_health_returns_ok_with_null_active() {
@@ -1684,6 +1771,29 @@ async fn handle_desktop_state(State(s): State<Arc<AppState>>) -> Response {
 
 // POST /api/desktop/host {providerId, way}
 async fn handle_desktop_host(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    desktop_host_impl(&s, &body)
+}
+
+// POST /api/desktop/unhost
+async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
+    desktop_unhost_impl(&s)
+}
+
+// POST /api/desktop/claude-start { way? }
+// 返回 Claude 注入式启动信息(契约:成功 {ok:true, command, env:{...}, ...} 供前端展示/复制;
+// 失败 {ok:false, error:{code,message}})。Key 只在响应里,不落盘、不进 ~/.claude、不进日志。
+async fn handle_desktop_claude_start(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    desktop_claude_start_impl(&s, &body)
+}
+
+// ── 多平台 agent 注册表与泛化路由(方案 §2.1,A 阶段;具名路由保留为别名,B 阶段各平台 adapter 挂 :agent 段)──
+
+// GET /api/desktop/agents —— 注册表元数据(前端数据驱动导航,D3 决策「A 后一次全亮」)
+async fn handle_desktop_agents() -> Response {
+    ok_env(crate::agents::registry_json())
+}
+
+fn desktop_host_impl(s: &AppState, body: &Value) -> Response {
     let provider_id = body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim();
     let way = body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim();
     if provider_id.is_empty() || way.is_empty() {
@@ -1699,8 +1809,7 @@ async fn handle_desktop_host(State(s): State<Arc<AppState>>, Json(body): Json<Va
     }
 }
 
-// POST /api/desktop/unhost
-async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
+fn desktop_unhost_impl(s: &AppState) -> Response {
     match crate::desktop::unhost(&s.config_path, &s.backup_dir, &s.codex_home, &s.providers_path) {
         Ok(v) => ok_env(v),
         Err((status, code, msg)) => (
@@ -1711,10 +1820,7 @@ async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
     }
 }
 
-// POST /api/desktop/claude-start { way? }
-// 返回 Claude 注入式启动信息(契约:成功 {ok:true, command, env:{...}, ...} 供前端展示/复制;
-// 失败 {ok:false, error:{code,message}})。Key 只在响应里,不落盘、不进 ~/.claude、不进日志。
-async fn handle_desktop_claude_start(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+fn desktop_claude_start_impl(s: &AppState, body: &Value) -> Response {
     let way = body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim();
     let pid = body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     match crate::desktop::claude_start(&s.providers_path, way, &pid) {
@@ -1730,6 +1836,90 @@ async fn handle_desktop_claude_start(State(s): State<Arc<AppState>>, Json(body):
             Json(json!({ "ok": false, "error": { "code": code, "message": msg } })),
         )
             .into_response(),
+    }
+}
+
+/// 泛化路由 agent 段校验:Some = 拒绝应答(未知 404 / 未实现 501);None = 已实现平台,继续分发。
+fn reject_agent(agent: &str) -> Option<(StatusCode, &'static str, String)> {
+    match crate::agents::find(agent) {
+        None => Some((StatusCode::NOT_FOUND, "E_UNKNOWN_AGENT", format!("未知平台: {agent}"))),
+        Some(m) if !m.available => Some((
+            StatusCode::NOT_IMPLEMENTED,
+            "E_AGENT_NOT_IMPLEMENTED",
+            format!("「{}」即将上线", m.name),
+        )),
+        Some(_) => None,
+    }
+}
+
+fn agent_reject_response(st: StatusCode, code: &str, msg: &str) -> Response {
+    (st, Json(json!({ "error": code, "message": msg }))).into_response()
+}
+
+fn agent_unsupported_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "E_AGENT_UNSUPPORTED", "message": "该平台无此操作" })),
+    )
+        .into_response()
+}
+
+// GET /api/desktop/:agent/state —— agent=codex 与旧 /api/desktop/state 等价;
+// claude 托管态为前端本地(注入式),无 state 接口。
+async fn handle_agent_state(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+) -> Response {
+    if let Some((st, code, msg)) = reject_agent(&agent) {
+        return agent_reject_response(st, code, &msg);
+    }
+    match agent.as_str() {
+        "codex" => ok_env(crate::desktop::state(&s.config_path, &s.providers_path, &s.codex_home)),
+        _ => agent_unsupported_response(),
+    }
+}
+
+// POST /api/desktop/:agent/host {providerId, way}
+async fn handle_agent_host(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some((st, code, msg)) = reject_agent(&agent) {
+        return agent_reject_response(st, code, &msg);
+    }
+    match agent.as_str() {
+        "codex" => desktop_host_impl(&s, &body),
+        _ => agent_unsupported_response(),
+    }
+}
+
+// POST /api/desktop/:agent/unhost
+async fn handle_agent_unhost(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+) -> Response {
+    if let Some((st, code, msg)) = reject_agent(&agent) {
+        return agent_reject_response(st, code, &msg);
+    }
+    match agent.as_str() {
+        "codex" => desktop_unhost_impl(&s),
+        _ => agent_unsupported_response(),
+    }
+}
+
+// POST /api/desktop/:agent/start —— agent=claude 与旧 /api/desktop/claude-start 等价
+async fn handle_agent_start(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some((st, code, msg)) = reject_agent(&agent) {
+        return agent_reject_response(st, code, &msg);
+    }
+    match agent.as_str() {
+        "claude" => desktop_claude_start_impl(&s, &body),
+        _ => agent_unsupported_response(),
     }
 }
 

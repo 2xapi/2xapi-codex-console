@@ -173,12 +173,13 @@ fn default_agent() -> String {
     "codex".to_string()
 }
 
-/// agent 白名单归一化:空 / 未知 → 默认 `"codex"`(本期允许 codex / claude;更多 agent 在此扩展)。
+/// agent 白名单归一化:空 / 未知 → 默认 `"codex"`(白名单来自 agents 注册表的已实现平台,A 阶段恒为 codex/claude)。
 fn normalize_agent(agent: &str) -> String {
-    match agent.trim().to_ascii_lowercase().as_str() {
-        "codex" => "codex".to_string(),
-        "claude" => "claude".to_string(),
-        _ => default_agent(),
+    let norm = agent.trim().to_ascii_lowercase();
+    if crate::agents::find(&norm).map_or(false, |m| m.available) {
+        norm
+    } else {
+        default_agent()
     }
 }
 
