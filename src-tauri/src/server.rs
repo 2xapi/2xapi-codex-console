@@ -216,6 +216,11 @@ pub fn build_router(state: AppState) -> Router {
             get(handle_agent_eco).post(handle_agent_eco_op),
         )
         .route("/api/desktop/eco-presets", get(handle_eco_presets))
+        // --- 技能管理(C 段):openclaw 全链 / hermes 只读 ---
+        .route(
+            "/api/desktop/:agent/skills",
+            get(handle_agent_skills).post(handle_agent_skills_op),
+        )
         // --- Backups & history ---
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
@@ -1722,6 +1727,16 @@ fn eco_store_for(
     match eco::supported(agent) {
         Some("codex") => Ok(Box::new(eco::codex::TomlStore::new(&s.config_path))),
         Some("cursor") => Ok(Box::new(eco::cursor::JsonStore::new(&s.cursor_home))),
+        // Claude Code:User scope(~/.claude.json 顶层 mcpServers,跨项目;E5 定案,官方文档)
+        Some("claude") => Ok(Box::new(eco::cursor::JsonStore::at(
+            "claude",
+            &s.wb_home.join(".claude.json"),
+        ))),
+        // WorkBuddy:标准 .mcp.json(E4 定案,本机 http 型 connector-proxy 在用=手动条目只读)
+        Some("workbuddy") => Ok(Box::new(eco::cursor::JsonStore::at(
+            "workbuddy",
+            &s.wb_home.join(".workbuddy").join(".mcp.json"),
+        ))),
         Some("trae") => Ok(Box::new(eco::cursor::JsonStore::at(
             "trae",
             &s.trae_home.join(".trae").join("mcp.json"),
@@ -1761,11 +1776,33 @@ async fn handle_agent_eco(
     State(s): State<Arc<AppState>>,
     axum::extract::Path(agent): axum::extract::Path<String>,
 ) -> Response {
-    let store = match eco_store_for(&s, &agent) {
-        Ok(st) => st,
-        Err(resp) => return *resp,
-    };
-    eco_op_response(crate::agents::eco::list(store.as_ref(), &s.codex_home))
+    match eco_store_for(&s, &agent) {
+        Ok(store) => {
+            let skills_ready =
+                crate::agents::eco::skill_supported(store.as_ref().id()).is_some();
+            eco_op_response(crate::agents::eco::list_with_tabs(
+                store.as_ref(),
+                &s.codex_home,
+                skills_ready,
+            ))
+        }
+        Err(resp) => {
+            // 仅技能平台(openclaw 无 MCP store):eco 视图返回空 MCP+技能 tab 就绪
+            if crate::agents::eco::skill_supported(&agent).is_some() {
+                ok_env(json!({
+                    "agent": agent.to_ascii_lowercase(),
+                    "servers": [],
+                    "tabs": [
+                        { "id": "mcp", "label": "MCP 服务器", "ready": false },
+                        { "id": "plugins", "label": "插件", "ready": false },
+                        { "id": "skills", "label": "技能", "ready": true }
+                    ],
+                }))
+            } else {
+                *resp
+            }
+        }
+    }
 }
 
 // POST /api/desktop/:agent/eco {op: install|uninstall|enable|disable, name?, presetId?, spec?}
@@ -1835,6 +1872,90 @@ async fn handle_agent_eco_op(
 // GET /api/desktop/eco-presets —— MCP 预设市场(静态目录 + 支持平台表)
 async fn handle_eco_presets() -> Response {
     ok_env(crate::agents::eco::presets_json())
+}
+
+/// 技能 store 构造(C 段:openclaw 全链 / hermes 只读)。
+fn skill_store_for(
+    s: &AppState,
+    agent: &str,
+) -> Result<Box<dyn crate::agents::eco::skills::EcoSkill>, Response> {
+    match crate::agents::eco::skill_supported(agent) {
+        Some("openclaw") => Ok(Box::new(crate::agents::eco::skills::OpenclawSkills::new(
+            s.oclaw_home.clone(),
+        ))),
+        Some("hermes") => Ok(Box::new(crate::agents::eco::skills::HermesSkills::new(
+            &s.hermes_home,
+        ))),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "E_SKILL_UNKNOWN_AGENT", "message": format!("「{agent}」暂未支持技能管理") })),
+        )
+            .into_response()),
+    }
+}
+
+fn skills_json(list: Vec<crate::agents::eco::skills::SkillInfo>, agent: &str) -> Value {
+    json!({
+        "agent": agent,
+        "skills": list
+            .iter()
+            .map(|sk| json!({
+                "id": sk.name, "name": sk.name, "desc": sk.desc,
+                "source": sk.source, "enabled": !sk.disabled,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+// GET /api/desktop/:agent/skills —— 技能列表
+async fn handle_agent_skills(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+) -> Response {
+    match skill_store_for(&s, &agent) {
+        Ok(store) => match store.list() {
+            Ok(list) => ok_env(skills_json(list, store.id())),
+            Err(e) => eco_op_response(Err(e)),
+        },
+        Err(resp) => resp,
+    }
+}
+
+// POST /api/desktop/:agent/skills {op: install|uninstall|enable|disable, name?|slug?}
+async fn handle_agent_skills_op(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(agent): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let store = match skill_store_for(&s, &agent) {
+        Ok(st) => st,
+        Err(resp) => return resp,
+    };
+    let op = body.get("op").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let name = body
+        .get("name")
+        .or_else(|| body.get("slug"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let r = match op.as_str() {
+        "install" => store.install(&name),
+        "uninstall" => store.uninstall(&name),
+        "enable" => store.set_enabled(&name, true),
+        "disable" => store.set_enabled(&name, false),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "E_BAD_REQUEST", "message": "op 仅支持 install / uninstall / enable / disable" })),
+            )
+                .into_response()
+        }
+    };
+    match r {
+        Ok(list) => ok_env(skills_json(list, store.id())),
+        Err(e) => eco_op_response(Err(e)),
+    }
 }
 
 #[cfg(test)]
@@ -2343,7 +2464,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 
-        // disable → 移除;enable → 写回;uninstall → 双清
+        // disable(Codex 原生):条目保留+enabled=false;enable:恢复;uninstall:移除
         let resp = app
             .clone()
             .oneshot(
@@ -2361,7 +2482,11 @@ mod tests {
             .unwrap()
             .parse::<toml::Value>()
             .unwrap();
-        assert!(toml["mcp_servers"].get("fetch").is_none());
+        assert_eq!(
+            toml["mcp_servers"]["fetch"]["enabled"].as_bool(),
+            Some(false),
+            "原生 enabled=false,条目保留"
+        );
         let resp = app
             .clone()
             .oneshot(
@@ -2379,7 +2504,11 @@ mod tests {
             .unwrap()
             .parse::<toml::Value>()
             .unwrap();
-        assert!(toml["mcp_servers"]["fetch"].is_table(), "enable 应回写");
+        assert_eq!(
+            toml["mcp_servers"]["fetch"]["enabled"].as_bool(),
+            Some(true),
+            "enable 恢复"
+        );
         let resp = app
             .clone()
             .oneshot(
@@ -2397,7 +2526,10 @@ mod tests {
             .unwrap()
             .parse::<toml::Value>()
             .unwrap();
-        assert!(toml["mcp_servers"].get("fetch").is_none());
+        assert!(
+            toml["mcp_servers"].get("fetch").is_none(),
+            "uninstall 后条目应移除"
+        );
         let reg = std::fs::read_to_string(root.join("codex").join("eco-managed.json"))
             .unwrap_or_default();
         assert!(!reg.contains("fetch"), "uninstall 后登记表应清除该条");
@@ -2480,7 +2612,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["data"]["presets"].as_array().unwrap().len(), 8);
-        assert_eq!(v["data"]["agents"].as_array().unwrap().len(), 7);
+        assert_eq!(v["data"]["agents"]["mcp"].as_array().unwrap().len(), 9);
+        assert_eq!(v["data"]["agents"]["skills"].as_array().unwrap().len(), 2);
     }
 
     /// 生态管理 B 段 e2e:五平台 install→形状+零触碰→uninstall;装时填参 400。
@@ -2589,6 +2722,99 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "带参 install");
         let t: toml::Value = std::fs::read_to_string(root.join("config.toml")).unwrap().parse().unwrap();
         assert_eq!(t["mcp_servers"]["filesystem"]["args"][2].as_str(), Some("/tmp/eco-test"), "$DIR 替换");
+    }
+
+    /// C 段 e2e:claude-code/workbuddy MCP 补平台 + codex 原生停用 list 层 + 技能路由。
+    #[tokio::test]
+    async fn eco_c_routes_e2e() {
+        let (state, root) = unique_state("eco-c");
+        let app = build_router(state.clone());
+        let post = |uri: String, body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder().method("POST").uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body)).unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // claude-code(User scope):projects 等键保留
+        let cj = root.join(".claude.json");
+        std::fs::write(&cj, r#"{"numStartups": 42, "mcpServers": {}, "projects": {"a": {"x": 1}}}"#).unwrap();
+        let resp = post("/api/desktop/claude/eco".into(), r#"{"op":"install","presetId":"fetch"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "claude install");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cj).unwrap()).unwrap();
+        assert_eq!(doc["numStartups"], 42, "其他键保留");
+        assert_eq!(doc["mcpServers"]["fetch"]["command"], "uvx");
+        let resp = post("/api/desktop/claude/eco".into(), r#"{"op":"uninstall","name":"fetch"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cj).unwrap()).unwrap();
+        assert!(doc.get("mcpServers").is_none() || doc["mcpServers"].as_object().unwrap().is_empty());
+        assert_eq!(doc["numStartups"], 42);
+
+        // workbuddy(.mcp.json):connector-proxy 手动条目零触碰
+        let wm = root.join(".workbuddy").join(".mcp.json");
+        std::fs::create_dir_all(root.join(".workbuddy")).unwrap();
+        std::fs::write(&wm, r#"{"mcpServers":{"connector-proxy":{"type":"http","url":"http://127.0.0.1:63685/mcp"}}}"#).unwrap();
+        let resp = post("/api/desktop/workbuddy/eco".into(), r#"{"op":"install","presetId":"memory"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "workbuddy install");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&wm).unwrap()).unwrap();
+        assert_eq!(doc["mcpServers"]["connector-proxy"]["url"], "http://127.0.0.1:63685/mcp", "手动 http 条目零触碰");
+        assert_eq!(doc["mcpServers"]["memory"]["command"], "npx");
+        let resp = post("/api/desktop/workbuddy/eco".into(), r#"{"op":"install","name":"connector-proxy","spec":{"command":"x"}}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "手动条目拒写");
+        let resp = post("/api/desktop/workbuddy/eco".into(), r#"{"op":"uninstall","name":"memory"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // codex 原生停用 list 层
+        let resp = post("/api/desktop/codex/eco".into(), r#"{"op":"install","presetId":"fetch"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post("/api/desktop/codex/eco".into(), r#"{"op":"disable","name":"fetch"}"#.into()).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let fetch = v["data"]["servers"].as_array().unwrap().iter().find(|x| x["id"] == "fetch").unwrap();
+        assert_eq!(fetch["enabled"], Value::Bool(false), "list 应报停用(原生)");
+
+        // openclaw eco 视图:空 servers+skills tab 就绪
+        let resp = app.clone().oneshot(Request::builder().uri("/api/desktop/openclaw/eco").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["data"]["servers"].as_array().unwrap().len(), 0);
+        let skills_tab = v["data"]["tabs"].as_array().unwrap().iter().find(|t| t["id"] == "skills").unwrap();
+        assert_eq!(skills_tab["ready"], Value::Bool(true), "openclaw 技能 tab 就绪");
+
+        // hermes 技能:只读列表+操作 400
+        let sk = root.join("hermes").join("skills").join("demo");
+        std::fs::create_dir_all(&sk).unwrap();
+        std::fs::write(sk.join("SKILL.md"), "---\nname: demo\ndescription: 测试技能\n---\n").unwrap();
+        let resp = app.clone().oneshot(Request::builder().uri("/api/desktop/hermes/skills").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["data"]["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"]["skills"][0]["desc"], "测试技能");
+        let resp = post("/api/desktop/hermes/skills".into(), r#"{"op":"disable","name":"demo"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "E_SKILL_UNSUPPORTED");
+
+        // openclaw 技能启停:受控段写入 openclaw.json
+        let resp = post("/api/desktop/openclaw/skills".into(), r#"{"op":"disable","name":"demo-skill"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "set_enabled 应成功");
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(root.join("oclaw").join("openclaw.json")).unwrap()).unwrap();
+        assert_eq!(cfg["skills"]["entries"]["demo-skill"]["enabled"], false, "受控段写入");
+
+        // 未知平台/非法 op
+        let resp = app.clone().oneshot(Request::builder().uri("/api/desktop/gemini/skills").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = post("/api/desktop/hermes/skills".into(), r#"{"op":"nuke"}"#.into()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// grokbuild 泛化路由 e2e:建 agent=grokbuild 供应商 → host 写 ~/.grok TOML → state 托管中 → unhost 还原(隔离 grok_home)

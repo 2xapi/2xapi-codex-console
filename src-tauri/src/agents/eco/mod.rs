@@ -12,6 +12,7 @@ pub mod codex;
 pub mod cursor;
 pub mod hermes;
 pub mod opencode;
+pub mod skills;
 
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -23,11 +24,13 @@ pub type OpError = (u16, String, String);
 pub const SUPPORTED: &[&str] = &[
     "codex",
     "cursor",
+    "claude",
     "claude-desktop",
     "grokbuild",
     "opencode",
     "hermes",
     "trae",
+    "workbuddy",
 ];
 
 /// 平台显示名(前端平台 tab;独立于托管注册表命名,含无托管世界的 cursor/trae)。
@@ -35,11 +38,13 @@ pub fn display_name(agent: &str) -> &'static str {
     match agent {
         "codex" => "Codex",
         "cursor" => "Cursor",
+        "claude" => "Claude Code",
         "claude-desktop" => "Claude 桌面版",
         "grokbuild" => "Grok Build",
         "opencode" => "OpenCode",
         "hermes" => "Hermes",
         "trae" => "TRAE",
+        "workbuddy" => "WorkBuddy",
         _ => "未知平台",
     }
 }
@@ -47,6 +52,14 @@ pub fn display_name(agent: &str) -> &'static str {
 pub fn supported(agent: &str) -> Option<&'static str> {
     let norm = agent.trim().to_ascii_lowercase();
     SUPPORTED.iter().find(|a| **a == norm).copied()
+}
+
+/// 技能(Skills)支持平台(C 段):openclaw=全链,hermes=只读。
+pub const SKILL_AGENTS: &[&str] = &["openclaw", "hermes"];
+
+pub fn skill_supported(agent: &str) -> Option<&'static str> {
+    let norm = agent.trim().to_ascii_lowercase();
+    SKILL_AGENTS.iter().find(|a| **a == norm).copied()
 }
 
 /// 平台载体读写抽象。
@@ -59,6 +72,11 @@ pub trait EcoStore {
     fn write(&self, servers: &BTreeMap<String, Value>) -> Result<(), OpError>;
     /// 写前备份载体文件。
     fn backup(&self, backup_dir: &Path) -> Result<(), OpError>;
+    /// 平台条目是否原生支持 enabled 停用字段(Codex 实证 true;其余 JSON/YAML 平台无此字段)。
+    /// true 时 disable/enable 原位改写 enabled 而非移除,list 以 spec.enabled 为准。
+    fn native_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// 侧车登记表路径(providers.json 同目录,本产品数据区)。
@@ -205,6 +223,14 @@ fn spec_summary(spec: &Value) -> String {
 
 /// GET 列表:平台配置实际条目(manual/console)+ 登记表停用条目(console, enabled=false)。
 pub fn list(store: &dyn EcoStore, codex_home: &Path) -> Result<Value, OpError> {
+    list_with_tabs(store, codex_home, skill_supported(store.id()).is_some())
+}
+
+pub fn list_with_tabs(
+    store: &dyn EcoStore,
+    codex_home: &Path,
+    skills_ready: bool,
+) -> Result<Value, OpError> {
     let live = store.read()?;
     let agents = load_registry(codex_home);
     let roster = agent_registry(&agents, store.id());
@@ -216,8 +242,14 @@ pub fn list(store: &dyn EcoStore, codex_home: &Path) -> Result<Value, OpError> {
         } else {
             "manual"
         };
+        // 原生 enabled 平台(Codex):条目在场但可能 enabled=false(原生停用,不移除)
+        let enabled = if store.native_enabled() {
+            spec.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+        } else {
+            true
+        };
         servers.push(json!({
-            "id": name, "name": name, "source": source, "enabled": true,
+            "id": name, "name": name, "source": source, "enabled": enabled,
             "summary": spec_summary(spec), "spec": spec,
         }));
         seen.push(name.clone());
@@ -244,7 +276,7 @@ pub fn list(store: &dyn EcoStore, codex_home: &Path) -> Result<Value, OpError> {
         "tabs": [
             { "id": "mcp", "label": "MCP 服务器", "ready": true },
             { "id": "plugins", "label": "插件", "ready": false },
-            { "id": "skills", "label": "技能", "ready": false }
+            { "id": "skills", "label": "技能", "ready": skills_ready }
         ],
     }))
 }
@@ -332,14 +364,28 @@ pub fn disable(
     if live.contains_key(name) {
         store.backup(backup_dir)?;
         let mut next = live.clone();
-        next.remove(name);
+        if store.native_enabled() {
+            // 原生 enabled 平台(Codex):条目原位标停用,不移除
+            if let Some(spec) = next.get_mut(name) {
+                if let Some(obj) = spec.as_object_mut() {
+                    obj.insert("enabled".into(), Value::Bool(false));
+                }
+            }
+        } else {
+            next.remove(name);
+        }
         store.write(&next)?;
     }
-    let spec = roster
+    let mut spec = roster
         .get(name)
         .and_then(|e| e.get("spec"))
         .cloned()
         .unwrap_or(Value::Null);
+    if store.native_enabled() {
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("enabled".into(), Value::Bool(false));
+        }
+    }
     registry_upsert(codex_home, store.id(), name, false, &spec);
     list(store, codex_home)
 }
@@ -363,22 +409,20 @@ pub fn enable(
         }
         return Err((404, "E_ECO_NOT_FOUND".into(), format!("条目不存在: {name}")));
     }
-    if !live.contains_key(name) {
-        let spec = roster
-            .get(name)
-            .and_then(|e| e.get("spec"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        store.backup(backup_dir)?;
-        let mut next = live.clone();
-        next.insert(name.to_string(), spec);
-        store.write(&next)?;
-    }
-    let spec = roster
+    let mut spec = roster
         .get(name)
         .and_then(|e| e.get("spec"))
         .cloned()
         .unwrap_or(Value::Null);
+    if let Some(obj) = spec.as_object_mut() {
+        obj.insert("enabled".into(), Value::Bool(true));
+    }
+    if !live.contains_key(name) || store.native_enabled() {
+        store.backup(backup_dir)?;
+        let mut next = live.clone();
+        next.insert(name.to_string(), spec.clone());
+        store.write(&next)?;
+    }
     registry_upsert(codex_home, store.id(), name, true, &spec);
     list(store, codex_home)
 }
@@ -534,10 +578,16 @@ pub fn presets_json() -> Value {
                 })
             })
             .collect::<Vec<_>>(),
-        "agents": SUPPORTED
-            .iter()
-            .map(|a| json!({ "id": a, "name": display_name(a) }))
-            .collect::<Vec<_>>(),
+        "agents": {
+            "mcp": SUPPORTED
+                .iter()
+                .map(|a| json!({ "id": a, "name": display_name(a) }))
+                .collect::<Vec<_>>(),
+            "skills": SKILL_AGENTS
+                .iter()
+                .map(|a| json!({ "id": a, "name": display_name(a) }))
+                .collect::<Vec<_>>(),
+        },
     })
 }
 
@@ -731,7 +781,8 @@ mod tests {
         assert!(preset_spec(fs_p, None).is_err(), "filesystem 无参数应 400");
         let spec = preset_spec(fs_p, Some(&serde_json::json!({ "DIR": "/tmp/docs" }))).unwrap();
         assert_eq!(spec["args"][2], "/tmp/docs", "$DIR 占位应被替换");
-        assert_eq!(v["agents"].as_array().unwrap().len(), 7, "B 段支持 7 平台");
+        assert_eq!(v["agents"]["mcp"].as_array().unwrap().len(), 9, "MCP 支持 9 平台(C 段含 claude/workbuddy)");
+        assert_eq!(v["agents"]["skills"].as_array().unwrap().len(), 2, "技能支持 2 平台");
     }
 
     #[test]

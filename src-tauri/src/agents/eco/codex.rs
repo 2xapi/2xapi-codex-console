@@ -153,6 +153,11 @@ impl EcoStore for TomlStore {
         self.render(&root)
     }
 
+    /// Codex [mcp_servers.x] 原生 enabled 布尔(侦察报告实证,本机在用)。
+    fn native_enabled(&self) -> bool {
+        true
+    }
+
     fn backup(&self, backup_dir: &Path) -> Result<(), super::OpError> {
         crate::config::backup_file(&self.path, backup_dir, "eco-apply", "pre-eco")
             .map_err(|e| (500, "E_IO".to_string(), e))

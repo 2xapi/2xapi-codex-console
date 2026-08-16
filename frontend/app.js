@@ -753,26 +753,79 @@ function hermesDashHtml() {
 /* ── 生态中心(开发组·生态中心 A 段):平台 tab + MCP 服务器管理 + 预设市场 ──
  * 后端契约:GET|POST /api/desktop/:agent/eco(信封 data={servers,tabs});手动条目只读(409 拒写)。
  * 插件/技能 tab 为占位(B/C 段铺开);平台清单来自 /api/desktop/eco-presets。 */
-var ECO_STATE = { agent: "codex", tab: "mcp", data: null, presets: null, agentsList: null, loading: false, pendingInstall: null, pendingParams: {} };
+var ECO_STATE = { agent: "codex", tab: "mcp", data: null, presets: null, agentsList: null, skillAgents: null, skills: null, skillLoading: false, loading: false, pendingInstall: null, pendingParams: {}, skillInstallSlug: "" };
 /* eco 支持平台(与后端 SUPPORTED 同步;世界内嵌生态入口按此渲染) */
 var ECO_SUPPORTED_IDS = { codex: 1, cursor: 1, "claude-desktop": 1, grokbuild: 1, opencode: 1, hermes: 1, trae: 1 };
 function loadEco(force) {
   ECO_STATE.loading = true; render();
   var p = api.ecoPresets().then(function (v) {
     ECO_STATE.presets = (v && v.presets) || [];
-    ECO_STATE.agentsList = (v && v.agents) || [];
-  }).catch(function () { ECO_STATE.presets = []; });
+    var agents = (v && v.agents) || {};
+    var mcp = agents.mcp || [], sk = agents.skills || [];
+    ECO_STATE.agentsList = mcp;
+    ECO_STATE.skillAgents = sk.map(function (x) { return x.id; });
+    /* 平台 tab = MCP ∪ 技能(保序:先 MCP 序,再追加仅技能平台) */
+    var ids = {};
+    ECO_STATE.tabAgents = mcp.concat(sk.filter(function (x) { return !ids[x.id] && !mcp.some(function (m) { return m.id === x.id; }); }));
+  }).catch(function () { ECO_STATE.presets = []; ECO_STATE.agentsList = []; ECO_STATE.skillAgents = []; ECO_STATE.tabAgents = []; });
   var l = api.ecoList(ECO_STATE.agent).then(function (v) {
     ECO_STATE.data = v;
   }).catch(function (e) {
     ECO_STATE.data = { error: e.message };
   }).finally(function () { ECO_STATE.loading = false; });
-  return Promise.all([p, l]).then(function () { if (state.view === "eco") render(); });
+  var sk = (ECO_STATE.skillAgents && ECO_STATE.skillAgents.indexOf(ECO_STATE.agent) >= 0)
+    ? loadEcoSkills()
+    : Promise.resolve();
+  return Promise.all([p, l, sk]).then(function () { if (state.view === "eco") render(); });
 }
 function ecoServers() { return (ECO_STATE.data && ECO_STATE.data.servers) || []; }
+function ecoSkills() { return (ECO_STATE.skills && ECO_STATE.skills.skills) || []; }
+function ecoSkillSupported() { return (ECO_STATE.skillAgents || []).indexOf(ECO_STATE.agent) >= 0; }
+function loadEcoSkills() {
+  ECO_STATE.skillLoading = true;
+  return api.skillList(ECO_STATE.agent).then(function (v) {
+    ECO_STATE.skills = v;
+  }).catch(function (e) {
+    ECO_STATE.skills = { error: e.message };
+  }).finally(function () { ECO_STATE.skillLoading = false; });
+}
+function doSkillOp(op, name) {
+  ECO_STATE.busy = "sk-" + (name || op);
+  api.skillOp(ECO_STATE.agent, { op: op, name: name }).then(function (v) {
+    ECO_STATE.skills = v;
+    showToast(({ install: "安装", uninstall: "卸载", enable: "启用", disable: "停用" })[op] + "完成", "ok");
+  }).catch(function (e) {
+    showToast(e.message || "操作失败", "error");
+  }).finally(function () {
+    ECO_STATE.busy = null;
+    if (state.view === "eco") render();
+  });
+}
+function doSkillInstall() {
+  var slug = (ECO_STATE.skillInstallSlug || "").trim();
+  if (!slug) return;
+  ECO_STATE.busy = "sk-install";
+  api.skillOp(ECO_STATE.agent, { op: "install", slug: slug }).then(function (v) {
+    ECO_STATE.skills = v;
+    ECO_STATE.skillInstallSlug = "";
+    showToast("已安装 " + slug + "(--global)", "ok");
+  }).catch(function (e) {
+    showToast(e.message || "安装失败", "error");
+  }).finally(function () {
+    ECO_STATE.busy = null;
+    if (state.view === "eco") render();
+  });
+}
 function ecoPresetInstalled(id) { return ecoServers().some(function (s) { return s.id === id; }); }
 function ecoCenterHtml() {
-  var agents = (ECO_STATE.agentsList && ECO_STATE.agentsList.length) ? ECO_STATE.agentsList : [{ id: "codex", name: "Codex" }, { id: "cursor", name: "Cursor" }];
+  var agents = (ECO_STATE.tabAgents && ECO_STATE.tabAgents.length) ? ECO_STATE.tabAgents
+    : (ECO_STATE.agentsList && ECO_STATE.agentsList.length) ? ECO_STATE.agentsList
+    : [{ id: "codex", name: "Codex" }, { id: "cursor", name: "Cursor" }];
+  var agentName = function (id) {
+    var all = (ECO_STATE.agentsList || []).concat((ECO_STATE.tabAgents || []));
+    for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i].name;
+    return id;
+  };
   var tabs = (ECO_STATE.data && ECO_STATE.data.tabs) || [
     { id: "mcp", label: "MCP 服务器", ready: true }, { id: "plugins", label: "插件", ready: false }, { id: "skills", label: "技能", ready: false }
   ];
@@ -785,8 +838,10 @@ function ecoCenterHtml() {
   });
   html += '</div><div class="eco-tabs">';
   tabs.forEach(function (tb) {
+    var count = tb.id === "mcp" ? ecoServers().length : (tb.id === "skills" ? ecoSkills().length : 0);
+    var offTitle = (tb.id === "mcp" && ecoSkillSupported()) ? "该平台无 MCP 配置载体" : "即将上线";
     html += '<button class="eco-tab ' + (ECO_STATE.tab === tb.id ? "on" : "") + (tb.ready ? "" : " disabled") + '"'
-      + (tb.ready ? ' data-a="eco-tab" data-g="' + esc(tb.id) + '"' : ' title="即将上线"') + '>' + esc(tb.label) + (tb.ready ? ' (' + ecoServers().length + ')' : '') + '</button>';
+      + (tb.ready ? ' data-a="eco-tab" data-g="' + esc(tb.id) + '"' : ' title="' + offTitle + '"') + '>' + esc(tb.label) + (tb.ready ? ' (' + count + ')' : '') + '</button>';
   });
   html += '</div>';
   if (ECO_STATE.loading) {
@@ -798,8 +853,56 @@ function ecoCenterHtml() {
       + esc(ECO_STATE.data.error) + '</div></section>';
     return html;
   }
+  if (ECO_STATE.tab === "skills") {
+    if (ECO_STATE.skillLoading) {
+      html += '<div class="sub" style="padding:20px 0;text-align:center">技能加载中…</div></section>';
+      return html;
+    }
+    if (ECO_STATE.skills && ECO_STATE.skills.error) {
+      html += '<div style="padding:10px 12px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.4);border-radius:8px;font-size:11.5px;color:#FFBAB4">'
+        + esc(ECO_STATE.skills.error) + '</div></section>';
+      return html;
+    }
+    var skRows = ecoSkills().map(function (sk) {
+      var bundled = sk.source === "bundled";
+      var srcTag = bundled
+        ? '<span class="tag">平台自带</span>'
+        : '<span class="tag on" style="border-color:var(--c-official);color:var(--c-official)">已安装</span>';
+      var stTag = sk.enabled
+        ? '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">● 可用</span>'
+        : '<span class="tag">○ 已停用</span>';
+      var ops = ECO_STATE.agent === "openclaw"
+        ? (sk.enabled
+          ? '<button class="btn ghost" data-a="sk-op" data-op="disable" data-id="' + esc(sk.id) + '">停用</button> '
+          : '<button class="btn ghost" data-a="sk-op" data-op="enable" data-id="' + esc(sk.id) + '">启用</button> ')
+          + (bundled ? '' : '<button class="btn ghost" data-a="sk-op" data-op="uninstall" data-id="' + esc(sk.id) + '">卸载</button>')
+        : '<span class="sub" style="font-size:10px">只读</span>';
+      return '<tr><td><b>' + esc(sk.id) + '</b></td><td style="color:var(--muted)">' + esc(sk.desc || "") + '</td>'
+        + '<td>' + srcTag + '</td><td>' + stTag + '</td><td style="white-space:nowrap">' + ops + '</td></tr>';
+    }).join("");
+    var installBar = ECO_STATE.agent === "openclaw"
+      ? '<div class="grid2" style="margin-top:10px">'
+        + '<div class="f" style="grid-column:1/-1"><label>从 ClawHub 安装(slug,如 @owner/my-skill;也支持 git 地址/本地路径)</label>'
+        + '<input class="mono" id="skSlug" placeholder="@owner/skill-name" value="' + esc(ECO_STATE.skillInstallSlug) + '"></div></div>'
+        + '<div class="btn-row" style="margin-top:6px"><button class="btn primary" data-a="sk-install"' + (ECO_STATE.busy === "sk-install" ? " disabled" : "") + '>⇩ 安装到全局(managed 目录)</button></div>'
+      : '';
+    html += '<table class="mtable"><thead><tr><th style="width:18%">技能</th><th>描述</th><th style="width:12%">来源</th><th style="width:12%">状态</th><th style="width:22%">操作</th></tr></thead>'
+      + (skRows ? '<tbody>' + skRows + '</tbody>' : '<tbody><tr><td colspan="5" class="sub" style="padding:14px 4px">还没有技能。</td></tr></tbody>')
+      + '</table>' + installBar
+      + '<div class="sub" style="margin-top:8px">⚙ ' + (ECO_STATE.agent === "openclaw"
+        ? 'OpenClaw:安装走 openclaw skills install --global;停用写 openclaw.json skills.entries;平台自带(bundled)技能只读。'
+        : 'Hermes:技能=目录+SKILL.md,本视图只读;启停可用平台 toolset 机制(hermes tools)。')
+      + '</div></section>';
+    return html;
+  }
   if (ECO_STATE.tab !== "mcp") {
-    html += '<div class="sub" style="padding:20px 0;text-align:center">即将上线(B/C 段铺开)</div></section>';
+    html += '<div class="sub" style="padding:20px 0;text-align:center">即将上线</div></section>';
+    return html;
+  }
+  /* MCP tab:仅技能平台(openclaw)无 MCP 载体 */
+  var mcpReady = ECO_STATE.data && ECO_STATE.data.tabs && ECO_STATE.data.tabs.some(function (t) { return t.id === "mcp" && t.ready; });
+  if (!mcpReady) {
+    html += '<div class="sub" style="padding:20px 0;text-align:center">该平台暂无 MCP 配置载体,请切到「技能」页。</div></section>';
     return html;
   }
   /* MCP 列表 */
@@ -852,7 +955,7 @@ function ecoCenterHtml() {
   }).join("");
   html += paramForm;
   html += '<section class="card" style="margin-top:12px"><h2>MCP 预设市场</h2>'
-    + '<div class="sub" style="margin:4px 0 10px">一键安装到当前平台(' + esc(agents.find(function (m) { return m.id === ECO_STATE.agent; }).name) + ');预设提炼自 cc-switch 与常用清单。</div>'
+    + '<div class="sub" style="margin:4px 0 10px">一键安装到当前平台(' + esc(agentName(ECO_STATE.agent)) + ');预设提炼自 cc-switch 与常用清单。</div>'
     + '<div class="eco-grid">' + (cards || '<span class="sub">暂无预设</span>') + '</div></section>';
   return html;
 }
@@ -1628,9 +1731,18 @@ document.addEventListener("click", function (ev) {
       break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
     case "eco-agent":
-      if (ECO_STATE.agent !== t.dataset.g) { ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; loadEco(); }
+      if (ECO_STATE.agent !== t.dataset.g) {
+        ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; ECO_STATE.skills = null;
+        if (ECO_STATE.tab === "skills" && !(ECO_STATE.skillAgents || []).includes(t.dataset.g)) ECO_STATE.tab = "mcp";
+        loadEco();
+      }
       break;
-    case "eco-tab": ECO_STATE.tab = t.dataset.g; render(); break;
+    case "sk-op": doSkillOp(t.dataset.op, t.dataset.id); break;
+    case "sk-install": doSkillInstall(); break;
+    case "eco-tab":
+      ECO_STATE.tab = t.dataset.g; render();
+      if (t.dataset.g === "skills" && ecoSkillSupported() && !ECO_STATE.skills) loadEcoSkills().then(function () { render(); });
+      break;
     case "eco-install": {
       var pp = (ECO_STATE.presets || []).find(function (x) { return x.id === t.dataset.id; });
       if (pp && pp.params && pp.params.length) {
@@ -1841,6 +1953,7 @@ document.addEventListener("input", function (ev) {
     return;
   }
   if (ev.target.id === "ipmNew") { state.nodeDraft = ev.target.value; return; }
+  if (ev.target.id === "skSlug") { ECO_STATE.skillInstallSlug = ev.target.value; return; }
   if (ev.target.dataset && ev.target.dataset.l === "email") { state.loginEmail = ev.target.value; return; }
   if (ev.target.dataset && ev.target.dataset.l === "password") { state.loginPassword = ev.target.value; return; }
 });
