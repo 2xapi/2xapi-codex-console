@@ -4,25 +4,25 @@
 mod server;
 // M8:launcher 模块根为 launcher/mod.rs。显式 #[path] 是为了兼容旧 launcher.rs
 // 还未删除的过渡期(rustc 见到两者并存会报 ambiguous);删除旧文件后此写法同样有效。
-#[path = "launcher/mod.rs"]
-mod launcher;
-mod config;
-mod desktop;
-mod grok_config;
-mod providers;
-mod probe;
-mod sessions;
-mod claude_sessions;
+mod acclines;
+mod agents;
 mod auth;
 mod backups;
-mod history;
+mod claude_sessions;
+mod config;
+mod desktop;
+mod diagnose;
 mod gateway;
 mod gateway_conv;
 mod gateway_gemini_conv;
-mod diagnose;
-mod acclines;
+mod grok_config;
+mod history;
+#[path = "launcher/mod.rs"]
+mod launcher;
 mod nodecreds;
-mod agents;
+mod probe;
+mod providers;
+mod sessions;
 
 use std::net::TcpListener;
 use tauri::{Manager, WebviewWindowBuilder};
@@ -47,7 +47,8 @@ fn main() {
     std::fs::create_dir_all(&backup_dir).ok();
 
     // 网关固定监听 127.0.0.1:8787（契约要求：Codex 的 config.toml 里 custom.base_url 指向此地址）
-    let listener = TcpListener::bind("127.0.0.1:8787").expect("无法绑定 127.0.0.1:8787（端口可能被占用，请先释放后重试）");
+    let listener = TcpListener::bind("127.0.0.1:8787")
+        .expect("无法绑定 127.0.0.1:8787（端口可能被占用，请先释放后重试）");
     // tokio::from_std 要求非阻塞 socket（否则 panic，tokio#7172）
     listener.set_nonblocking(true).expect("set_nonblocking");
     let app_url = "http://127.0.0.1:8787".to_string();
@@ -60,9 +61,11 @@ fn main() {
     // 阶段 4:加速线路装配——启动即加载线路填入健康状态;accel 配置从 2xapi-settings.json 读入
     let lines = crate::acclines::load_lines(&codex_home);
     let health_state = std::sync::Arc::new(crate::acclines::HealthState::new(lines.lines));
-    let accel_state = std::sync::Arc::new(std::sync::Mutex::new(server::load_accel_cfg(&codex_home)));
+    let accel_state =
+        std::sync::Arc::new(std::sync::Mutex::new(server::load_accel_cfg(&codex_home)));
     // 星图 任务 B:每账号节点凭证表(兼容迁移旧单对象 → legacy)
-    let nodecreds_store = std::sync::Arc::new(std::sync::RwLock::new(nodecreds::load_store(&codex_home)));
+    let nodecreds_store =
+        std::sync::Arc::new(std::sync::RwLock::new(nodecreds::load_store(&codex_home)));
 
     let state = server::AppState {
         config_path: config_path.clone(),
@@ -71,25 +74,33 @@ fn main() {
         codex_home: codex_home.clone(),
         // workbuddy 双载体(~/.codebuddy 与 ~/.workbuddy)的公共根;测试传 tempdir(server/gateway 测试态)
         wb_home: std::path::PathBuf::from(
-            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default(),
         ),
         hermes_home: crate::agents::hermes::hermes_home(),
         // gemini 载体根(~/.gemini 所在);测试传 tempdir
         gem_home: std::path::PathBuf::from(
-            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default(),
         ),
         grok_home: crate::grok_config::default_grok_home(),
         oc_home: std::path::PathBuf::from(
-            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default(),
         ),
         oclaw_home: {
-            let home = std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+            let home = std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default();
             std::path::PathBuf::from(home).join(".openclaw")
@@ -97,14 +108,20 @@ fn main() {
         // Claude Desktop(macOS):~/Library/Application Support(Claude/ 与 Claude-3p/ 的父;
         // Windows 的 APPDATA 路径未实证,首版 macOS 为主)
         cd_home: {
-            let home = std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+            let home = std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default();
-            std::path::PathBuf::from(home).join("Library").join("Application Support")
+            std::path::PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
         },
         // Cursor 生态管理(A 段):~/.cursor 所在根(eco adapter join(".cursor/mcp.json"))
         cursor_home: std::path::PathBuf::from(
-            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default(),
         ),
@@ -123,7 +140,10 @@ fn main() {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             // 阶段 4:后台健康探测循环(每 30s 快照 HealthState.lines 探测;线路可经 set_lines 更新)。
             // spawn_health_loop 内部自行 tokio::spawn,此处直接调用即可。
-            crate::acclines::spawn_health_loop(health_state.clone(), std::time::Duration::from_secs(30));
+            crate::acclines::spawn_health_loop(
+                health_state.clone(),
+                std::time::Duration::from_secs(30),
+            );
             axum::serve(listener, router).await.unwrap();
         });
     });

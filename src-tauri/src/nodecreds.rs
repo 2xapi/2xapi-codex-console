@@ -69,10 +69,7 @@ impl std::fmt::Debug for Store {
         f.debug_struct("Store")
             .field("version", &self.version)
             .field("legacy", &self.legacy.as_ref().map(|_| "<redacted>"))
-            .field(
-                "creds",
-                &format!("{} entries", self.creds.len()),
-            )
+            .field("creds", &format!("{} entries", self.creds.len()))
             .finish()
     }
 }
@@ -86,7 +83,11 @@ impl Default for Store {
 impl Store {
     /// 空 v2 表(文件缺失/非法时的兜底)。
     pub fn empty() -> Store {
-        Store { version: 2, legacy: None, creds: HashMap::new() }
+        Store {
+            version: 2,
+            legacy: None,
+            creds: HashMap::new(),
+        }
     }
 
     /// 按 2xapi Key 取该账号凭证(hash 索引)。
@@ -124,7 +125,11 @@ pub fn load_store(codex_home: &Path) -> Store {
     }
     // 旧单对象格式 → 迁移为 v2(legacy 装载,creds 空)
     match serde_json::from_str::<crate::acclines::Cred>(&raw) {
-        Ok(legacy) => Store { version: 2, legacy: Some(legacy), creds: HashMap::new() },
+        Ok(legacy) => Store {
+            version: 2,
+            legacy: Some(legacy),
+            creds: HashMap::new(),
+        },
         Err(_) => Store::empty(),
     }
 }
@@ -220,18 +225,20 @@ pub async fn issue_node_cred(base_url: &str, api_key: &str) -> Result<NodeCred, 
         403 => {
             // 尽力解析快照:JSON 取 error 文案(及可能的配额字段);非 JSON 用原文兜底
             let raw = resp.text().await.unwrap_or_default();
-            let snap = serde_json::from_str::<serde_json::Value>(&raw).ok().and_then(|v| {
-                let message = v
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| raw.trim().to_string());
-                Some(QuotaSnapshot {
-                    message,
-                    quota_total_bytes: v.get("quotaTotalBytes").and_then(|x| x.as_u64()),
-                    quota_used_bytes: v.get("quotaUsedBytes").and_then(|x| x.as_u64()),
-                })
-            });
+            let snap = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .map(|v| {
+                    let message = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| raw.trim().to_string());
+                    QuotaSnapshot {
+                        message,
+                        quota_total_bytes: v.get("quotaTotalBytes").and_then(|x| x.as_u64()),
+                        quota_used_bytes: v.get("quotaUsedBytes").and_then(|x| x.as_u64()),
+                    }
+                });
             Err(IssueErr::QuotaFull(snap))
         }
         other => Err(IssueErr::Unreachable(format!("节点返回 HTTP {other}"))),
@@ -259,7 +266,10 @@ mod tests {
 
     fn sandbox(label: &str) -> std::path::PathBuf {
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("2xapi-nodecreds-{label}-{}-{n}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "2xapi-nodecreds-{label}-{}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -290,7 +300,10 @@ mod tests {
         assert_eq!(s.version, 2);
         assert_eq!(s.creds.len(), 0, "旧文件迁移后 creds 应为空表");
         let lg = s.legacy_cred().expect("legacy 应装载");
-        assert_eq!((lg.user.as_str(), lg.pass.as_str()), ("old-user", "old-pass"));
+        assert_eq!(
+            (lg.user.as_str(), lg.pass.as_str()),
+            ("old-user", "old-pass")
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -307,9 +320,18 @@ mod tests {
         assert!(loaded.legacy.is_none());
         assert_eq!(loaded.creds.len(), 2);
         assert_eq!(loaded.get_for_key("sk-key-a").unwrap().user, "u-a");
-        assert_eq!(loaded.get_for_key("sk-key-b").unwrap().quota_used_bytes, 200);
-        assert!(loaded.get_for_key("sk-other").is_none(), "未签发账号 → None");
-        assert_eq!(loaded.get_for_key("sk-key-a").unwrap(), s.get_for_key("sk-key-a").unwrap());
+        assert_eq!(
+            loaded.get_for_key("sk-key-b").unwrap().quota_used_bytes,
+            200
+        );
+        assert!(
+            loaded.get_for_key("sk-other").is_none(),
+            "未签发账号 → None"
+        );
+        assert_eq!(
+            loaded.get_for_key("sk-key-a").unwrap(),
+            s.get_for_key("sk-key-a").unwrap()
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -322,8 +344,15 @@ mod tests {
         s.set_for_key("sk-x", cred("u-x", 1));
         save_store(&home, &s).unwrap();
         let meta = std::fs::metadata(home.join(FILE_NAME)).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "凭证文件权限须 0600");
-        assert!(!home.join(format!("{FILE_NAME}.tmp")).exists(), "临时文件应已 rename 掉");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "凭证文件权限须 0600"
+        );
+        assert!(
+            !home.join(format!("{FILE_NAME}.tmp")).exists(),
+            "临时文件应已 rename 掉"
+        );
         assert_eq!(load_store(&home), s, "写后读回应一致");
         // 文件缺失 → 空 Store
         let empty_home = sandbox("missing");
@@ -345,13 +374,19 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let body = body.clone();
                 let seen = seen.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 8192];
-                    let Ok(n) = sock.read(&mut buf).await else { return };
-                    seen.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    seen.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).to_string());
                     let resp = format!(
                         "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -382,7 +417,10 @@ mod tests {
         assert!(c.issued_at >= before, "issued_at 应为签发时刻");
         // 请求体应为 {"apiKey":...} 且打到 /issue-cred
         let req = seen.lock().unwrap()[0].clone();
-        assert!(req.starts_with("POST /issue-cred "), "应 POST {base}/issue-cred");
+        assert!(
+            req.starts_with("POST /issue-cred "),
+            "应 POST {base}/issue-cred"
+        );
         assert!(req.contains(r#""apiKey":"sk-abc""#), "body 应含明文 apiKey");
     }
 
@@ -394,7 +432,10 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
         )
         .await;
-        assert_eq!(issue_node_cred(&base, "sk-bad").await.unwrap_err(), IssueErr::KeyInvalid);
+        assert_eq!(
+            issue_node_cred(&base, "sk-bad").await.unwrap_err(),
+            IssueErr::KeyInvalid
+        );
     }
 
     #[tokio::test]
@@ -417,7 +458,10 @@ mod tests {
     #[tokio::test]
     async fn issue_node_cred_unreachable() {
         // 127.0.0.1:9(discard 端口,本地必拒连)→ Unreachable
-        match issue_node_cred("http://127.0.0.1:9", "sk-any").await.unwrap_err() {
+        match issue_node_cred("http://127.0.0.1:9", "sk-any")
+            .await
+            .unwrap_err()
+        {
             IssueErr::Unreachable(_) => {}
             other => panic!("拒连应 Unreachable,got {other:?}"),
         }
@@ -437,11 +481,20 @@ mod tests {
         // pass 永不进日志:Debug 输出须脱敏
         let c = cred("u", 0);
         let dbg = format!("{c:?}");
-        assert!(dbg.contains("<redacted>") && !dbg.contains("pass-u"), "NodeCred Debug 须脱敏");
+        assert!(
+            dbg.contains("<redacted>") && !dbg.contains("pass-u"),
+            "NodeCred Debug 须脱敏"
+        );
         let mut s = Store::empty();
-        s.legacy = Some(crate::acclines::Cred { user: "lu".into(), pass: "lp".into() });
+        s.legacy = Some(crate::acclines::Cred {
+            user: "lu".into(),
+            pass: "lp".into(),
+        });
         s.set_for_key("k", cred("u2", 0));
         let sdbg = format!("{s:?}");
-        assert!(sdbg.contains("<redacted>") && !sdbg.contains("lp"), "Store Debug 须脱敏");
+        assert!(
+            sdbg.contains("<redacted>") && !sdbg.contains("lp"),
+            "Store Debug 须脱敏"
+        );
     }
 }

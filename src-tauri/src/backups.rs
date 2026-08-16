@@ -9,9 +9,16 @@ pub fn list(backup_dir: &Path) -> Vec<Value> {
     };
     for f in files.flatten() {
         let name = f.file_name().to_string_lossy().to_string();
-        if name.ends_with(".manifest.json") { continue; }
-        let metadata = match f.metadata() { Ok(m) => m, Err(_) => continue };
-        let modified = metadata.modified().ok()
+        if name.ends_with(".manifest.json") {
+            continue;
+        }
+        let metadata = match f.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = metadata
+            .modified()
+            .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| {
                 chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
@@ -38,7 +45,9 @@ pub fn list(backup_dir: &Path) -> Vec<Value> {
         }));
     }
     entries.sort_by(|a, b| {
-        b.get("createdAt").and_then(|v| v.as_str()).unwrap_or("")
+        b.get("createdAt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
             .cmp(a.get("createdAt").and_then(|v| v.as_str()).unwrap_or(""))
     });
     entries

@@ -26,7 +26,13 @@ fn find_provider(
     data.providers
         .into_iter()
         .find(|p| p.id == provider_id)
-        .ok_or_else(|| (404, "E_NO_PROVIDER".into(), format!("供应商不存在: {provider_id}")))
+        .ok_or_else(|| {
+            (
+                404,
+                "E_NO_PROVIDER".into(),
+                format!("供应商不存在: {provider_id}"),
+            )
+        })
 }
 
 pub fn host(

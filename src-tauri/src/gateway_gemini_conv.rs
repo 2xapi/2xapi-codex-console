@@ -35,10 +35,16 @@ impl GeminiConvError {
 }
 
 /// Gemini 请求体(不含 URL 上的 model)→ ChatCompletions 请求体。
-pub fn gemini_to_chat_request(model: &str, stream: bool, body: &[u8]) -> Result<ConvertedChatRequest, GeminiConvError> {
-    let v: Value =
-        serde_json::from_slice(body).map_err(|e| GeminiConvError::Invalid(format!("非法 generateContent body: {e}")))?;
-    let obj = v.as_object().ok_or_else(|| GeminiConvError::Invalid("generateContent body 不是 object".into()))?;
+pub fn gemini_to_chat_request(
+    model: &str,
+    stream: bool,
+    body: &[u8],
+) -> Result<ConvertedChatRequest, GeminiConvError> {
+    let v: Value = serde_json::from_slice(body)
+        .map_err(|e| GeminiConvError::Invalid(format!("非法 generateContent body: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| GeminiConvError::Invalid("generateContent body 不是 object".into()))?;
 
     let mut messages: Vec<Value> = Vec::new();
 
@@ -55,10 +61,14 @@ pub fn gemini_to_chat_request(model: &str, stream: bool, body: &[u8]) -> Result<
         .and_then(|c| c.as_array())
         .ok_or_else(|| GeminiConvError::Invalid("缺少 contents 数组".into()))?;
     // 函数名 → 尚未消费的 tool_call_id 队列(gemini 无显式 id,按顺序匹配同名调用)
-    let mut pending_calls: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut pending_calls: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     for (ci, content) in contents.iter().enumerate() {
-        let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let role = content
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("user");
         let parts = content
             .get("parts")
             .and_then(|p| p.as_array())
@@ -72,23 +82,36 @@ pub fn gemini_to_chat_request(model: &str, stream: bool, body: &[u8]) -> Result<
             if part.get("text").is_some() {
                 text_buf.push_str(part.get("text").and_then(|t| t.as_str()).unwrap_or(""));
             } else if let Some(fc) = part.get("functionCall") {
-                let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                let name = fc
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let args = fc.get("args").cloned().unwrap_or(json!({}));
                 let id = format!("call_gem_{ci}_{pi}");
-                pending_calls.entry(name.clone()).or_default().push(id.clone());
+                pending_calls
+                    .entry(name.clone())
+                    .or_default()
+                    .push(id.clone());
                 tool_calls.push(json!({
                     "id": id, "type": "function",
                     "function": { "name": name, "arguments": args.to_string() }
                 }));
             } else if let Some(fr) = part.get("functionResponse") {
-                let name = fr.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                let name = fr
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let resp = fr.get("response").cloned().unwrap_or(json!({}));
                 func_responses.push((name, resp.to_string()));
             } else if part.get("inlineData").is_some() || part.get("fileData").is_some() {
                 return Err(GeminiConvError::Multimodal(
                     "多模态内容(inlineData/fileData)暂不支持:本入口当前仅支持文本与工具调用,请在 Gemini CLI 中避免发送图片/文件".into(),
                 ));
-            } else if part.get("thought") == Some(&Value::Bool(true)) || part.get("thoughtSignature").is_some() {
+            } else if part.get("thought") == Some(&Value::Bool(true))
+                || part.get("thoughtSignature").is_some()
+            {
                 // 思考 part:Chat 上游不消费,丢弃(透传分支不受影响,原生 gemini 上游原样到达)
             }
             // 其余未知 part 类型丢弃(与 M3b「无法映射的条目丢弃」同策略)
@@ -115,7 +138,13 @@ pub fn gemini_to_chat_request(model: &str, stream: bool, body: &[u8]) -> Result<
                 for (name, resp) in func_responses {
                     let id = pending_calls
                         .get_mut(&name)
-                        .and_then(|q| if q.is_empty() { None } else { Some(q.remove(0)) })
+                        .and_then(|q| {
+                            if q.is_empty() {
+                                None
+                            } else {
+                                Some(q.remove(0))
+                            }
+                        })
                         .unwrap_or_else(|| format!("call_gem_orphan_{name}"));
                     messages.push(json!({ "role": "tool", "tool_call_id": id, "content": resp }));
                 }
@@ -129,7 +158,11 @@ pub fn gemini_to_chat_request(model: &str, stream: bool, body: &[u8]) -> Result<
 
     // generationConfig → Chat 采样参数(克制映射,与 M3b 同策略)
     if let Some(gc) = obj.get("generationConfig").and_then(|g| g.as_object()) {
-        for (src, dst) in [("temperature", "temperature"), ("topP", "top_p"), ("maxOutputTokens", "max_tokens")] {
+        for (src, dst) in [
+            ("temperature", "temperature"),
+            ("topP", "top_p"),
+            ("maxOutputTokens", "max_tokens"),
+        ] {
             if let Some(x) = gc.get(src) {
                 if !x.is_null() {
                     chat.insert(dst.into(), x.clone());
@@ -198,7 +231,11 @@ pub fn gemini_to_chat_request(model: &str, stream: bool, body: &[u8]) -> Result<
 /// 非流式:ChatCompletions 响应 → Gemini GenerateContentResponse。
 pub fn chat_json_to_gemini_json(model: &str, chat: &[u8]) -> Result<Vec<u8>, String> {
     let v: Value = serde_json::from_slice(chat).map_err(|e| format!("非法 chat 响应: {e}"))?;
-    let choice = v.get("choices").and_then(|c| c.get(0)).cloned().unwrap_or(json!({}));
+    let choice = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .cloned()
+        .unwrap_or(json!({}));
     let msg = choice.get("message").cloned().unwrap_or(json!({}));
 
     let mut parts: Vec<Value> = Vec::new();
@@ -219,7 +256,10 @@ pub fn chat_json_to_gemini_json(model: &str, chat: &[u8]) -> Result<Vec<u8>, Str
         parts.push(json!({ "text": "" }));
     }
 
-    let finish = choice.get("finish_reason").and_then(|f| f.as_str()).unwrap_or("stop");
+    let finish = choice
+        .get("finish_reason")
+        .and_then(|f| f.as_str())
+        .unwrap_or("stop");
     let finish_reason = match finish {
         "length" => "MAX_TOKENS",
         "content_filter" => "SAFETY",
@@ -316,7 +356,11 @@ impl GeminiSseConvState {
         let choice = v.get("choices")?.get(0)?;
 
         // 文本增量 → 立即出 gemini 分块
-        if let Some(t) = choice.get("delta").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+        if let Some(t) = choice
+            .get("delta")
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+        {
             if !t.is_empty() {
                 self.saw_text = true;
                 return Some(format!(
@@ -326,14 +370,23 @@ impl GeminiSseConvState {
             }
         }
         // tool_calls 增量按 index 累积
-        if let Some(tcs) = choice.get("delta").and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
+        if let Some(tcs) = choice
+            .get("delta")
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|t| t.as_array())
+        {
             for tc in tcs {
                 let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 let f = tc.get("function").cloned().unwrap_or(json!({}));
-                let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let name = f
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let args = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
                 while self.tools.len() <= idx {
-                    self.tools.push((String::new(), String::new(), String::new()));
+                    self.tools
+                        .push((String::new(), String::new(), String::new()));
                 }
                 let slot = &mut self.tools[idx];
                 if !name.is_empty() {
@@ -433,7 +486,8 @@ mod tests {
             }] }],
             "toolConfig": { "functionCallingConfig": { "mode": "ANY" } }
         });
-        let conv = gemini_to_chat_request("gemini-2.5-flash", false, body.to_string().as_bytes()).unwrap();
+        let conv =
+            gemini_to_chat_request("gemini-2.5-flash", false, body.to_string().as_bytes()).unwrap();
         let v: Value = serde_json::from_slice(&conv.body).unwrap();
         assert_eq!(v["model"], "gemini-2.5-flash");
         let msgs = v["messages"].as_array().unwrap();
@@ -508,7 +562,10 @@ mod tests {
         let v1: Value = serde_json::from_str(e1[0].trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(v1["candidates"][0]["content"]["parts"][0]["text"], "你");
 
-        let e2 = c.feed(mk(json!({ "id": "1", "choices": [{ "index": 0, "delta": { "content": "好" } }] })).as_bytes());
+        let e2 = c.feed(
+            mk(json!({ "id": "1", "choices": [{ "index": 0, "delta": { "content": "好" } }] }))
+                .as_bytes(),
+        );
         assert_eq!(e2.len(), 1);
         let e3 = c.feed(mk(json!({ "id": "1", "choices": [{ "index": 0, "finish_reason": "stop" }], "usage": { "prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4 } })).as_bytes());
         assert_eq!(e3.len(), 0, "finish/usage 不应即时出块");
@@ -516,7 +573,10 @@ mod tests {
         let fin = c.finish();
         let joined = fin.join("");
         assert!(joined.contains(r#""finishReason":"STOP""#));
-        assert!(joined.contains(r#""promptTokenCount":2"#), "上游 usage 应转换:\n{joined}");
+        assert!(
+            joined.contains(r#""promptTokenCount":2"#),
+            "上游 usage 应转换:\n{joined}"
+        );
         assert!(joined.contains(r#""candidatesTokenCount":2"#));
     }
 
@@ -526,7 +586,10 @@ mod tests {
         let mut c = GeminiSseConvState::new();
         c.feed(b"data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n\n");
         let fin = c.finish().join("");
-        assert!(fin.contains(r#""promptTokenCount":0"#), "usage 缺失须全零兜底:\n{fin}");
+        assert!(
+            fin.contains(r#""promptTokenCount":0"#),
+            "usage 缺失须全零兜底:\n{fin}"
+        );
         assert!(fin.contains(r#""candidatesTokenCount":0"#));
         assert!(fin.contains(r#""totalTokenCount":0"#));
     }
@@ -534,16 +597,36 @@ mod tests {
     #[test]
     fn sse_tool_calls_accumulate_across_chunks() {
         // 用 json! 宏构造 SSE 行,避免手写转义错漏
-        let mk = |d: Value| format!("data: {}\n\n", json!({ "id": "1", "choices": [{ "index": 0, "delta": d }] }));
+        let mk = |d: Value| {
+            format!(
+                "data: {}\n\n",
+                json!({ "id": "1", "choices": [{ "index": 0, "delta": d }] })
+            )
+        };
         let mut c = GeminiSseConvState::new();
         let _ = c.feed(mk(json!({ "tool_calls": [{ "index": 0, "id": "call_9", "function": { "name": "get_w", "arguments": "{\"ci" } }] })).as_bytes());
         let _ = c.feed(mk(json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "ty\":\"BJ\"}" } }] })).as_bytes());
-        let _ = c.feed(format!("data: {}\n\n", json!({ "id": "1", "choices": [{ "index": 0, "finish_reason": "tool_calls" }] })).as_bytes());
+        let _ = c.feed(
+            format!(
+                "data: {}\n\n",
+                json!({ "id": "1", "choices": [{ "index": 0, "finish_reason": "tool_calls" }] })
+            )
+            .as_bytes(),
+        );
         let fin = c.finish().join("");
-        assert!(fin.contains(r#""functionCall""#), "终块应含 functionCall:\n{fin}");
+        assert!(
+            fin.contains(r#""functionCall""#),
+            "终块应含 functionCall:\n{fin}"
+        );
         assert!(fin.contains(r#""name":"get_w""#));
-        assert!(fin.contains(r#""city":"BJ""#), "args 跨块拼接应完整:\n{fin}");
-        assert!(fin.contains(r#""finishReason":"STOP""#), "tool_calls 完成 → STOP(gemini 语义):\n{fin}");
+        assert!(
+            fin.contains(r#""city":"BJ""#),
+            "args 跨块拼接应完整:\n{fin}"
+        );
+        assert!(
+            fin.contains(r#""finishReason":"STOP""#),
+            "tool_calls 完成 → STOP(gemini 语义):\n{fin}"
+        );
     }
 
     #[test]

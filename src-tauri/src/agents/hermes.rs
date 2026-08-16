@@ -44,11 +44,6 @@ pub fn hermes_home() -> PathBuf {
     PathBuf::from(home).join(".hermes")
 }
 
-/// hermes 配置文件路径 `~/.hermes/config.yaml`。
-pub fn hermes_config_path() -> PathBuf {
-    hermes_home().join("config.yaml")
-}
-
 // ── YAML 段级读写(文本层,保格式) ────────────────────────────
 
 /// 判断一行是否 YAML 顶层键(列 0 起、非注释、非列表项、冒号后为空白/行尾;容忍 \r)。
@@ -113,7 +108,10 @@ fn deduplicate_top_level_keys(raw: &str) -> String {
     // 重写:首个段之前的内容(注释/文档头)保留;每段取到下一顶层键行(或 EOF),
     // 只保留同名键的最后一次出现
     let mut result = String::with_capacity(raw.len());
-    let head_end = key_lines.first().map(|&(_, start, _)| start).unwrap_or(raw.len());
+    let head_end = key_lines
+        .first()
+        .map(|&(_, start, _)| start)
+        .unwrap_or(raw.len());
     result.push_str(&raw[..head_end]);
     for (idx, &(_, start, key)) in key_lines.iter().enumerate() {
         let remaining = counts.get_mut(key).unwrap();
@@ -159,7 +157,8 @@ fn replace_section(raw: &str, key: &str, value: &serde_yaml::Value) -> Result<St
             out.push_str(&raw[..start]);
             out.push_str(&serialized);
             let remainder = remove_all_sections(&raw[end..], key);
-            if !serialized.ends_with('\n') && !remainder.is_empty() && !remainder.starts_with('\n') {
+            if !serialized.ends_with('\n') && !remainder.is_empty() && !remainder.starts_with('\n')
+            {
                 out.push('\n');
             }
             out.push_str(&remainder);
@@ -183,7 +182,9 @@ fn replace_section(raw: &str, key: &str, value: &serde_yaml::Value) -> Result<St
 fn read_hermes_yaml(path: &Path) -> Result<serde_yaml::Value, String> {
     let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(serde_yaml::Value::Mapping(Default::default())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_yaml::Value::Mapping(Default::default()))
+        }
         Err(e) => return Err(format!("读取 {} 失败: {e}", path.display())),
     };
     if raw.trim().is_empty() {
@@ -222,7 +223,11 @@ fn backup_yaml_file(src: &Path, backup_dir: &Path, purpose: &str) -> Result<(), 
         },
     });
     let manifest_path = format!("{}.manifest.json", backup_path.display());
-    std::fs::write(manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default()).ok();
+    std::fs::write(
+        manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    )
+    .ok();
     Ok(())
 }
 
@@ -235,13 +240,20 @@ fn find_pre_host_snapshot(backup_dir: &Path) -> Option<serde_yaml::Value> {
         if !name.starts_with(BACKUP_PREFIX) || !name.ends_with(".manifest.json") {
             continue;
         }
-        let manifest: Value = serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+        let manifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
         if manifest.get("purpose").and_then(|v| v.as_str()) != Some("pre-host") {
             continue;
         }
-        let yaml_path = e.path().with_file_name(name.trim_end_matches(".manifest.json"));
+        let yaml_path = e
+            .path()
+            .with_file_name(name.trim_end_matches(".manifest.json"));
         let mtime = e.metadata().and_then(|m| m.modified()).ok();
-        if best.as_ref().map(|(t, _)| mtime.map(|n| n > *t).unwrap_or(false)).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|(t, _)| mtime.map(|n| n > *t).unwrap_or(false))
+            .unwrap_or(true)
+        {
             if let Some(mtime) = mtime {
                 best = Some((mtime, yaml_path));
             }
@@ -272,13 +284,19 @@ fn build_gateway_entry(provider: &Provider) -> serde_yaml::Mapping {
                     serde_yaml::Value::Number((cw as i64).into()),
                 );
             }
-            models.insert(serde_yaml::Value::String(m.name.clone()), serde_yaml::Value::Mapping(meta));
+            models.insert(
+                serde_yaml::Value::String(m.name.clone()),
+                serde_yaml::Value::Mapping(meta),
+            );
         }
     }
     let mut entry = serde_yaml::Mapping::new();
     entry.insert("name".into(), ENTRY_NAME.into());
     // base_url 指向网关 /hermes 前缀:OpenAI SDK 自动追加 /chat/completions → 命中专属入口
-    entry.insert("base_url".into(), format!("{GATEWAY_BASE_URL}/hermes").into());
+    entry.insert(
+        "base_url".into(),
+        format!("{GATEWAY_BASE_URL}/hermes").into(),
+    );
     // 占位 Key:网关入站不校验客户端凭证(一律按供应商覆盖注入);不写真 Key,盘上零泄漏
     entry.insert("api_key".into(), ENTRY_NAME.into());
     entry.insert("api_mode".into(), "chat_completions".into());
@@ -324,7 +342,8 @@ fn current_pointer(doc: &serde_yaml::Value) -> Option<String> {
 
 /// hermes 托管态(受控标记=条目存在性,禁地址匹配红线;与 codex hosting 信封同构)。
 pub fn detect_state(config_path: &Path) -> Value {
-    let doc = read_hermes_yaml(config_path).unwrap_or(serde_yaml::Value::Mapping(Default::default()));
+    let doc =
+        read_hermes_yaml(config_path).unwrap_or(serde_yaml::Value::Mapping(Default::default()));
     let hosted = entry_exists(&doc);
     json!({
         "hosting": if hosted { json!({ "way": "gateway", "entry": ENTRY_NAME }) } else { Value::Null },
@@ -339,7 +358,11 @@ fn clear_active_if_hermes(providers_path: &Path) {
     let should_clear = data
         .active_provider_id
         .as_deref()
-        .map(|id| data.providers.iter().any(|p| p.id == id && p.agent == "hermes"))
+        .map(|id| {
+            data.providers
+                .iter()
+                .any(|p| p.id == id && p.agent == "hermes")
+        })
         .unwrap_or(false);
     if should_clear {
         crate::providers::clear_active(providers_path);
@@ -355,7 +378,11 @@ pub fn host(
     way: &str,
 ) -> Result<Value, OpError> {
     if way != "gateway" {
-        return Err((400, "E_BAD_WAY".into(), "Hermes 为叠加平台,仅支持 gateway 托管方式".into()));
+        return Err((
+            400,
+            "E_BAD_WAY".into(),
+            "Hermes 为叠加平台,仅支持 gateway 托管方式".into(),
+        ));
     }
     let data = crate::providers::load(providers_path);
     let provider = data
@@ -363,27 +390,46 @@ pub fn host(
         .iter()
         .find(|p| p.id == provider_id && (p.agent == "hermes" || p.agent.is_empty()))
         .cloned()
-        .ok_or_else(|| (404, "E_PROVIDER_NOT_FOUND".to_string(), "找不到该 hermes 供应商".to_string()))?;
+        .ok_or_else(|| {
+            (
+                404,
+                "E_PROVIDER_NOT_FOUND".to_string(),
+                "找不到该 hermes 供应商".to_string(),
+            )
+        })?;
     if provider.model.is_empty() {
-        return Err((422, "E_NO_MODEL".to_string(), "该供应商未配置默认模型,请先在编辑里拉取模型或手填".to_string()));
+        return Err((
+            422,
+            "E_NO_MODEL".to_string(),
+            "该供应商未配置默认模型,请先在编辑里拉取模型或手填".to_string(),
+        ));
     }
 
     let raw = match std::fs::read_to_string(config_path) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err((500, "E_IO".to_string(), format!("读取 config.yaml 失败: {e}"))),
+        Err(e) => {
+            return Err((
+                500,
+                "E_IO".to_string(),
+                format!("读取 config.yaml 失败: {e}"),
+            ))
+        }
     };
     let healed = deduplicate_top_level_keys(&raw);
-    let doc: serde_yaml::Value = serde_yaml::from_str(&healed)
-        .map_err(|e| (500, "E_CONFIG".to_string(), format!("解析 config.yaml 失败: {e}")))?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&healed).map_err(|e| {
+        (
+            500,
+            "E_CONFIG".to_string(),
+            format!("解析 config.yaml 失败: {e}"),
+        )
+    })?;
 
     // 指针受控切换(D1):当前指向用户第三方条目 → 不动指针;否则(官方/未设置/已指向本条目)→ 切
     let pointer_now = current_pointer(&doc);
     let user_names = user_entry_names(&doc);
-    let pointer_switched = match &pointer_now {
-        Some(p) if p != ENTRY_NAME && user_names.contains(p) => false,
-        _ => true,
-    };
+    let pointer_switched =
+        !matches!(&pointer_now, Some(p) if p != ENTRY_NAME && user_names.contains(p));
 
     // upsert custom_providers(用户条目原样保留)
     let mut providers_seq: Vec<serde_yaml::Value> = doc
@@ -401,8 +447,12 @@ pub fn host(
     }
 
     // model 段:指针切换时更新 provider/default;否则仅保留原段(条目已写入,UI 提示用户可自选)
-    let mut new_text = replace_section(&healed, "custom_providers", &serde_yaml::Value::Sequence(providers_seq))
-        .map_err(|e| (500, "E_CONFIG".to_string(), e))?;
+    let mut new_text = replace_section(
+        &healed,
+        "custom_providers",
+        &serde_yaml::Value::Sequence(providers_seq),
+    )
+    .map_err(|e| (500, "E_CONFIG".to_string(), e))?;
     let mut switched = false;
     if pointer_switched {
         let mut model = match doc.get("model") {
@@ -441,15 +491,30 @@ pub fn host(
 }
 
 /// unhost:仅移除本产品条目;指针指向本条目时恢复(快照优先,无快照回官方默认)。
-pub fn unhost(config_path: &Path, backup_dir: &Path, providers_path: &Path) -> Result<Value, OpError> {
+pub fn unhost(
+    config_path: &Path,
+    backup_dir: &Path,
+    providers_path: &Path,
+) -> Result<Value, OpError> {
     let raw = match std::fs::read_to_string(config_path) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err((500, "E_IO".to_string(), format!("读取 config.yaml 失败: {e}"))),
+        Err(e) => {
+            return Err((
+                500,
+                "E_IO".to_string(),
+                format!("读取 config.yaml 失败: {e}"),
+            ))
+        }
     };
     let healed = deduplicate_top_level_keys(&raw);
-    let doc: serde_yaml::Value = serde_yaml::from_str(&healed)
-        .map_err(|e| (500, "E_CONFIG".to_string(), format!("解析 config.yaml 失败: {e}")))?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&healed).map_err(|e| {
+        (
+            500,
+            "E_CONFIG".to_string(),
+            format!("解析 config.yaml 失败: {e}"),
+        )
+    })?;
 
     if !entry_exists(&doc) {
         // 未托管(或用户自己删过)→ 幂等 no-op
@@ -467,16 +532,20 @@ pub fn unhost(config_path: &Path, backup_dir: &Path, providers_path: &Path) -> R
     let mut new_text = if providers_seq.is_empty() {
         remove_all_sections(&healed, "custom_providers")
     } else {
-        replace_section(&healed, "custom_providers", &serde_yaml::Value::Sequence(providers_seq))
-            .map_err(|e| (500, "E_CONFIG".to_string(), e))?
+        replace_section(
+            &healed,
+            "custom_providers",
+            &serde_yaml::Value::Sequence(providers_seq),
+        )
+        .map_err(|e| (500, "E_CONFIG".to_string(), e))?
     };
 
     // 指针恢复:仅当当前指向本条目
     let pointer_now = current_pointer(&doc);
     let mut pointer_restored = false;
     if pointer_now.as_deref() == Some(ENTRY_NAME) {
-        let restored_model = find_pre_host_snapshot(backup_dir)
-            .and_then(|snap| snap.get("model").cloned());
+        let restored_model =
+            find_pre_host_snapshot(backup_dir).and_then(|snap| snap.get("model").cloned());
         match restored_model {
             Some(m) => {
                 new_text = replace_section(&new_text, "model", &m)
@@ -584,15 +653,38 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.get("name").unwrap().as_str(), Some(ENTRY_NAME));
-        assert_eq!(e.get("base_url").unwrap().as_str(), Some("http://127.0.0.1:8787/hermes"));
-        assert_eq!(e.get("api_mode").unwrap().as_str(), Some("chat_completions"));
+        assert_eq!(
+            e.get("base_url").unwrap().as_str(),
+            Some("http://127.0.0.1:8787/hermes")
+        );
+        assert_eq!(
+            e.get("api_mode").unwrap().as_str(),
+            Some("chat_completions")
+        );
         assert_eq!(e.get("model").unwrap().as_str(), Some("gpt-5.5"));
-        assert!(e.get("api_key").unwrap().as_str() != Some("sk-test"), "真 Key 不得落盘");
+        assert!(
+            e.get("api_key").unwrap().as_str() != Some("sk-test"),
+            "真 Key 不得落盘"
+        );
         // 指针
         assert_eq!(current_pointer(&doc).as_deref(), Some(ENTRY_NAME));
         // 用户段零触碰
-        assert_eq!(doc.get("agent").unwrap().get("reasoning_effort").unwrap().as_str(), Some("max"));
-        assert_eq!(doc.get("display").unwrap().get("language").unwrap().as_str(), Some("zh"));
+        assert_eq!(
+            doc.get("agent")
+                .unwrap()
+                .get("reasoning_effort")
+                .unwrap()
+                .as_str(),
+            Some("max")
+        );
+        assert_eq!(
+            doc.get("display")
+                .unwrap()
+                .get("language")
+                .unwrap()
+                .as_str(),
+            Some("zh")
+        );
         assert_eq!(doc.get("_config_version").unwrap().as_i64(), Some(33));
         assert!(doc.get("voice").is_some());
     }
@@ -607,7 +699,11 @@ mod tests {
         let first = std::fs::read_to_string(&config).unwrap();
         let backup_count = std::fs::read_dir(&backup).unwrap().count();
         let out = host(&config, &backup, &providers, "p1", "gateway").unwrap();
-        assert_eq!(out["changed"]["config"], json!(false), "第二次 host 应 no-op");
+        assert_eq!(
+            out["changed"]["config"],
+            json!(false),
+            "第二次 host 应 no-op"
+        );
         assert_eq!(std::fs::read_to_string(&config).unwrap(), first);
         assert_eq!(std::fs::read_dir(&backup).unwrap().count(), backup_count);
     }
@@ -628,8 +724,15 @@ mod tests {
         assert_eq!(current_pointer(&doc).as_deref(), Some("my-router"));
         let entries = doc.get("custom_providers").unwrap().as_sequence().unwrap();
         assert_eq!(entries.len(), 2, "用户条目保留 + 本产品条目");
-        let user_entry = entries.iter().find(|e| e.get("name").and_then(|n| n.as_str()) == Some("my-router")).unwrap();
-        assert_eq!(user_entry.get("api_key").unwrap().as_str(), Some("sk-or-user"), "用户条目零触碰");
+        let user_entry = entries
+            .iter()
+            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("my-router"))
+            .unwrap();
+        assert_eq!(
+            user_entry.get("api_key").unwrap().as_str(),
+            Some("sk-or-user"),
+            "用户条目零触碰"
+        );
     }
 
     /// 换供应商:条目更新,指针若已指向本条目保持指向,pre-switch 备份。
@@ -639,16 +742,26 @@ mod tests {
         std::fs::write(&config, USER_CONFIG).unwrap();
         let providers = providers_file(
             &dir,
-            vec![provider_fixture("p1", "hermes", "gpt-5.5"), provider_fixture("p2", "hermes", "glm-5")],
+            vec![
+                provider_fixture("p1", "hermes", "gpt-5.5"),
+                provider_fixture("p2", "hermes", "glm-5"),
+            ],
         );
         host(&config, &backup, &providers, "p1", "gateway").unwrap();
         let out = host(&config, &backup, &providers, "p2", "gateway").unwrap();
-        assert_eq!(out["switched"], json!(true), "指针已指向本条目,换供应商后 default 更新");
+        assert_eq!(
+            out["switched"],
+            json!(true),
+            "指针已指向本条目,换供应商后 default 更新"
+        );
         let doc = read_hermes_yaml(&config).unwrap();
         let entries = doc.get("custom_providers").unwrap().as_sequence().unwrap();
         assert_eq!(entries.len(), 1, "upsert 不新增");
         assert_eq!(entries[0].get("model").unwrap().as_str(), Some("glm-5"));
-        assert_eq!(doc.get("model").unwrap().get("default").unwrap().as_str(), Some("glm-5"));
+        assert_eq!(
+            doc.get("model").unwrap().get("default").unwrap().as_str(),
+            Some("glm-5")
+        );
     }
 
     /// 串台防护:codex 供应商不能 host 给 hermes。
@@ -709,8 +822,15 @@ mod tests {
         assert_eq!(out["pointerRestored"], json!(true));
         let doc = read_hermes_yaml(&config).unwrap();
         assert!(!entry_exists(&doc));
-        assert_eq!(current_pointer(&doc).as_deref(), Some("openai-api"), "恢复 host 前官方指针");
-        assert_eq!(doc.get("model").unwrap().get("default").unwrap().as_str(), Some("gpt-5.5"));
+        assert_eq!(
+            current_pointer(&doc).as_deref(),
+            Some("openai-api"),
+            "恢复 host 前官方指针"
+        );
+        assert_eq!(
+            doc.get("model").unwrap().get("default").unwrap().as_str(),
+            Some("gpt-5.5")
+        );
     }
 
     /// 未托管时 unhost 幂等 no-op。
@@ -756,7 +876,11 @@ mod tests {
         host(&config, &backup, &providers, "p1", "gateway").unwrap();
         let first = std::fs::read_to_string(&config).unwrap();
         let out = host(&config, &backup, &providers, "p1", "gateway").unwrap();
-        assert_eq!(out["changed"]["config"], json!(false), "CRLF 下幂等不得失效");
+        assert_eq!(
+            out["changed"]["config"],
+            json!(false),
+            "CRLF 下幂等不得失效"
+        );
         let second = std::fs::read_to_string(&config).unwrap();
         assert_eq!(first, second);
         let doc = read_hermes_yaml(&config).unwrap();
@@ -785,7 +909,9 @@ mod tests {
         }];
         let entry = build_gateway_entry(&p);
         let models = entry.get("models").unwrap().as_mapping().unwrap();
-        let m = models.get(serde_yaml::Value::String("glm-5".into())).unwrap();
+        let m = models
+            .get(serde_yaml::Value::String("glm-5".into()))
+            .unwrap();
         assert_eq!(m.get("context_length").unwrap().as_i64(), Some(200000));
     }
 

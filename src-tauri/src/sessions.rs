@@ -7,7 +7,7 @@
 //! 安全约定:任何写操作(repair)前先整库备份到 backup_dir;只读操作永不改 db。
 //! 本期只上「列表+修复+设置」,删除第二版(带备份恢复验证后再放)。
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -62,7 +62,9 @@ pub fn list_sessions(codex_home: &Path, page: usize, size: usize, provider: &str
     };
     let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(c) => c,
-        Err(_) => return json!({ "total": 0, "items": [], "db": db_path.to_string_lossy(), "error": "打开数据库失败" }),
+        Err(_) => {
+            return json!({ "total": 0, "items": [], "db": db_path.to_string_lossy(), "error": "打开数据库失败" })
+        }
     };
 
     // 主表探测:新 schema local_thread_catalog / 旧 schema threads
@@ -74,12 +76,34 @@ pub fn list_sessions(codex_home: &Path, page: usize, size: usize, provider: &str
     };
     let cols = if table == catalog {
         // 新 schema:主键 (host_id, thread_id),无独立 id 列
-        ("thread_id", "display_title", "cwd", "model_provider", "source_updated_at", "missing_candidate")
+        (
+            "thread_id",
+            "display_title",
+            "cwd",
+            "model_provider",
+            "source_updated_at",
+            "missing_candidate",
+        )
     } else {
-        ("id", "title", "cwd", "model_provider", "updated_at_ms", "archived")
+        (
+            "id",
+            "title",
+            "cwd",
+            "model_provider",
+            "updated_at_ms",
+            "archived",
+        )
     };
-    let archived_expr = if table == catalog { "0" } else { "COALESCE(archived,0)" };
-    let missing_expr = if table == catalog { "COALESCE(missing_candidate,0)" } else { "0" };
+    let archived_expr = if table == catalog {
+        "0"
+    } else {
+        "COALESCE(archived,0)"
+    };
+    let missing_expr = if table == catalog {
+        "COALESCE(missing_candidate,0)"
+    } else {
+        "0"
+    };
     let updated_expr = if table == catalog {
         // source_updated_at 是 REAL 秒 → 毫秒
         "CAST(source_updated_at * 1000 AS INTEGER)"
@@ -96,13 +120,12 @@ pub fn list_sessions(codex_home: &Path, page: usize, size: usize, provider: &str
     };
 
     // total
-    let total_sql = format!(
-        "SELECT COUNT(*) FROM {table} WHERE 1=1{where_provider}"
-    );
+    let total_sql = format!("SELECT COUNT(*) FROM {table} WHERE 1=1{where_provider}");
     let total: i64 = if provider.is_empty() {
         conn.query_row(&total_sql, [], |r| r.get(0)).unwrap_or(0)
     } else {
-        conn.query_row(&total_sql, rusqlite::params![provider], |r| r.get(0)).unwrap_or(0)
+        conn.query_row(&total_sql, rusqlite::params![provider], |r| r.get(0))
+            .unwrap_or(0)
     };
 
     // 分页列表(updatedAt 倒序;同值按 id 倒序稳定)
@@ -144,7 +167,9 @@ pub fn list_sessions(codex_home: &Path, page: usize, size: usize, provider: &str
                     id,
                     title: title.unwrap_or_default(),
                     cwd: cwd.unwrap_or_default(),
-                    provider_tag: provider_tag.filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into()),
+                    provider_tag: provider_tag
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "unknown".into()),
                     updated_at_ms: updated_ms,
                     archived: archived != 0,
                     missing: missing != 0,
@@ -175,7 +200,10 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
 
     // 写前整库备份(三保险)
     let _ = std::fs::create_dir_all(backup_dir);
-    let backup_name = format!("sessions-{}.db", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let backup_name = format!(
+        "sessions-{}.db",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
     let backup_path = backup_dir.join(&backup_name);
     if let Ok(data) = std::fs::read(&db_path) {
         let _ = std::fs::write(&backup_path, &data);
@@ -183,7 +211,9 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
 
     let conn = match Connection::open(&db_path) {
         Ok(c) => c,
-        Err(e) => return json!({ "fixed": 0, "scanned": 0, "error": format!("打开数据库失败: {e}") }),
+        Err(e) => {
+            return json!({ "fixed": 0, "scanned": 0, "error": format!("打开数据库失败: {e}") })
+        }
     };
     let catalog = "local_thread_catalog";
     if !has_column(&conn, catalog, "source_detail") {
@@ -200,11 +230,13 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
             Ok(s) => s,
             Err(_) => return json!({ "fixed": 0, "scanned": 0, "error": "查询失败" }),
         };
-        let Ok(rows) = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?))
-            })
-        else {
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        }) else {
             return json!({ "fixed": 0, "scanned": 0, "error": "查询失败" });
         };
         let mut out = Vec::new();
@@ -223,7 +255,9 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
                 })
                 .unwrap_or(false);
             let want_missing = if exists { 0 } else { 1 };
-            if (current_missing.unwrap_or(0) != want_missing) || (want_missing == 0 && current_missing.is_none()) {
+            if (current_missing.unwrap_or(0) != want_missing)
+                || (want_missing == 0 && current_missing.is_none())
+            {
                 out.push((tid, want_missing));
             }
         }
@@ -233,7 +267,10 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
     // 落库修复(每行 UPDATE)
     for (tid, want_missing) in &ids_to_fix {
         let upd = format!("UPDATE {catalog} SET missing_candidate = ?1 WHERE thread_id = ?2");
-        if conn.execute(&upd, rusqlite::params![want_missing, tid]).is_ok() {
+        if conn
+            .execute(&upd, rusqlite::params![want_missing, tid])
+            .is_ok()
+        {
             fixed += 1;
         }
     }
@@ -255,7 +292,10 @@ fn read_settings(codex_home: &Path) -> Value {
 }
 
 fn write_settings(codex_home: &Path, v: &Value) {
-    let _ = std::fs::write(settings_path(codex_home), serde_json::to_string_pretty(v).unwrap_or_default());
+    let _ = std::fs::write(
+        settings_path(codex_home),
+        serde_json::to_string_pretty(v).unwrap_or_default(),
+    );
 }
 
 /// GET /api/sessions/settings → {autoRepairBeforeHost}
@@ -278,7 +318,11 @@ pub fn set_settings(codex_home: &Path, auto_repair: bool) -> Value {
 
 /// host 前自动 repair(轻量:只对账,不重建)。供 desktop.rs host 调用。
 pub fn auto_repair_if_enabled(codex_home: &Path, backup_dir: &Path) {
-    if get_settings(codex_home).get("autoRepairBeforeHost").and_then(|v| v.as_bool()).unwrap_or(true) {
+    if get_settings(codex_home)
+        .get("autoRepairBeforeHost")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
         let _ = repair_sessions(codex_home, backup_dir);
     }
 }
@@ -294,7 +338,8 @@ mod tests {
 
     fn sandbox(label: &str) -> (PathBuf, PathBuf) {
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("2xapi-stage3-{label}-{}-{n}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("2xapi-stage3-{label}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("codex");
         std::fs::create_dir_all(home.join("sqlite")).unwrap();
@@ -333,14 +378,20 @@ mod tests {
         // 两个 provider、不同时间
         let rollout = root.join("r.jsonl");
         let _ = std::fs::write(&rollout, "{}");
-        make_catalog_db(&root, &[
-            ("t1", "会话甲", "custom", rollout.to_str().unwrap(), 1000),
-            ("t2", "会话乙", "2xapi", "", 3000),
-            ("t3", "会话丙", "custom", "", 2000),
-        ]);
+        make_catalog_db(
+            &root,
+            &[
+                ("t1", "会话甲", "custom", rollout.to_str().unwrap(), 1000),
+                ("t2", "会话乙", "2xapi", "", 3000),
+                ("t3", "会话丙", "custom", "", 2000),
+            ],
+        );
         let home = &root;
 
-        eprintln!("[DBG] db_path exists: {}", home.join("sqlite/codex-dev.db").exists());
+        eprintln!(
+            "[DBG] db_path exists: {}",
+            home.join("sqlite/codex-dev.db").exists()
+        );
         let r = list_sessions(home, 1, 10, "");
         eprintln!("[DBG] list result: {}", r);
         assert_eq!(r["total"], 3);
@@ -362,26 +413,44 @@ mod tests {
         let good = root.join("good.jsonl");
         let _ = std::fs::write(&good, "{}");
         // t1 文件存在(missing 应为 0);t2 文件不存在(missing 应为 1);t3 文件存在但标记了 1(应清 0)
-        make_catalog_db(&root, &[
-            ("t1", "甲", "custom", good.to_str().unwrap(), 100),
-            ("t2", "乙", "custom", "/nonexistent/x.jsonl", 200),
-            ("t3", "丙", "custom", good.to_str().unwrap(), 300),
-        ]);
+        make_catalog_db(
+            &root,
+            &[
+                ("t1", "甲", "custom", good.to_str().unwrap(), 100),
+                ("t2", "乙", "custom", "/nonexistent/x.jsonl", 200),
+                ("t3", "丙", "custom", good.to_str().unwrap(), 300),
+            ],
+        );
         // t3 手工标 missing=1
         let conn = Connection::open(root.join("sqlite/codex-dev.db")).unwrap();
-        conn.execute("UPDATE local_thread_catalog SET missing_candidate=1 WHERE thread_id='t3'", []).unwrap();
+        conn.execute(
+            "UPDATE local_thread_catalog SET missing_candidate=1 WHERE thread_id='t3'",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let r = repair_sessions(&root, &bk);
         assert_eq!(r["scanned"], 3, "应扫描全部");
-        assert_eq!(r["fixed"], 2, "t2 标 missing + t3 清 missing 共 2 行修正;t1 本正确不动");
+        assert_eq!(
+            r["fixed"], 2,
+            "t2 标 missing + t3 清 missing 共 2 行修正;t1 本正确不动"
+        );
         // 备份已建
-        assert!(std::fs::read_dir(&bk).unwrap().next().is_some(), "写前应有整库备份");
+        assert!(
+            std::fs::read_dir(&bk).unwrap().next().is_some(),
+            "写前应有整库备份"
+        );
 
         // 验证落库
         let conn = Connection::open(root.join("sqlite/codex-dev.db")).unwrap();
         let get = |tid: &str| -> i64 {
-            conn.query_row("SELECT missing_candidate FROM local_thread_catalog WHERE thread_id=?1", [tid], |r| r.get(0)).unwrap()
+            conn.query_row(
+                "SELECT missing_candidate FROM local_thread_catalog WHERE thread_id=?1",
+                [tid],
+                |r| r.get(0),
+            )
+            .unwrap()
         };
         assert_eq!(get("t1"), 0);
         assert_eq!(get("t2"), 1, "缺失 rollout 应标记 missing");
@@ -392,9 +461,16 @@ mod tests {
     #[test]
     fn settings_default_on_and_roundtrip() {
         let (root, _bk) = sandbox("settings");
-        assert!(get_settings(&root)["autoRepairBeforeHost"].as_bool().unwrap(), "默认开");
+        assert!(
+            get_settings(&root)["autoRepairBeforeHost"]
+                .as_bool()
+                .unwrap(),
+            "默认开"
+        );
         set_settings(&root, false);
-        assert!(!get_settings(&root)["autoRepairBeforeHost"].as_bool().unwrap());
+        assert!(!get_settings(&root)["autoRepairBeforeHost"]
+            .as_bool()
+            .unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

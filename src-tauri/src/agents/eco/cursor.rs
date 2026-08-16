@@ -13,7 +13,9 @@ pub struct JsonStore {
 
 impl JsonStore {
     pub fn new(cursor_home: &Path) -> Self {
-        Self { path: cursor_home.join(".cursor").join("mcp.json") }
+        Self {
+            path: cursor_home.join(".cursor").join("mcp.json"),
+        }
     }
 
     fn read_doc(&self) -> Result<serde_json::Map<String, Value>, super::OpError> {
@@ -22,18 +24,35 @@ impl JsonStore {
         }
         let raw = std::fs::read_to_string(&self.path)
             .map_err(|e| (500, "E_IO".to_string(), format!("读取 mcp.json 失败: {e}")))?;
-        serde_json::from_str::<Value>(&raw).map_err(|_| {
-            (500, "E_PARSE".to_string(), "mcp.json 不是合法 JSON,已拒绝写入(避免破坏手动配置);请先修复该文件".to_string())
-        })?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| (500, "E_PARSE".to_string(), "mcp.json 顶层必须是对象".to_string()))
+        serde_json::from_str::<Value>(&raw)
+            .map_err(|_| {
+                (
+                    500,
+                    "E_PARSE".to_string(),
+                    "mcp.json 不是合法 JSON,已拒绝写入(避免破坏手动配置);请先修复该文件"
+                        .to_string(),
+                )
+            })?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    500,
+                    "E_PARSE".to_string(),
+                    "mcp.json 顶层必须是对象".to_string(),
+                )
+            })
     }
 
     fn write_doc(&self, doc: &serde_json::Map<String, Value>) -> Result<(), super::OpError> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| (500, "E_IO".to_string(), format!("创建 .cursor 目录失败: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                (
+                    500,
+                    "E_IO".to_string(),
+                    format!("创建 .cursor 目录失败: {e}"),
+                )
+            })?;
         }
         let text = serde_json::to_string_pretty(&Value::Object(doc.clone()))
             .map_err(|e| (500, "E_IO".to_string(), format!("JSON 编码失败: {e}")))?;
@@ -99,7 +118,10 @@ mod tests {
         let s = JsonStore::new(&root);
         assert!(s.read().unwrap().is_empty());
         let mut m = BTreeMap::new();
-        m.insert("fetch".to_string(), json!({ "command": "uvx", "args": ["mcp-server-fetch"] }));
+        m.insert(
+            "fetch".to_string(),
+            json!({ "command": "uvx", "args": ["mcp-server-fetch"] }),
+        );
         s.write(&m).unwrap();
         let raw = std::fs::read_to_string(root.join(".cursor/mcp.json")).unwrap();
         assert!(raw.contains("\"mcpServers\""));
@@ -112,7 +134,11 @@ mod tests {
         let root = root("preserve");
         let path = root.join(".cursor/mcp.json");
         std::fs::create_dir_all(root.join(".cursor")).unwrap();
-        std::fs::write(&path, r#"{ "other": 1, "mcpServers": { "old": { "command": "x" } } }"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "other": 1, "mcpServers": { "old": { "command": "x" } } }"#,
+        )
+        .unwrap();
         let s = JsonStore::new(&root);
         let mut m = BTreeMap::new();
         m.insert("new".to_string(), json!({ "command": "y" }));
@@ -132,7 +158,11 @@ mod tests {
         let s = JsonStore::new(&root);
         let err = s.read().unwrap_err();
         assert_eq!(err.1, "E_PARSE");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken", "坏文件必须原样保留");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ broken",
+            "坏文件必须原样保留"
+        );
     }
 
     #[test]
@@ -143,10 +173,9 @@ mod tests {
         m.insert("a".to_string(), json!({ "command": "x" }));
         s.write(&m).unwrap();
         s.write(&BTreeMap::new()).unwrap();
-        let doc: Value = serde_json::from_str(
-            &std::fs::read_to_string(root.join(".cursor/mcp.json")).unwrap(),
-        )
-        .unwrap();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(".cursor/mcp.json")).unwrap())
+                .unwrap();
         assert!(doc.get("mcpServers").is_none());
     }
 
@@ -160,6 +189,9 @@ mod tests {
         m.insert("a".to_string(), json!({ "command": "x" }));
         s.write(&m).unwrap();
         s.backup(&bk).unwrap();
-        assert!(std::fs::read_dir(&bk).unwrap().count() >= 1, "备份目录应有快照");
+        assert!(
+            std::fs::read_dir(&bk).unwrap().count() >= 1,
+            "备份目录应有快照"
+        );
     }
 }

@@ -19,7 +19,7 @@ pub use lifecycle::{spawn_monitor, sweep_orphans};
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -105,7 +105,7 @@ fn create_temp_dir(id: &str) -> Result<PathBuf, String> {
 }
 
 /// 写目录归属标记(不含 key;供启动清扫识别)。
-fn write_marker(dir: &PathBuf, created_ts: i64) -> Result<(), String> {
+fn write_marker(dir: &Path, created_ts: i64) -> Result<(), String> {
     let marker = json!({ "launcher": "2xapi", "version": 2, "created_at": created_ts });
     std::fs::write(dir.join(MARKER_FILE), marker.to_string())
         .map_err(|e| format!("写 {} 失败: {}", MARKER_FILE, e))
@@ -115,8 +115,9 @@ fn write_marker(dir: &PathBuf, created_ts: i64) -> Result<(), String> {
 /// body 两种来源:
 ///   - `{ projectDir, providerId, model? }`:key/base_url/wire_api 从软件 providers.json 取(自己用)
 ///   - `{ projectDir, baseUrl, apiKey, model, wireApi? }`:手动直连(客户各自 key)
+///
 /// 通用可选:`sandbox`(默认 workspace-write)、`extraArgs[]`(附加 codex 参数)
-pub fn start(state: &LauncherState, input: &Value, providers_path: &PathBuf) -> Result<Value, String> {
+pub fn start(state: &LauncherState, input: &Value, providers_path: &Path) -> Result<Value, String> {
     let project_dir = input
         .get("projectDir")
         .or_else(|| input.get("project_dir"))
@@ -218,7 +219,7 @@ pub fn start(state: &LauncherState, input: &Value, providers_path: &PathBuf) -> 
     let spec = platform::LaunchSpec {
         temp_dir: temp_dir.clone(),
         codex_bin: codex.clone(),
-        api_key: api_key,
+        api_key,
         model: model.clone(),
         project_dir: project_dir.clone(),
         sandbox: sandbox.clone(),
@@ -309,7 +310,10 @@ mod tests {
         assert_eq!(parse_sandbox(None).unwrap(), "workspace-write");
         assert_eq!(parse_sandbox(Some("")).unwrap(), "workspace-write");
         assert_eq!(parse_sandbox(Some("read-only")).unwrap(), "read-only");
-        assert_eq!(parse_sandbox(Some(" danger-full-access ")).unwrap(), "danger-full-access");
+        assert_eq!(
+            parse_sandbox(Some(" danger-full-access ")).unwrap(),
+            "danger-full-access"
+        );
     }
 
     #[test]
@@ -320,7 +324,8 @@ mod tests {
 
     #[test]
     fn extra_args_parse_and_filter() {
-        let v: Value = serde_json::from_str(r#"{"extraArgs":["--verbose","  ","-c","x=1",42]}"#).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"extraArgs":["--verbose","  ","-c","x=1",42]}"#).unwrap();
         assert_eq!(parse_extra_args(&v), vec!["--verbose", "-c", "x=1"]);
         assert!(parse_extra_args(&serde_json::json!({})).is_empty());
     }

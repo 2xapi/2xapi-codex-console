@@ -23,7 +23,10 @@ type OpError = (u16, String, String);
 
 /// 两个配置载体:CLI 与桌面版,互不读取对方目录(实证),同一套条目各写一份。
 fn config_roots(home: &Path) -> Vec<(&'static str, PathBuf)> {
-    vec![("cli", home.join(".codebuddy")), ("desktop", home.join(".workbuddy"))]
+    vec![
+        ("cli", home.join(".codebuddy")),
+        ("desktop", home.join(".workbuddy")),
+    ]
 }
 
 fn models_path(root: &Path) -> PathBuf {
@@ -38,7 +41,14 @@ fn read_models(root: &Path) -> Result<Value, OpError> {
     }
     let raw = std::fs::read_to_string(&p).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
     serde_json::from_str(&raw).map_err(|_| {
-        (422, "E_PARSE".into(), format!("{} 不是合法 JSON,请先手动修复(本产品不改动坏文件)", p.display()))
+        (
+            422,
+            "E_PARSE".into(),
+            format!(
+                "{} 不是合法 JSON,请先手动修复(本产品不改动坏文件)",
+                p.display()
+            ),
+        )
     })
 }
 
@@ -90,7 +100,10 @@ fn write_models_atomic(root: &Path, cfg: &Value) -> Result<(), OpError> {
     std::fs::create_dir_all(root).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
     let p = models_path(root);
     let tmp = p.with_extension("json.tmp");
-    let raw = format!("{}\n", serde_json::to_string_pretty(cfg).map_err(|e| (500, "E_IO".into(), e.to_string()))?);
+    let raw = format!(
+        "{}\n",
+        serde_json::to_string_pretty(cfg).map_err(|e| (500, "E_IO".into(), e.to_string()))?
+    );
     std::fs::write(&tmp, raw).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
     #[cfg(unix)]
     {
@@ -133,7 +146,11 @@ pub fn host(
     way: &str,
 ) -> Result<Value, OpError> {
     if way != "gateway" && way != "direct" {
-        return Err((400, "E_BAD_WAY".into(), "未知托管方式,仅支持 gateway / direct".into()));
+        return Err((
+            400,
+            "E_BAD_WAY".into(),
+            "未知托管方式,仅支持 gateway / direct".into(),
+        ));
     }
     let data = crate::providers::load(providers_path);
     let provider = data
@@ -141,9 +158,19 @@ pub fn host(
         .iter()
         .find(|p| p.id == provider_id)
         .cloned()
-        .ok_or_else(|| (404, "E_PROVIDER_NOT_FOUND".to_string(), "找不到该供应商".to_string()))?;
+        .ok_or_else(|| {
+            (
+                404,
+                "E_PROVIDER_NOT_FOUND".to_string(),
+                "找不到该供应商".to_string(),
+            )
+        })?;
     if provider.model.is_empty() {
-        return Err((422, "E_NO_MODEL".to_string(), "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into()));
+        return Err((
+            422,
+            "E_NO_MODEL".to_string(),
+            "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into(),
+        ));
     }
     let entry = build_entry(&provider, way);
     let mut changed = serde_json::Map::new();
@@ -194,20 +221,37 @@ pub fn state(wb_home: &Path) -> Value {
                 let mine: Vec<&Value> = cfg
                     .get("models")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter(|m| m.get("vendor").and_then(|v| v.as_str()) == Some(VENDOR)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter(|m| m.get("vendor").and_then(|v| v.as_str()) == Some(VENDOR))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let pid = mine.first().and_then(|m| m.get("x-provider-id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                let pid = mine
+                    .first()
+                    .and_then(|m| m.get("x-provider-id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 (p.exists(), mine.len(), pid)
             }
             Err(_) => (p.exists(), 0, None), // 坏 JSON:文件在但无法确认,不冒充托管态
         };
         hosted_any = hosted_any || ours > 0;
-        if provider_id.is_none() { provider_id = pid; }
+        if provider_id.is_none() {
+            provider_id = pid;
+        }
         entries.insert(key.into(), json!({ "file": file_exists, "ours": ours }));
     }
     let cli_installed = which_codebuddy().is_some();
-    let desktop_installed = ["/Applications/WorkBuddy.app", &format!("{}/Applications/WorkBuddy.app", std::env::var("HOME").unwrap_or_default())]
-        .iter().any(|p| Path::new(p).exists());
+    let desktop_installed = [
+        "/Applications/WorkBuddy.app",
+        &format!(
+            "{}/Applications/WorkBuddy.app",
+            std::env::var("HOME").unwrap_or_default()
+        ),
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists());
     json!({
         "agent": "workbuddy",
         // hosting 契约对齐 B 阶段通用世界(grokbuild/opencode 等:{…}|null);hosted 保留兼容
@@ -221,31 +265,65 @@ pub fn state(wb_home: &Path) -> Value {
 
 /// PATH 及常见安装位找 codebuddy CLI(只为 UI 提示,找不到不报错)。
 fn which_codebuddy() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "codebuddy.exe" } else { "codebuddy" };
+    let name = if cfg!(windows) {
+        "codebuddy.exe"
+    } else {
+        "codebuddy"
+    };
     for dir in std::env::var("PATH").unwrap_or_default().split(':') {
-        if dir.is_empty() { continue; }
+        if dir.is_empty() {
+            continue;
+        }
         let p = Path::new(dir).join(name);
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    let fallback = [format!("{home}/.local/bin/{name}"), format!("/usr/local/bin/{name}"), format!("/opt/homebrew/bin/{name}")];
+    let fallback = [
+        format!("{home}/.local/bin/{name}"),
+        format!("/usr/local/bin/{name}"),
+        format!("/opt/homebrew/bin/{name}"),
+    ];
     fallback.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
 /// POST /api/desktop/workbuddy/start —— CLI 注入式启动信息(命令可复制;桌面版无命令,UI 提示自选模型)。
-pub fn start(providers_path: &Path, way: &str, provider_id: &str, wb_home: &Path) -> Result<Value, OpError> {
+pub fn start(
+    providers_path: &Path,
+    way: &str,
+    provider_id: &str,
+    wb_home: &Path,
+) -> Result<Value, OpError> {
     let p = if !provider_id.trim().is_empty() {
         let data = crate::providers::load(providers_path);
-        data.providers.iter().find(|p| p.id == provider_id).cloned()
-            .ok_or((400u16, "E_NO_PROVIDER".to_string(), "供应商不存在".to_string()))?
+        data.providers
+            .iter()
+            .find(|p| p.id == provider_id)
+            .cloned()
+            .ok_or((
+                400u16,
+                "E_NO_PROVIDER".to_string(),
+                "供应商不存在".to_string(),
+            ))?
     } else {
-        crate::providers::get_provider_for_agent(providers_path, "workbuddy")
-            .ok_or((503u16, "E_NO_WORKBUDDY_PROVIDER".to_string(), "请先选择 WorkBuddy 供应商".to_string()))?
+        crate::providers::get_provider_for_agent(providers_path, "workbuddy").ok_or((
+            503u16,
+            "E_NO_WORKBUDDY_PROVIDER".to_string(),
+            "请先选择 WorkBuddy 供应商".to_string(),
+        ))?
     };
     // 条目须先 host(url/apiKey 都在条目里,start 不再传 Key)
-    let hosted = state(wb_home).get("hosted").and_then(|v| v.as_bool()).unwrap_or(false);
+    let hosted = state(wb_home)
+        .get("hosted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !hosted {
-        return Err((409u16, "E_NOT_HOSTED".to_string(), "请先托管,再启动".to_string()));
+        return Err((
+            409u16,
+            "E_NOT_HOSTED".to_string(),
+            "请先托管,再启动".to_string(),
+        ));
     }
     Ok(json!({
         // --model 须用真实模型名(=条目 id,真机实证;见 build_entry 注释)
@@ -272,13 +350,18 @@ mod tests {
 
     fn write_provider_file(dir: &Path) -> PathBuf {
         let p = dir.join("providers.json");
-        fs::write(&p, serde_json::json!({
-            "providers": [{
-                "id": "pv1", "name": "测试站", "agent": "workbuddy",
-                "base_url": "https://example.com/v1", "api_key": "sk-test-key",
-                "model": "gpt-test",
-            }]
-        }).to_string()).unwrap();
+        fs::write(
+            &p,
+            serde_json::json!({
+                "providers": [{
+                    "id": "pv1", "name": "测试站", "agent": "workbuddy",
+                    "base_url": "https://example.com/v1", "api_key": "sk-test-key",
+                    "model": "gpt-test",
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
         p
     }
 
@@ -291,14 +374,19 @@ mod tests {
         let pp = write_provider_file(&home);
         // 用户已有 CLI 配置:自条目 + availableModels + 未知顶层字段
         fs::create_dir_all(home.join(".codebuddy")).unwrap();
-        fs::write(home.join(".codebuddy/models.json"), serde_json::json!({
-            "models": [
-                {"id": "user-model", "name": "User", "vendor": "other", "apiKey": "sk-user",
-                 "url": "https://u.example/v1/chat/completions"}
-            ],
-            "availableModels": ["user-model"],
-            "futureField": {"keep": true}
-        }).to_string()).unwrap();
+        fs::write(
+            home.join(".codebuddy/models.json"),
+            serde_json::json!({
+                "models": [
+                    {"id": "user-model", "name": "User", "vendor": "other", "apiKey": "sk-user",
+                     "url": "https://u.example/v1/chat/completions"}
+                ],
+                "availableModels": ["user-model"],
+                "futureField": {"keep": true}
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let v = host(&home, &backup, &pp, "pv1", "gateway").unwrap();
         assert_eq!(v["hosted"], json!(true));
@@ -306,17 +394,34 @@ mod tests {
         assert_eq!(v["changed"]["desktop"], json!(true)); // 桌面目录不存在 → 新建写入
 
         for d in [".codebuddy", ".workbuddy"] {
-            let cfg: Value = serde_json::from_str(&fs::read_to_string(home.join(d).join("models.json")).unwrap()).unwrap();
+            let cfg: Value = serde_json::from_str(
+                &fs::read_to_string(home.join(d).join("models.json")).unwrap(),
+            )
+            .unwrap();
             let models = cfg["models"].as_array().unwrap();
-            assert_eq!(models.len(), if d == ".codebuddy" { 2 } else { 1 }, "{d} 应为本产品条目+用户条目");
+            assert_eq!(
+                models.len(),
+                if d == ".codebuddy" { 2 } else { 1 },
+                "{d} 应为本产品条目+用户条目"
+            );
             let ours = models.iter().find(|m| m["vendor"] == VENDOR).unwrap();
             assert_eq!(ours["url"], GATEWAY_CHAT_URL);
             assert_eq!(ours["apiKey"], "sk-test-key");
-            assert_eq!(ours["id"], "gpt-test", "条目 id 必须是真实模型名(CLI 以之作请求 model)");
+            assert_eq!(
+                ours["id"], "gpt-test",
+                "条目 id 必须是真实模型名(CLI 以之作请求 model)"
+            );
             assert_eq!(ours["x-provider-id"], "pv1");
             if d == ".codebuddy" {
-                assert!(models.iter().any(|m| m["id"] == "user-model"), "用户条目零触碰");
-                assert_eq!(cfg["availableModels"], json!(["user-model"]), "availableModels 零触碰");
+                assert!(
+                    models.iter().any(|m| m["id"] == "user-model"),
+                    "用户条目零触碰"
+                );
+                assert_eq!(
+                    cfg["availableModels"],
+                    json!(["user-model"]),
+                    "availableModels 零触碰"
+                );
                 assert_eq!(cfg["futureField"]["keep"], json!(true), "未知字段保留");
             }
         }
@@ -335,16 +440,26 @@ mod tests {
         let home = tmp("direct");
         let pp = write_provider_file(&home);
         host(&home, &home.join("bk"), &pp, "pv1", "direct").unwrap();
-        let cfg: Value = serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap()).unwrap();
-        assert_eq!(cfg["models"][0]["url"], "https://example.com/v1/chat/completions");
+        let cfg: Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["models"][0]["url"],
+            "https://example.com/v1/chat/completions"
+        );
         assert_eq!(cfg["models"][0]["id"], "gpt-test");
         // base 不带 /v1(2xapi.cc.cd 形态)→ 补 /v1(真机实证:无 /v1 路径 404)
         let mut d2: Value = serde_json::from_str(&fs::read_to_string(&pp).unwrap()).unwrap();
         d2["providers"].as_array_mut().unwrap()[0]["base_url"] = json!("https://no-v1.example");
         fs::write(&pp, d2.to_string()).unwrap();
         host(&home, &home.join("bk"), &pp, "pv1", "direct").unwrap();
-        let cfg2: Value = serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap()).unwrap();
-        assert_eq!(cfg2["models"][0]["url"], "https://no-v1.example/v1/chat/completions");
+        let cfg2: Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg2["models"][0]["url"],
+            "https://no-v1.example/v1/chat/completions"
+        );
     }
 
     /// unhost 仅移除本产品条目;二次 unhost no-op。
@@ -359,7 +474,9 @@ mod tests {
         let v = unhost(&home, &backup).unwrap();
         assert_eq!(v["hosted"], json!(false));
         assert_eq!(v["changed"]["cli"], json!(true));
-        let cfg: Value = serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap()).unwrap();
+        let cfg: Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap())
+                .unwrap();
         assert!(cfg["models"].as_array().unwrap().is_empty());
 
         let v2 = unhost(&home, &backup).unwrap();
@@ -376,7 +493,10 @@ mod tests {
         let pp = write_provider_file(&home);
         let err = host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap_err();
         assert_eq!(err.1, "E_PARSE");
-        assert_eq!(fs::read_to_string(home.join(".codebuddy/models.json")).unwrap(), raw);
+        assert_eq!(
+            fs::read_to_string(home.join(".codebuddy/models.json")).unwrap(),
+            raw
+        );
     }
 
     /// 无模型供应商拒绝 host(与 codex E_NO_MODEL 口径一致)。
@@ -384,10 +504,15 @@ mod tests {
     fn no_model_rejects() {
         let home = tmp("nomodel");
         let pp = home.join("providers.json");
-        fs::write(&pp, serde_json::json!({
-            "providers": [{"id": "pv2", "name": "空", "agent": "workbuddy",
-                "base_url": "https://x.example", "api_key": "k", "model": ""}]
-        }).to_string()).unwrap();
+        fs::write(
+            &pp,
+            serde_json::json!({
+                "providers": [{"id": "pv2", "name": "空", "agent": "workbuddy",
+                    "base_url": "https://x.example", "api_key": "k", "model": ""}]
+            })
+            .to_string(),
+        )
+        .unwrap();
         let err = host(&home, &home.join("bk"), &pp, "pv2", "gateway").unwrap_err();
         assert_eq!(err.1, "E_NO_MODEL");
     }
@@ -404,7 +529,10 @@ mod tests {
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         let s1 = state(&home);
         assert_eq!(s1["hosted"], json!(true));
-        assert_eq!(s1["hosting"]["way"], "gateway", "通用世界前端读 hosting 判定托管态");
+        assert_eq!(
+            s1["hosting"]["way"], "gateway",
+            "通用世界前端读 hosting 判定托管态"
+        );
         assert_eq!(s1["entries"]["desktop"]["ours"], 1);
     }
 
@@ -428,7 +556,9 @@ mod tests {
         let pp = write_provider_file(&home);
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         host(&home, &home.join("bk"), &pp, "pv1", "direct").unwrap();
-        let cfg: Value = serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap()).unwrap();
+        let cfg: Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap())
+                .unwrap();
         let models = cfg["models"].as_array().unwrap();
         assert_eq!(models.len(), 1, "同 id 覆盖,条目不重复");
         assert_eq!(models[0]["url"], "https://example.com/v1/chat/completions");

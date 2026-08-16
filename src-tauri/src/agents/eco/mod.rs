@@ -57,7 +57,12 @@ fn save_registry(codex_home: &Path, agents: &Map<String, Value>) {
     }
     let body = json!({ "version": 1, "agents": agents });
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_string_pretty(&body).unwrap_or_default()).is_ok() {
+    if std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    )
+    .is_ok()
+    {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
@@ -112,7 +117,9 @@ fn normalize_spec(spec: &Value) -> Result<Value, OpError> {
             }
         }
     } else {
-        return Err(bad("A 期仅支持 stdio 型 MCP 服务器(command + args),远程型后续开放"));
+        return Err(bad(
+            "A 期仅支持 stdio 型 MCP 服务器(command + args),远程型后续开放",
+        ));
     }
     let mut v = Value::Object(out);
     wrap_for_windows(&mut v);
@@ -121,9 +128,19 @@ fn normalize_spec(spec: &Value) -> Result<Value, OpError> {
 
 #[cfg(windows)]
 fn wrap_for_windows(spec: &mut Value) {
-    let Some(obj) = spec.as_object_mut() else { return };
-    let Some(cmd) = obj.get("command").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let stem = Path::new(&cmd).file_stem().and_then(|s| s.to_str()).unwrap_or(&cmd).to_ascii_lowercase();
+    let Some(obj) = spec.as_object_mut() else {
+        return;
+    };
+    let Some(cmd) = obj
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let stem = Path::new(&cmd)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd)
+        .to_ascii_lowercase();
     if !WRAP_COMMANDS.contains(&stem.as_str()) {
         return;
     }
@@ -150,7 +167,11 @@ fn spec_summary(spec: &Value) -> String {
                     .join(" ")
             })
             .unwrap_or_default();
-        return if args.is_empty() { cmd.to_string() } else { format!("{cmd} {args}") };
+        return if args.is_empty() {
+            cmd.to_string()
+        } else {
+            format!("{cmd} {args}")
+        };
     }
     if let Some(url) = spec.get("url").and_then(|v| v.as_str()) {
         return url.to_string();
@@ -166,7 +187,11 @@ pub fn list(store: &dyn EcoStore, codex_home: &Path) -> Result<Value, OpError> {
     let mut servers: Vec<Value> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (name, spec) in &live {
-        let source = if roster.contains_key(name) { "console" } else { "manual" };
+        let source = if roster.contains_key(name) {
+            "console"
+        } else {
+            "manual"
+        };
         servers.push(json!({
             "id": name, "name": name, "source": source, "enabled": true,
             "summary": spec_summary(spec), "spec": spec,
@@ -183,7 +208,12 @@ pub fn list(store: &dyn EcoStore, codex_home: &Path) -> Result<Value, OpError> {
             "summary": spec_summary(&spec), "spec": spec,
         }));
     }
-    servers.sort_by(|a, b| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")));
+    servers.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["id"].as_str().unwrap_or(""))
+    });
     Ok(json!({
         "agent": store.id(),
         "servers": servers,
@@ -199,7 +229,10 @@ fn registry_upsert(codex_home: &Path, agent: &str, name: &str, enabled: bool, sp
     let mut agents = load_registry(codex_home);
     let entry = agents.entry(agent.to_string()).or_insert_with(|| json!({}));
     if let Some(m) = entry.as_object_mut() {
-        m.insert(name.to_string(), json!({ "enabled": enabled, "spec": spec }));
+        m.insert(
+            name.to_string(),
+            json!({ "enabled": enabled, "spec": spec }),
+        );
     }
     save_registry(codex_home, &agents);
 }
@@ -225,7 +258,9 @@ fn guard_manual(
         return Err((
             409,
             "E_ECO_MANUAL".into(),
-            format!("「{name}」为手动添加的条目,Console 不改动手动配置;如需移除请在平台配置中自行操作"),
+            format!(
+                "「{name}」为手动添加的条目,Console 不改动手动配置;如需移除请在平台配置中自行操作"
+            ),
         ));
     }
     Ok(())
@@ -240,7 +275,11 @@ pub fn install(
     spec: &Value,
 ) -> Result<Value, OpError> {
     if !is_valid_name(name) {
-        return Err((400, "E_ECO_BAD_NAME".into(), "名称仅限字母/数字/-/_,长度 1-64".into()));
+        return Err((
+            400,
+            "E_ECO_BAD_NAME".into(),
+            "名称仅限字母/数字/-/_,长度 1-64".into(),
+        ));
     }
     let spec = normalize_spec(spec)?;
     let mut live = store.read()?;
@@ -272,7 +311,11 @@ pub fn disable(
         next.remove(name);
         store.write(&next)?;
     }
-    let spec = roster.get(name).and_then(|e| e.get("spec")).cloned().unwrap_or(Value::Null);
+    let spec = roster
+        .get(name)
+        .and_then(|e| e.get("spec"))
+        .cloned()
+        .unwrap_or(Value::Null);
     registry_upsert(codex_home, store.id(), name, false, &spec);
     list(store, codex_home)
 }
@@ -288,18 +331,30 @@ pub fn enable(
     let roster = agent_registry(&load_registry(codex_home), store.id());
     if !roster.contains_key(name) {
         if live.contains_key(name) {
-            return Err((409, "E_ECO_MANUAL".into(), "手动条目默认启用,无需此操作".into()));
+            return Err((
+                409,
+                "E_ECO_MANUAL".into(),
+                "手动条目默认启用,无需此操作".into(),
+            ));
         }
         return Err((404, "E_ECO_NOT_FOUND".into(), format!("条目不存在: {name}")));
     }
     if !live.contains_key(name) {
-        let spec = roster.get(name).and_then(|e| e.get("spec")).cloned().unwrap_or(Value::Null);
+        let spec = roster
+            .get(name)
+            .and_then(|e| e.get("spec"))
+            .cloned()
+            .unwrap_or(Value::Null);
         store.backup(backup_dir)?;
         let mut next = live.clone();
         next.insert(name.to_string(), spec);
         store.write(&next)?;
     }
-    let spec = roster.get(name).and_then(|e| e.get("spec")).cloned().unwrap_or(Value::Null);
+    let spec = roster
+        .get(name)
+        .and_then(|e| e.get("spec"))
+        .cloned()
+        .unwrap_or(Value::Null);
     registry_upsert(codex_home, store.id(), name, true, &spec);
     list(store, codex_home)
 }
@@ -493,19 +548,34 @@ mod tests {
 
         // disable → 不在 live,登记表 enabled=false
         let v = disable(&store, &root, &root, "fetch").unwrap();
-        let fetch = v["servers"].as_array().unwrap().iter().find(|s| s["id"] == "fetch").unwrap();
+        let fetch = v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "fetch")
+            .unwrap();
         assert_eq!(fetch["enabled"], Value::Bool(false));
         assert!(!store.file.borrow().contains_key("fetch"));
 
         // enable → 写回
         let v = enable(&store, &root, &root, "fetch").unwrap();
-        let fetch = v["servers"].as_array().unwrap().iter().find(|s| s["id"] == "fetch").unwrap();
+        let fetch = v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "fetch")
+            .unwrap();
         assert_eq!(fetch["enabled"], Value::Bool(true));
         assert!(store.file.borrow().contains_key("fetch"));
 
         // uninstall → live+登记表双清;手动条目仍在
         let v = uninstall(&store, &root, &root, "fetch").unwrap();
-        let ids: Vec<&str> = v["servers"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["manual-one"]);
         // 手动条目 uninstall → 409
         let err = uninstall(&store, &root, &root, "manual-one").unwrap_err();
@@ -517,7 +587,14 @@ mod tests {
     #[test]
     fn install_idempotent_overwrites_console_entry() {
         let (root, store) = setup("idem");
-        install(&store, &root, &root, "fetch", &json!({ "command": "uvx", "args": ["mcp-server-fetch"] })).unwrap();
+        install(
+            &store,
+            &root,
+            &root,
+            "fetch",
+            &json!({ "command": "uvx", "args": ["mcp-server-fetch"] }),
+        )
+        .unwrap();
         // 同名再装(Console 自己的)→ 幂等覆盖,不 409
         install(&store, &root, &root, "fetch", &spec()).unwrap();
         assert_eq!(store.file.borrow()["fetch"]["command"], "npx");
@@ -526,14 +603,24 @@ mod tests {
     #[test]
     fn bad_names_and_specs_rejected() {
         let (root, store) = setup("validate");
-        assert_eq!(install(&store, &root, &root, "", &spec()).unwrap_err().1, "E_ECO_BAD_NAME");
-        assert_eq!(install(&store, &root, &root, "a b", &spec()).unwrap_err().1, "E_ECO_BAD_NAME");
         assert_eq!(
-            install(&store, &root, &root, "ok", &json!({ "url": "https://x" })).unwrap_err().1,
+            install(&store, &root, &root, "", &spec()).unwrap_err().1,
+            "E_ECO_BAD_NAME"
+        );
+        assert_eq!(
+            install(&store, &root, &root, "a b", &spec()).unwrap_err().1,
+            "E_ECO_BAD_NAME"
+        );
+        assert_eq!(
+            install(&store, &root, &root, "ok", &json!({ "url": "https://x" }))
+                .unwrap_err()
+                .1,
             "E_ECO_BAD_SPEC"
         );
         assert_eq!(
-            install(&store, &root, &root, "ok", &json!({ "command": "" })).unwrap_err().1,
+            install(&store, &root, &root, "ok", &json!({ "command": "" }))
+                .unwrap_err()
+                .1,
             "E_ECO_BAD_SPEC"
         );
     }
@@ -550,7 +637,10 @@ mod tests {
         assert_eq!(spec["env"]["GITHUB_TOKEN"], "");
         let mem = find_preset("memory").unwrap();
         assert!(preset_spec(mem).get("env").is_none());
-        assert!(find_preset("filesystem").is_none(), "需装时填参的预设不在 A 期市场");
+        assert!(
+            find_preset("filesystem").is_none(),
+            "需装时填参的预设不在 A 期市场"
+        );
     }
 
     #[test]
@@ -576,9 +666,7 @@ mod real {
     use std::path::PathBuf;
 
     fn real_home() -> PathBuf {
-        PathBuf::from(
-            std::env::var("HOME").unwrap_or_default(),
-        )
+        PathBuf::from(std::env::var("HOME").unwrap_or_default())
     }
 
     #[test]
@@ -599,24 +687,47 @@ mod real {
         std::fs::create_dir_all(&backup_dir).unwrap();
 
         let before: BTreeMap<String, Value> = store.read().unwrap();
-        println!("[codex] 副本已有 MCP 条目: {:?}", before.keys().collect::<Vec<_>>());
+        println!(
+            "[codex] 副本已有 MCP 条目: {:?}",
+            before.keys().collect::<Vec<_>>()
+        );
 
         // install 预设 fetch
-        let v = install(&store, &tmp, &backup_dir, "fetch", &preset_spec(find_preset("fetch").unwrap())).unwrap();
+        let v = install(
+            &store,
+            &tmp,
+            &backup_dir,
+            "fetch",
+            &preset_spec(find_preset("fetch").unwrap()),
+        )
+        .unwrap();
         let after = store.read().unwrap();
         assert!(after.contains_key("fetch"), "install 后应含 fetch");
         for k in before.keys() {
             assert!(after.contains_key(k), "已有条目 {k} 必须保留");
             assert_eq!(after[k], before[k], "已有条目 {k} 内容必须零变化");
         }
-        let src = v["servers"].as_array().unwrap().iter().find(|s| s["id"] == "fetch").unwrap();
+        let src = v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "fetch")
+            .unwrap();
         assert_eq!(src["source"], "console");
 
         // diff 精确性:除 mcp_servers 外的顶层键零变化
-        let orig_toml: toml::Value = String::from_utf8(original.clone()).unwrap().parse().unwrap();
-        let now_toml: toml::Value = std::fs::read_to_string(tmp.join("config.toml")).unwrap().parse().unwrap();
+        let orig_toml: toml::Value = String::from_utf8(original.clone())
+            .unwrap()
+            .parse()
+            .unwrap();
+        let now_toml: toml::Value = std::fs::read_to_string(tmp.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
         for (k, v0) in orig_toml.as_table().unwrap() {
-            if k == "mcp_servers" { continue; }
+            if k == "mcp_servers" {
+                continue;
+            }
             assert_eq!(now_toml.get(k), Some(v0), "顶层键 {k} 零触碰");
         }
 
@@ -628,30 +739,65 @@ mod real {
 
         // uninstall → mcp_servers 段回到原样(原有条目数),其他键不变
         uninstall(&store, &tmp, &backup_dir, "fetch").unwrap();
-        let final_toml: toml::Value = std::fs::read_to_string(tmp.join("config.toml")).unwrap().parse().unwrap();
-        let final_mcp = final_toml.get("mcp_servers").and_then(|m| m.as_table()).map(|m| m.len()).unwrap_or(0);
-        let orig_mcp = orig_toml.get("mcp_servers").and_then(|m| m.as_table()).map(|m| m.len()).unwrap_or(0);
+        let final_toml: toml::Value = std::fs::read_to_string(tmp.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let final_mcp = final_toml
+            .get("mcp_servers")
+            .and_then(|m| m.as_table())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let orig_mcp = orig_toml
+            .get("mcp_servers")
+            .and_then(|m| m.as_table())
+            .map(|m| m.len())
+            .unwrap_or(0);
         assert_eq!(final_mcp, orig_mcp, "uninstall 后 MCP 段条目数应回到原始");
         assert!(backup_dir.read_dir().unwrap().count() >= 1, "备份链存在");
         let _ = std::fs::remove_dir_all(&tmp);
         println!("[codex] 真机副本 e2e 通过");
 
         // ── cursor:真实 HOME 写入(原文件不存在)──
-        assert!(!home.join(".cursor").join("mcp.json").exists(), "前提:真实 ~/.cursor/mcp.json 不存在(存在则本测试不应运行)");
+        assert!(
+            !home.join(".cursor").join("mcp.json").exists(),
+            "前提:真实 ~/.cursor/mcp.json 不存在(存在则本测试不应运行)"
+        );
         let cstore = crate::agents::eco::cursor::JsonStore::new(&home);
         let cbackup = home.join(".codex").join("config-backups");
-        let v = install(&cstore, &home.join(".codex"), &cbackup, "playwright", &preset_spec(find_preset("playwright").unwrap())).unwrap();
+        let v = install(
+            &cstore,
+            &home.join(".codex"),
+            &cbackup,
+            "playwright",
+            &preset_spec(find_preset("playwright").unwrap()),
+        )
+        .unwrap();
         let raw = std::fs::read_to_string(home.join(".cursor").join("mcp.json")).unwrap();
         let doc: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx", "真实写入形状");
-        assert_eq!(doc["mcpServers"]["playwright"]["args"][0], "@playwright/mcp@latest");
-        assert!(v["servers"].as_array().unwrap().iter().any(|s| s["id"] == "playwright"));
+        assert_eq!(
+            doc["mcpServers"]["playwright"]["command"], "npx",
+            "真实写入形状"
+        );
+        assert_eq!(
+            doc["mcpServers"]["playwright"]["args"][0],
+            "@playwright/mcp@latest"
+        );
+        assert!(v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "playwright"));
 
         uninstall(&cstore, &home.join(".codex"), &cbackup, "playwright").unwrap();
         // 卸载后:登记表无 playwright,mcpServers 段清空
-        let after_raw = std::fs::read_to_string(home.join(".cursor").join("mcp.json")).unwrap_or_default();
+        let after_raw =
+            std::fs::read_to_string(home.join(".cursor").join("mcp.json")).unwrap_or_default();
         let after_doc: Value = serde_json::from_str(&after_raw).unwrap_or(Value::Null);
-        assert!(after_doc.get("mcpServers").is_none(), "卸载后 mcpServers 段应清空");
+        assert!(
+            after_doc.get("mcpServers").is_none(),
+            "卸载后 mcpServers 段应清空"
+        );
         // 零残留:只删本测试新建的 mcp.json;~/.cursor 目录是 Cursor IDE 用户数据目录
         // (真机实证:含 extensions/plugins/projects 等,始终存在),任何情况下不得删除目录本身。
         let _ = std::fs::remove_file(home.join(".cursor").join("mcp.json"));

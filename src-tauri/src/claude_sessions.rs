@@ -6,6 +6,7 @@
 //!   - title = 首条 user 消息文本(只读前 TITLE_SCAN_LINES 行,不全量解析;找不到 → "(无标题)")
 //!   - cwd = 目录名反转义(前导 `-` 是根,后续 `-` 分段)
 //!   - updatedAt = 文件 mtime(毫秒),倒序分页
+//!
 //! `~/.claude` 缺失 → {total:0, items:[]},不报错。
 //!
 //! 安全约定:本模块只读 ~/.claude,绝无任何写操作(Claude 会话文件归 CLI 自己管)。
@@ -197,7 +198,10 @@ mod tests {
 
     fn sandbox(label: &str) -> PathBuf {
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("2xapi-claude-sess-{label}-{}-{n}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "2xapi-claude-sess-{label}-{}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         root
     }
@@ -248,29 +252,52 @@ mod tests {
     fn title_extraction_string_and_array_content() {
         let root = sandbox("title");
         // 字符串形态:首行 queue-operation(非 user)先出现,应跳过取到后面 user
-        write_session(&root, "-Users-u-p", "s-str", &[
-            r#"{"type":"queue-operation","operation":"dequeue"}"#,
-            r#"{"type":"user","message":{"role":"user","content":"帮我看下这个报错怎么修"}}"#,
-        ]);
+        write_session(
+            &root,
+            "-Users-u-p",
+            "s-str",
+            &[
+                r#"{"type":"queue-operation","operation":"dequeue"}"#,
+                r#"{"type":"user","message":{"role":"user","content":"帮我看下这个报错怎么修"}}"#,
+            ],
+        );
         // 数组形态:text 块 + tool_result 块混排,只取文本
-        write_session(&root, "-Users-u-p", "s-arr", &[
-            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
-            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ignored"},{"type":"text","text":"重构登录模块"}]}}"#,
-        ]);
+        write_session(
+            &root,
+            "-Users-u-p",
+            "s-arr",
+            &[
+                r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ignored"},{"type":"text","text":"重构登录模块"}]}}"#,
+            ],
+        );
         // 无 user 消息 → 兜底
-        write_session(&root, "-Users-u-p", "s-none", &[
-            r#"{"type":"assistant","message":{"role":"assistant","content":"..."}}"#,
-        ]);
+        write_session(
+            &root,
+            "-Users-u-p",
+            "s-none",
+            &[r#"{"type":"assistant","message":{"role":"assistant","content":"..."}}"#],
+        );
         // 首个 user 是命令注入 → 跳过,取下一条真消息
-        write_session(&root, "-Users-u-p", "s-cmd", &[
-            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<command-message>compact</command-message>"}}"#,
-            r#"{"type":"user","message":{"role":"user","content":"压缩上下文后的第二个问题"}}"#,
-        ]);
+        write_session(
+            &root,
+            "-Users-u-p",
+            "s-cmd",
+            &[
+                r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<command-message>compact</command-message>"}}"#,
+                r#"{"type":"user","message":{"role":"user","content":"压缩上下文后的第二个问题"}}"#,
+            ],
+        );
         // 超长 → 截断加省略号(80 字符 + …)
         let long = "很".repeat(100);
-        write_session(&root, "-Users-u-p", "s-long", &[
-            &format!(r#"{{"type":"user","message":{{"role":"user","content":"{long}"}}}}"#),
-        ]);
+        write_session(
+            &root,
+            "-Users-u-p",
+            "s-long",
+            &[&format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"{long}"}}}}"#
+            )],
+        );
 
         let r = list_sessions(&root, 1, 50);
         let title = |id: &str| -> String {
@@ -281,7 +308,11 @@ mod tests {
         assert_eq!(title("s-str"), "帮我看下这个报错怎么修");
         assert_eq!(title("s-arr"), "重构登录模块", "数组 content 只取 text 块");
         assert_eq!(title("s-none"), "(无标题)");
-        assert_eq!(title("s-cmd"), "压缩上下文后的第二个问题", "命令注入行应跳过");
+        assert_eq!(
+            title("s-cmd"),
+            "压缩上下文后的第二个问题",
+            "命令注入行应跳过"
+        );
         let t = title("s-long");
         assert!(t.chars().count() == 81 && t.ends_with('…'), "超长截断: {t}");
         let _ = std::fs::remove_dir_all(&root);
@@ -290,10 +321,16 @@ mod tests {
     /// ③ 目录反转义:常规多级、连串 `-`(空段过滤)、无前导 `-` 容错。
     #[test]
     fn unescape_cwd_variants() {
-        assert_eq!(unescape_cwd("-Users-wenkezhi-Documents-xxx"), "/Users/wenkezhi/Documents/xxx");
+        assert_eq!(
+            unescape_cwd("-Users-wenkezhi-Documents-xxx"),
+            "/Users/wenkezhi/Documents/xxx"
+        );
         assert_eq!(unescape_cwd("-private-tmp"), "/private/tmp");
         // 原路径含非 ASCII 被压成连串 `-`(如 -Users-x-Documents-sub2api-----)→ 空段过滤
-        assert_eq!(unescape_cwd("-Users-x-Documents-sub2api-----"), "/Users/x/Documents/sub2api");
+        assert_eq!(
+            unescape_cwd("-Users-x-Documents-sub2api-----"),
+            "/Users/x/Documents/sub2api"
+        );
         // 无前导 `-`(非常规,容错不炸)
         assert_eq!(unescape_cwd("Users-x"), "/Users/x");
     }

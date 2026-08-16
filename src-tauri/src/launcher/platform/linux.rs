@@ -31,7 +31,11 @@ fn which(bin: &str) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 pub(crate) fn launch(spec: &LaunchSpec) -> Result<(), String> {

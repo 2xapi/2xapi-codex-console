@@ -35,7 +35,9 @@ fn config_json(dir: &Path) -> PathBuf {
     dir.join("claude_desktop_config.json")
 }
 fn profile_path(cd_home: &Path) -> PathBuf {
-    p3_dir(cd_home).join("configLibrary").join(format!("{PROFILE_ID}.json"))
+    p3_dir(cd_home)
+        .join("configLibrary")
+        .join(format!("{PROFILE_ID}.json"))
 }
 fn meta_path(cd_home: &Path) -> PathBuf {
     p3_dir(cd_home).join("configLibrary").join("_meta.json")
@@ -67,12 +69,21 @@ fn set_deployment_mode(path: &Path, mode: &str) -> Result<(), OpError> {
     write_json(path, &obj)
 }
 
-fn find_provider(providers_path: &Path, provider_id: &str) -> Result<crate::providers::Provider, OpError> {
+fn find_provider(
+    providers_path: &Path,
+    provider_id: &str,
+) -> Result<crate::providers::Provider, OpError> {
     crate::providers::load(providers_path)
         .providers
         .into_iter()
         .find(|p| p.id == provider_id)
-        .ok_or_else(|| (404, "E_NO_PROVIDER".into(), format!("供应商不存在: {provider_id}")))
+        .ok_or_else(|| {
+            (
+                404,
+                "E_NO_PROVIDER".into(),
+                format!("供应商不存在: {provider_id}"),
+            )
+        })
 }
 
 /// 托管态:profile 文件存在且 _meta.appliedId 指向我们。
@@ -99,25 +110,51 @@ pub fn host(
     way: &str,
 ) -> Result<Value, OpError> {
     if way != "gateway" && way != "direct" {
-        return Err((400, "E_BAD_WAY".into(), "未知托管方式,仅支持 gateway / direct".into()));
+        return Err((
+            400,
+            "E_BAD_WAY".into(),
+            "未知托管方式,仅支持 gateway / direct".into(),
+        ));
     }
     let provider = find_provider(providers_path, provider_id)?;
     if provider.model.trim().is_empty() {
-        return Err((422, "E_NO_MODEL".into(), "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into()));
+        return Err((
+            422,
+            "E_NO_MODEL".into(),
+            "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into(),
+        ));
     }
     if way == "direct" && provider.base_url.trim().is_empty() {
-        return Err((422, "E_NO_BASE_URL".into(), "该供应商未配置 API 地址".into()));
+        return Err((
+            422,
+            "E_NO_BASE_URL".into(),
+            "该供应商未配置 API 地址".into(),
+        ));
     }
 
     let main_cfg = config_json(&main_dir(cd_home));
     let p3_cfg = config_json(&p3_dir(cd_home));
-    let prev_main = read_json_obj(&main_cfg).get("deploymentMode").and_then(|v| v.as_str()).map(String::from);
-    let prev_p3 = read_json_obj(&p3_cfg).get("deploymentMode").and_then(|v| v.as_str()).map(String::from);
+    let prev_main = read_json_obj(&main_cfg)
+        .get("deploymentMode")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let prev_p3 = read_json_obj(&p3_cfg)
+        .get("deploymentMode")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let (base_url, api_key, key_note) = if way == "gateway" {
-        (format!("{GATEWAY_BASE}/claude-desktop"), PLACEHOLDER_KEY.to_string(), "占位(真实 Key 只在网关)")
+        (
+            format!("{GATEWAY_BASE}/claude-desktop"),
+            PLACEHOLDER_KEY.to_string(),
+            "占位(真实 Key 只在网关)",
+        )
     } else {
-        (provider.base_url.trim().trim_end_matches('/').to_string(), provider.api_key.clone(), "直连:真实 Key 写入 profile")
+        (
+            provider.base_url.trim().trim_end_matches('/').to_string(),
+            provider.api_key.clone(),
+            "直连:真实 Key 写入 profile",
+        )
     };
     let profile = json!({
         "coworkEgressAllowedHosts": ["*"],
@@ -132,9 +169,12 @@ pub fn host(
     set_deployment_mode(&p3_cfg, "3p")?;
 
     let mut prof_obj = profile.as_object().cloned().unwrap_or_default();
-    prof_obj.insert("inferenceModels".into(), json!([
-        { "id": provider.model.trim(), "name": provider.model.trim() }
-    ]));
+    prof_obj.insert(
+        "inferenceModels".into(),
+        json!([
+            { "id": provider.model.trim(), "name": provider.model.trim() }
+        ]),
+    );
     write_json(&profile_path(cd_home), &prof_obj)?;
 
     let mut meta = read_json_obj(&meta_path(cd_home));
@@ -142,7 +182,10 @@ pub fn host(
         .entry("entries".to_string())
         .or_insert_with(|| json!([]));
     if let Some(arr) = entries.as_array_mut() {
-        if !arr.iter().any(|e| e.get("id").and_then(|v| v.as_str()) == Some(PROFILE_ID)) {
+        if !arr
+            .iter()
+            .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(PROFILE_ID))
+        {
             arr.push(json!({ "id": PROFILE_ID }));
         }
     }
@@ -152,8 +195,12 @@ pub fn host(
     // 私有簿记:host 前两处 deploymentMode 原值(unhost 按此恢复;原即 3p 则保持)
     write_json(&state_path(cd_home), &{
         let mut m = Map::new();
-        if let Some(p) = &prev_main { m.insert("prevMain".into(), json!(p)); }
-        if let Some(p) = &prev_p3 { m.insert("prevP3".into(), json!(p)); }
+        if let Some(p) = &prev_main {
+            m.insert("prevMain".into(), json!(p));
+        }
+        if let Some(p) = &prev_p3 {
+            m.insert("prevP3".into(), json!(p));
+        }
         m
     })?;
 
@@ -173,7 +220,11 @@ pub fn unhost(cd_home: &Path) -> Result<Value, OpError> {
     // 簿记恢复 deploymentMode(无簿记/原值缺失 → "1p",官方模式)
     let bk = read_json_obj(&state_path(cd_home));
     let restore = |cfg: &Path, key: &str| {
-        let mode = bk.get(key).and_then(|v| v.as_str()).unwrap_or("1p").to_string();
+        let mode = bk
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("1p")
+            .to_string();
         let _ = set_deployment_mode(cfg, &mode);
     };
     restore(&config_json(&main_dir(cd_home)), "prevMain");

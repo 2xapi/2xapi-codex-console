@@ -46,7 +46,8 @@ fn env_get(content: &str, key: &str) -> Option<String> {
         if t.starts_with('#') {
             return None;
         }
-        t.split_once('=').and_then(|(k, v)| (k.trim() == key).then(|| v.trim().to_string()))
+        t.split_once('=')
+            .and_then(|(k, v)| (k.trim() == key).then(|| v.trim().to_string()))
     })
 }
 
@@ -62,7 +63,10 @@ fn env_upsert(content: &str, updates: &[(&str, String)]) -> String {
         let mut kept: Vec<String> = Vec::new();
         for line in lines.drain(..) {
             let t = line.trim();
-            let is_key = !t.starts_with('#') && t.split_once('=').map(|(k, _)| k.trim() == *key).unwrap_or(false);
+            let is_key = !t.starts_with('#')
+                && t.split_once('=')
+                    .map(|(k, _)| k.trim() == *key)
+                    .unwrap_or(false);
             if is_key && !replaced {
                 kept.push(format!("{key}={val}"));
                 replaced = true;
@@ -122,7 +126,14 @@ fn read_settings(home: &Path) -> Result<Option<Value>, OpError> {
     }
     let raw = std::fs::read_to_string(&p).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
     serde_json::from_str(&raw).map(Some).map_err(|_| {
-        (422, "E_PARSE".into(), format!("{} 不是合法 JSON,请先手动修复(本产品不改动坏文件)", p.display()))
+        (
+            422,
+            "E_PARSE".into(),
+            format!(
+                "{} 不是合法 JSON,请先手动修复(本产品不改动坏文件)",
+                p.display()
+            ),
+        )
     })
 }
 
@@ -157,7 +168,11 @@ pub fn host(
     way: &str,
 ) -> Result<Value, OpError> {
     if way != "gateway" && way != "direct" {
-        return Err((400, "E_BAD_WAY".into(), "未知托管方式,仅支持 gateway / direct".into()));
+        return Err((
+            400,
+            "E_BAD_WAY".into(),
+            "未知托管方式,仅支持 gateway / direct".into(),
+        ));
     }
     let data = crate::providers::load(providers_path);
     let provider = data
@@ -165,18 +180,36 @@ pub fn host(
         .iter()
         .find(|p| p.id == provider_id)
         .cloned()
-        .ok_or_else(|| (404, "E_PROVIDER_NOT_FOUND".to_string(), "找不到该供应商".to_string()))?;
+        .ok_or_else(|| {
+            (
+                404,
+                "E_PROVIDER_NOT_FOUND".to_string(),
+                "找不到该供应商".to_string(),
+            )
+        })?;
     if provider.model.is_empty() {
-        return Err((422, "E_NO_MODEL".into(), "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into()));
+        return Err((
+            422,
+            "E_NO_MODEL".into(),
+            "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into(),
+        ));
     }
     if way == "direct" && provider.wire_api != crate::providers::WireApi::Gemini {
         return Err((400, "E_DIRECT_NEEDS_GEMINI".into(),
             "直连方式要求协议为 Gemini 的供应商(Gemini CLI 只讲 Google 协议);Chat 协议供应商请走网关(自动转换)".into()));
     }
     let (base, key, key_hint) = if way == "gateway" {
-        (GATEWAY_BASE.to_string(), PLACEHOLDER_KEY.to_string(), "占位(真实 Key 只在网关)")
+        (
+            GATEWAY_BASE.to_string(),
+            PLACEHOLDER_KEY.to_string(),
+            "占位(真实 Key 只在网关)",
+        )
     } else {
-        (provider.base_url.trim_end_matches('/').to_string(), provider.api_key.clone(), "真实 Key(落盘)")
+        (
+            provider.base_url.trim_end_matches('/').to_string(),
+            provider.api_key.clone(),
+            "真实 Key(落盘)",
+        )
     };
 
     // sidecar 先落:首次 host 记录还原基线;重复 host(换供应商/way)保留最初快照
@@ -186,7 +219,14 @@ pub fn host(
         let settings = read_settings(gem_home)?;
         let prev_env: serde_json::Map<String, Value> = OUR_KEYS
             .iter()
-            .map(|k| (k.to_string(), env_get(&env_raw, k).map(Value::String).unwrap_or(Value::Null)))
+            .map(|k| {
+                (
+                    k.to_string(),
+                    env_get(&env_raw, k)
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                )
+            })
             .collect();
         let snap = json!({
             "way": way,
@@ -233,7 +273,11 @@ pub fn host(
             }
         }
     }
-    write_atomic(&stp, &serde_json::to_string_pretty(&settings).map_err(|e| (500, "E_IO".into(), e.to_string()))?)?;
+    write_atomic(
+        &stp,
+        &serde_json::to_string_pretty(&settings)
+            .map_err(|e| (500, "E_IO".into(), e.to_string()))?,
+    )?;
 
     crate::providers::set_active(providers_path, &provider.id);
     Ok(json!({
@@ -291,10 +335,20 @@ pub fn unhost(gem_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
     // settings:selectedType 恢复快照(null=删键;无快照且当前是 gemini-api-key → oauth-personal 兜底)
     if stp.exists() {
         if let Some(mut settings) = read_settings(gem_home)? {
-            let prev = snap.pointer("/prev_selected_type").cloned().unwrap_or(Value::Null);
+            let prev = snap
+                .pointer("/prev_selected_type")
+                .cloned()
+                .unwrap_or(Value::Null);
             let restore = if prev.is_null() {
-                let cur = settings.pointer("/security/auth/selectedType").and_then(|v| v.as_str()).unwrap_or("");
-                if cur == "gemini-api-key" { json!("oauth-personal") } else { Value::Null }
+                let cur = settings
+                    .pointer("/security/auth/selectedType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if cur == "gemini-api-key" {
+                    json!("oauth-personal")
+                } else {
+                    Value::Null
+                }
             } else {
                 prev
             };
@@ -309,7 +363,11 @@ pub fn unhost(gem_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
                     }
                 }
             }
-            write_atomic(&stp, &serde_json::to_string_pretty(&settings).map_err(|e| (500, "E_IO".into(), e.to_string()))?)?;
+            write_atomic(
+                &stp,
+                &serde_json::to_string_pretty(&settings)
+                    .map_err(|e| (500, "E_IO".into(), e.to_string()))?,
+            )?;
         }
     }
 
@@ -322,10 +380,11 @@ pub fn unhost(gem_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
 pub fn state(gem_home: &Path) -> Value {
     let raw = read_env(gem_home).unwrap_or_default();
     let hosted = env_get(&raw, "GOOGLE_GEMINI_BASE_URL").is_some();
-    let auth_type = read_settings(gem_home)
-        .ok()
-        .flatten()
-        .and_then(|s| s.pointer("/security/auth/selectedType").and_then(|v| v.as_str()).map(String::from));
+    let auth_type = read_settings(gem_home).ok().flatten().and_then(|s| {
+        s.pointer("/security/auth/selectedType")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
     let way = std::fs::read_to_string(sidecar_path(gem_home))
         .ok()
         .and_then(|r| serde_json::from_str::<Value>(&r).ok())
@@ -346,7 +405,11 @@ pub fn state(gem_home: &Path) -> Value {
 
 /// PATH 及常见安装位找 gemini CLI(只做 UI 提示)。
 fn which_gemini() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "gemini.exe" } else { "gemini" };
+    let name = if cfg!(windows) {
+        "gemini.exe"
+    } else {
+        "gemini"
+    };
     for dir in std::env::var("PATH").unwrap_or_default().split(':') {
         if dir.is_empty() {
             continue;
@@ -357,15 +420,27 @@ fn which_gemini() -> Option<PathBuf> {
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    [format!("{home}/.local/bin/{name}"), format!("/usr/local/bin/{name}"), format!("/opt/homebrew/bin/{name}")]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    [
+        format!("{home}/.local/bin/{name}"),
+        format!("/usr/local/bin/{name}"),
+        format!("/opt/homebrew/bin/{name}"),
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
 }
 
 /// POST /api/desktop/gemini/start —— 注入式启动命令(可复制;direct 方式 Key 出现在命令中,提示保管)。
-pub fn start(providers_path: &Path, way: &str, provider_id: &str, gem_home: &Path) -> Result<Value, OpError> {
-    let hosted = state(gem_home).get("hosted").and_then(|v| v.as_bool()).unwrap_or(false);
+pub fn start(
+    providers_path: &Path,
+    way: &str,
+    provider_id: &str,
+    gem_home: &Path,
+) -> Result<Value, OpError> {
+    let hosted = state(gem_home)
+        .get("hosted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !hosted {
         return Err((409, "E_NOT_HOSTED".into(), "请先托管,再启动".into()));
     }
@@ -375,13 +450,23 @@ pub fn start(providers_path: &Path, way: &str, provider_id: &str, gem_home: &Pat
             .iter()
             .find(|p| p.id == provider_id)
             .cloned()
-            .ok_or((404u16, "E_NO_PROVIDER".to_string(), "供应商不存在".to_string()))?
+            .ok_or((
+                404u16,
+                "E_NO_PROVIDER".to_string(),
+                "供应商不存在".to_string(),
+            ))?
     } else {
-        crate::providers::get_provider_for_agent(providers_path, "gemini")
-            .ok_or((503u16, "E_NO_GEMINI_PROVIDER".to_string(), "请先选择 Gemini 供应商".to_string()))?
+        crate::providers::get_provider_for_agent(providers_path, "gemini").ok_or((
+            503u16,
+            "E_NO_GEMINI_PROVIDER".to_string(),
+            "请先选择 Gemini 供应商".to_string(),
+        ))?
     };
     let (base, key) = if way == "direct" {
-        (p.base_url.trim_end_matches('/').to_string(), p.api_key.clone())
+        (
+            p.base_url.trim_end_matches('/').to_string(),
+            p.api_key.clone(),
+        )
     } else {
         (GATEWAY_BASE.to_string(), PLACEHOLDER_KEY.to_string())
     };
@@ -441,28 +526,54 @@ mod tests {
         let pp = write_provider_file(&home, "chat_completions");
         fs::create_dir_all(gemini_dir(&home)).unwrap();
         // 用户已有 .env:注释 + 无关键;settings 有用户字段
-        fs::write(env_path(&home), "# 用户注释\nGOOGLE_CLOUD_PROJECT=my-proj\nGEMINI_API_KEY=user-own-key\n").unwrap();
-        fs::write(settings_path(&home), r#"{"theme":"dark","security":{"auth":{"oauthPrev":"x"}}}"#).unwrap();
+        fs::write(
+            env_path(&home),
+            "# 用户注释\nGOOGLE_CLOUD_PROJECT=my-proj\nGEMINI_API_KEY=user-own-key\n",
+        )
+        .unwrap();
+        fs::write(
+            settings_path(&home),
+            r#"{"theme":"dark","security":{"auth":{"oauthPrev":"x"}}}"#,
+        )
+        .unwrap();
 
         let v = host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         assert_eq!(v["hosted"], json!(true));
 
         let env = fs::read_to_string(env_path(&home)).unwrap();
         assert!(env.contains("# 用户注释"), "注释保留:\n{env}");
-        assert!(env.contains("GOOGLE_CLOUD_PROJECT=my-proj"), "无关键保留:\n{env}");
-        assert_eq!(env_get(&env, "GOOGLE_GEMINI_BASE_URL").unwrap(), GATEWAY_BASE);
-        assert_eq!(env_get(&env, "GEMINI_API_KEY").unwrap(), PLACEHOLDER_KEY, "用户原 key 被受控覆盖(网关占位)");
+        assert!(
+            env.contains("GOOGLE_CLOUD_PROJECT=my-proj"),
+            "无关键保留:\n{env}"
+        );
+        assert_eq!(
+            env_get(&env, "GOOGLE_GEMINI_BASE_URL").unwrap(),
+            GATEWAY_BASE
+        );
+        assert_eq!(
+            env_get(&env, "GEMINI_API_KEY").unwrap(),
+            PLACEHOLDER_KEY,
+            "用户原 key 被受控覆盖(网关占位)"
+        );
         assert_eq!(env_get(&env, "GEMINI_MODEL").unwrap(), "gemini-2.5-flash");
 
-        let st: Value = serde_json::from_str(&fs::read_to_string(settings_path(&home)).unwrap()).unwrap();
+        let st: Value =
+            serde_json::from_str(&fs::read_to_string(settings_path(&home)).unwrap()).unwrap();
         assert_eq!(st["security"]["auth"]["selectedType"], "gemini-api-key");
         assert_eq!(st["theme"], "dark", "用户字段保留");
-        assert_eq!(st["security"]["auth"]["oauthPrev"], "x", "auth 其他字段保留");
+        assert_eq!(
+            st["security"]["auth"]["oauthPrev"], "x",
+            "auth 其他字段保留"
+        );
 
         // 幂等:同参再 host,sidecar 保留最初快照(原 GEMINI_API_KEY=user-own-key)
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
-        let snap: Value = serde_json::from_str(&fs::read_to_string(sidecar_path(&home)).unwrap()).unwrap();
-        assert_eq!(snap["prev_env"]["GEMINI_API_KEY"], "user-own-key", "重复 host 不得覆盖最初快照");
+        let snap: Value =
+            serde_json::from_str(&fs::read_to_string(sidecar_path(&home)).unwrap()).unwrap();
+        assert_eq!(
+            snap["prev_env"]["GEMINI_API_KEY"], "user-own-key",
+            "重复 host 不得覆盖最初快照"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -478,7 +589,10 @@ mod tests {
         let v = host(&home, &home.join("bk"), &pp_gem, "pv1", "direct").unwrap();
         assert_eq!(v["hosted"], json!(true));
         let env = fs::read_to_string(env_path(&home)).unwrap();
-        assert_eq!(env_get(&env, "GOOGLE_GEMINI_BASE_URL").unwrap(), "https://example.com");
+        assert_eq!(
+            env_get(&env, "GOOGLE_GEMINI_BASE_URL").unwrap(),
+            "https://example.com"
+        );
         assert_eq!(env_get(&env, "GEMINI_API_KEY").unwrap(), "sk-test-key");
         let _ = fs::remove_dir_all(&home);
     }
@@ -490,7 +604,11 @@ mod tests {
         let pp = write_provider_file(&home, "chat_completions");
         fs::create_dir_all(gemini_dir(&home)).unwrap();
         fs::write(env_path(&home), "GEMINI_API_KEY=user-own-key\n").unwrap();
-        fs::write(settings_path(&home), r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#).unwrap();
+        fs::write(
+            settings_path(&home),
+            r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+        )
+        .unwrap();
 
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         let v = unhost(&home, &home.join("bk")).unwrap();
@@ -498,11 +616,22 @@ mod tests {
         assert_eq!(v["restored"], json!(true));
 
         let env = fs::read_to_string(env_path(&home)).unwrap();
-        assert_eq!(env_get(&env, "GEMINI_API_KEY").unwrap(), "user-own-key", "用户原值恢复");
-        assert!(env_get(&env, "GOOGLE_GEMINI_BASE_URL").is_none(), "原本无此键 → 删净");
+        assert_eq!(
+            env_get(&env, "GEMINI_API_KEY").unwrap(),
+            "user-own-key",
+            "用户原值恢复"
+        );
+        assert!(
+            env_get(&env, "GOOGLE_GEMINI_BASE_URL").is_none(),
+            "原本无此键 → 删净"
+        );
         assert!(env_get(&env, "GEMINI_MODEL").is_none());
-        let st: Value = serde_json::from_str(&fs::read_to_string(settings_path(&home)).unwrap()).unwrap();
-        assert_eq!(st["security"]["auth"]["selectedType"], "oauth-personal", "selectedType 恢复快照值");
+        let st: Value =
+            serde_json::from_str(&fs::read_to_string(settings_path(&home)).unwrap()).unwrap();
+        assert_eq!(
+            st["security"]["auth"]["selectedType"], "oauth-personal",
+            "selectedType 恢复快照值"
+        );
         assert!(!sidecar_path(&home).exists(), "sidecar 应删除");
 
         // 二次 unhost no-op(不报错)
@@ -522,7 +651,8 @@ mod tests {
         unhost(&home, &home.join("bk")).unwrap();
         let env = fs::read_to_string(env_path(&home)).unwrap();
         assert!(env_get(&env, "GOOGLE_GEMINI_BASE_URL").is_none());
-        let st: Value = serde_json::from_str(&fs::read_to_string(settings_path(&home)).unwrap()).unwrap();
+        let st: Value =
+            serde_json::from_str(&fs::read_to_string(settings_path(&home)).unwrap()).unwrap();
         assert_eq!(st["security"]["auth"]["selectedType"], "oauth-personal");
         let _ = fs::remove_dir_all(&home);
     }
@@ -539,7 +669,10 @@ mod tests {
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         let s1 = state(&home);
         assert_eq!(s1["hosted"], json!(true));
-        assert_eq!(s1["hosting"]["way"], "gateway", "通用世界前端读 hosting 判定托管态");
+        assert_eq!(
+            s1["hosting"]["way"], "gateway",
+            "通用世界前端读 hosting 判定托管态"
+        );
         assert_eq!(s1["hosting"]["authType"], "gemini-api-key");
         assert_eq!(s1["authType"], "gemini-api-key");
         assert_eq!(s1["model"], "gemini-2.5-flash");
@@ -557,8 +690,14 @@ mod tests {
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         let v = start(&pp, "gateway", "pv1", &home).unwrap();
         let cmd = v["command"].as_str().unwrap();
-        assert!(cmd.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787"), "命令:\n{cmd}");
-        assert!(cmd.contains(PLACEHOLDER_KEY), "网关方式命令用占位 Key:\n{cmd}");
+        assert!(
+            cmd.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787"),
+            "命令:\n{cmd}"
+        );
+        assert!(
+            cmd.contains(PLACEHOLDER_KEY),
+            "网关方式命令用占位 Key:\n{cmd}"
+        );
         assert!(cmd.ends_with("gemini"));
         let _ = fs::remove_dir_all(&home);
     }

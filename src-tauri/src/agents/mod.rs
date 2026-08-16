@@ -123,6 +123,7 @@ static REGISTRY: &[AgentMeta] = &[
     },
 ];
 
+/// 平台注册表迭代(registry_json 与测试共用同源)。
 pub fn registry() -> impl Iterator<Item = &'static AgentMeta> {
     REGISTRY.iter()
 }
@@ -133,20 +134,10 @@ pub fn find(id: &str) -> Option<&'static AgentMeta> {
     REGISTRY.iter().find(|m| m.id == norm)
 }
 
-/// 已实现平台白名单(providers.rs normalize_agent 的事实源;A 阶段恒为 codex/claude)。
-pub fn supported_ids() -> Vec<&'static str> {
-    REGISTRY
-        .iter()
-        .filter(|m| m.available)
-        .map(|m| m.id)
-        .collect()
-}
-
 /// GET /api/desktop/agents 响应体。
 pub fn registry_json() -> Value {
     json!({
-        "agents": REGISTRY
-            .iter()
+        "agents": registry()
             .map(|m| {
                 json!({
                     "id": m.id,
@@ -178,23 +169,55 @@ mod tests {
         assert!(!all.contains(&"pi"), "pi 已裁撤,不得出现在注册表");
     }
 
+    /// 可用平台白名单(available=true 的 id;仅测试断言使用)。
+    fn supported_ids() -> Vec<&'static str> {
+        REGISTRY
+            .iter()
+            .filter(|m| m.available)
+            .map(|m| m.id)
+            .collect()
+    }
+
     /// 白名单(available 语义=后端已并入;gemini/workbuddy 后端在 main 而前端未交付→available=true
     /// +frontend_ready=false,其前端批次交付时翻 frontend_ready,本断言不动)。顺序 = REGISTRY 声明序。
     #[test]
     fn supported_ids_are_backend_merged() {
         assert_eq!(
             supported_ids(),
-            vec!["codex", "claude", "gemini", "grokbuild", "opencode", "openclaw", "hermes", "claude-desktop", "workbuddy"]
+            vec![
+                "codex",
+                "claude",
+                "gemini",
+                "grokbuild",
+                "opencode",
+                "openclaw",
+                "hermes",
+                "claude-desktop",
+                "workbuddy"
+            ]
         );
     }
 
     /// 前端世界满编:九平台全部可点亮(「全部做好」批次交付后)。
     #[test]
     fn frontend_ready_platforms() {
-        let ready: Vec<&str> = registry().filter(|m| m.frontend_ready).map(|m| m.id).collect();
+        let ready: Vec<&str> = registry()
+            .filter(|m| m.frontend_ready)
+            .map(|m| m.id)
+            .collect();
         assert_eq!(
             ready,
-            vec!["codex", "claude", "gemini", "grokbuild", "opencode", "openclaw", "hermes", "claude-desktop", "workbuddy"]
+            vec![
+                "codex",
+                "claude",
+                "gemini",
+                "grokbuild",
+                "opencode",
+                "openclaw",
+                "hermes",
+                "claude-desktop",
+                "workbuddy"
+            ]
         );
     }
 

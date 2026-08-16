@@ -6,29 +6,62 @@ fn known_context(name: &str) -> Option<u64> {
     let n = name.to_ascii_lowercase();
     let has = |sub: &str| n.contains(sub);
     // OpenAI
-    if has("gpt-4o") || has("gpt-4-turbo") || has("gpt-4-1106") || has("gpt-4-0125") || has("gpt-4-vision") {
+    if has("gpt-4o")
+        || has("gpt-4-turbo")
+        || has("gpt-4-1106")
+        || has("gpt-4-0125")
+        || has("gpt-4-vision")
+    {
         return Some(128_000);
     }
-    if has("o1-mini") || has("o3-mini") { return Some(128_000); }
-    if has("o1") || has("o3") { return Some(200_000); }
-    if has("gpt-4") { return Some(8_192); }
-    if has("gpt-3.5") { return Some(16_385); }
+    if has("o1-mini") || has("o3-mini") {
+        return Some(128_000);
+    }
+    if has("o1") || has("o3") {
+        return Some(200_000);
+    }
+    if has("gpt-4") {
+        return Some(8_192);
+    }
+    if has("gpt-3.5") {
+        return Some(16_385);
+    }
     // Anthropic
-    if has("claude") { return Some(200_000); }
+    if has("claude") {
+        return Some(200_000);
+    }
     // DeepSeek（含中转的自定义名如 deepseek-v4-flash）
-    if has("deepseek") { return Some(64_000); }
+    if has("deepseek") {
+        return Some(64_000);
+    }
     // Google
-    if has("gemini-1.5") { return Some(1_000_000); }
-    if has("gemini-2") { return Some(2_000_000); }
-    if has("gemini") { return Some(32_000); }
+    if has("gemini-1.5") {
+        return Some(1_000_000);
+    }
+    if has("gemini-2") {
+        return Some(2_000_000);
+    }
+    if has("gemini") {
+        return Some(32_000);
+    }
     // MiniMax
-    if has("minimax") { return Some(1_000_000); }
+    if has("minimax") {
+        return Some(1_000_000);
+    }
     // 通义
-    if has("qwen") || has("qwq") { return Some(128_000); }
+    if has("qwen") || has("qwq") {
+        return Some(128_000);
+    }
     // 智谱 / 月之暗面 / xAI
-    if has("glm") { return Some(128_000); }
-    if has("kimi") { return Some(256_000); }
-    if has("grok") { return Some(131_072); }
+    if has("glm") {
+        return Some(128_000);
+    }
+    if has("kimi") {
+        return Some(256_000);
+    }
+    if has("grok") {
+        return Some(131_072);
+    }
     None
 }
 
@@ -123,8 +156,17 @@ pub async fn probe_reasoning_levels(base_url: &str, api_key: &str, model: &str) 
         for suffix in ["/responses", "/v1/responses"] {
             let url = format!("{base}{suffix}");
             let body = serde_json::json!({"model": model, "input": "1", "stream": false, "reasoning": {"effort": effort}, "max_output_tokens": 1});
-            match client.post(&url).header("Authorization", format!("Bearer {api_key}")).json(&body).send().await {
-                Ok(r) if r.status().is_success() => { supported.push(effort.to_string()); break; }
+            match client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    supported.push(effort.to_string());
+                    break;
+                }
                 _ => {}
             }
         }
@@ -138,17 +180,21 @@ mod tests {
 
     /// 启动一个内存 mock 上游，返回 base_url。同时响应 /models 与 /v1/models。
     async fn spawn_mock() -> String {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
-                    if sock.read(&mut buf).await.is_err() { return; }
+                    if sock.read(&mut buf).await.is_err() {
+                        return;
+                    }
                     let body = r#"{"object":"list","data":[
                         {"id":"gpt-4o","object":"model","owned_by":"openai","context_length":128000},
                         {"id":"deepseek-chat","object":"model","owned_by":"deepseek","context_window":64000},
@@ -181,7 +227,11 @@ mod tests {
         let base = spawn_mock().await;
         // base 自带 /v1（opencode 场景）：probe 应先试 {base}/models 成功，不再拼 /v1/v1/models
         let r = probe_endpoint(&format!("{base}/v1"), "sk-tmp").await;
-        assert_eq!(r.len(), 3, "base with /v1 should still find models, got {r:?}");
+        assert_eq!(
+            r.len(),
+            3,
+            "base with /v1 should still find models, got {r:?}"
+        );
     }
 
     #[tokio::test]
@@ -195,37 +245,66 @@ mod tests {
     /// 路由感知 mock:/models→JSON;/responses→SSE;/chat/completions→JSON;其余 404。
     /// mode 控制形态,覆盖 preflight 的四类结果。
     async fn spawn_mock_router(mode: &'static str) -> String {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = [0u8; 8192];
-                    let n = match sock.read(&mut buf).await { Ok(n) => n, Err(_) => return };
+                    let n = match sock.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
                     let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let path = req.lines().next().unwrap_or_default().split(' ').nth(1).unwrap_or("").to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
 
-                    let auth_ok = req.lines().any(|l| l.to_ascii_lowercase().starts_with("authorization: bearer good"));
+                    let auth_ok = req.lines().any(|l| {
+                        l.to_ascii_lowercase()
+                            .starts_with("authorization: bearer good")
+                    });
                     let (status, ctype, body) = if !auth_ok {
-                        ("401 Unauthorized", "application/json", r#"{"error":"bad key"}"#.to_string())
+                        (
+                            "401 Unauthorized",
+                            "application/json",
+                            r#"{"error":"bad key"}"#.to_string(),
+                        )
                     } else if path.ends_with("/models") {
-                        let models = r#"{"object":"list","data":[{"id":"m-x","context_window":64000}]}"#;
+                        let models =
+                            r#"{"object":"list","data":[{"id":"m-x","context_window":64000}]}"#;
                         ("200 OK", "application/json", models.to_string())
                     } else if path.ends_with("/responses") {
                         if mode == "chat_only" {
                             ("404 Not Found", "application/json", "{}".to_string())
                         } else {
-                            ("200 OK", "text/event-stream", "data: {\"type\":\"response.created\"}\n\n".to_string())
+                            (
+                                "200 OK",
+                                "text/event-stream",
+                                "data: {\"type\":\"response.created\"}\n\n".to_string(),
+                            )
                         }
                     } else if path.ends_with("/chat/completions") {
                         if mode == "responses_only" {
                             ("404 Not Found", "application/json", "{}".to_string())
                         } else {
-                            ("200 OK", "application/json", r#"{"choices":[{"message":{"role":"assistant","content":"x"}}]}"#.to_string())
+                            (
+                                "200 OK",
+                                "application/json",
+                                r#"{"choices":[{"message":{"role":"assistant","content":"x"}}]}"#
+                                    .to_string(),
+                            )
                         }
                     } else {
                         ("404 Not Found", "application/json", "{}".to_string())
@@ -291,7 +370,11 @@ mod tests {
         let base = spawn_mock_router("all").await; // 无 model → 流探测跳过 → 走 /models 状态辅助
         let r = preflight(&base, "wrong-key", "").await;
         assert!(!r.key_ok);
-        assert_eq!(r.error, Some("auth"), "无 model 时坏 key 应分类为 auth,而非 timeout");
+        assert_eq!(
+            r.error,
+            Some("auth"),
+            "无 model 时坏 key 应分类为 auth,而非 timeout"
+        );
     }
 }
 
@@ -312,11 +395,16 @@ pub async fn probe_responses_stream(base_url: &str, api_key: &str, model: &str) 
         "model": model, "input": "hi", "stream": true, "max_output_tokens": 16
     });
     for suffix in ["/responses", "/v1/responses"] {
-        if let Some(r) = try_stream_probe(&format!("{}{}", base, suffix), api_key, &body, true).await {
+        if let Some(r) =
+            try_stream_probe(&format!("{}{}", base, suffix), api_key, &body, true).await
+        {
             return r;
         }
     }
-    StreamProbe { status: None, got_sse: false }
+    StreamProbe {
+        status: None,
+        got_sse: false,
+    }
 }
 
 /// 探测 /chat/completions:非流式 POST {messages,max_tokens:1}。
@@ -326,11 +414,16 @@ pub async fn probe_chat(base_url: &str, api_key: &str, model: &str) -> StreamPro
         "model": model, "messages": [{"role":"user","content":"hi"}], "max_tokens": 1
     });
     for suffix in ["/chat/completions", "/v1/chat/completions"] {
-        if let Some(r) = try_stream_probe(&format!("{}{}", base, suffix), api_key, &body, false).await {
+        if let Some(r) =
+            try_stream_probe(&format!("{}{}", base, suffix), api_key, &body, false).await
+        {
             return r;
         }
     }
-    StreamProbe { status: None, got_sse: false }
+    StreamProbe {
+        status: None,
+        got_sse: false,
+    }
 }
 
 /// 仅探测 /models 的 HTTP 状态(用于 model 为空时区分 timeout/auth/notfound;
@@ -339,17 +432,32 @@ async fn probe_models_http_status(base_url: &str, api_key: &str) -> (Option<u16>
     let base = base_url.trim_end_matches('/');
     let mut s1 = None;
     let mut s2 = None;
-    if let Ok(r) = client().get(format!("{base}/models")).header("Authorization", format!("Bearer {api_key}")).send().await {
+    if let Ok(r) = client()
+        .get(format!("{base}/models"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+    {
         s1 = Some(r.status().as_u16());
     }
-    if let Ok(r) = client().get(format!("{base}/v1/models")).header("Authorization", format!("Bearer {api_key}")).send().await {
+    if let Ok(r) = client()
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+    {
         s2 = Some(r.status().as_u16());
     }
     (s1, s2)
 }
 
 /// 单次探测:返回 Some(结果) 表示拿到了 HTTP 响应(不再换后缀);None = 连接失败(换下一后缀)。
-async fn try_stream_probe(url: &str, api_key: &str, body: &serde_json::Value, want_sse: bool) -> Option<StreamProbe> {
+async fn try_stream_probe(
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    want_sse: bool,
+) -> Option<StreamProbe> {
     let resp = client()
         .post(url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -360,7 +468,6 @@ async fn try_stream_probe(url: &str, api_key: &str, body: &serde_json::Value, wa
     let status = resp.status().as_u16();
     if want_sse && status == 200 {
         // 逐块读 body,出现首个 "data:" 行即兼容(上限 8KB / 读满即止,不等待流结束)
-        use futures_util::StreamExt;
         let mut resp = resp;
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
         while let Some(chunk) = resp.chunk().await.ok()? {
@@ -370,9 +477,15 @@ async fn try_stream_probe(url: &str, api_key: &str, body: &serde_json::Value, wa
             }
         }
         let got_sse = buf.windows(5).any(|w| w == b"data:");
-        return Some(StreamProbe { status: Some(status), got_sse });
+        return Some(StreamProbe {
+            status: Some(status),
+            got_sse,
+        });
     }
-    Some(StreamProbe { status: Some(status), got_sse: false })
+    Some(StreamProbe {
+        status: Some(status),
+        got_sse: false,
+    })
 }
 
 /// preflight 组装结果。
@@ -383,7 +496,7 @@ pub struct PreflightResult {
     pub responses_compat: bool,
     pub chat_ok: bool,
     pub latency_ms: u64,
-    pub suggest: String, // "gateway" | ""
+    pub suggest: String,             // "gateway" | ""
     pub error: Option<&'static str>, // "timeout" | "auth" | "notfound"
 }
 
@@ -401,7 +514,16 @@ pub async fn preflight(base_url: &str, api_key: &str, model_hint: &str) -> Prefl
 
     let (resp_probe, chat_probe) = if model.is_empty() {
         // 连模型名都没有:流探测无从发起
-        (StreamProbe { status: None, got_sse: false }, StreamProbe { status: None, got_sse: false })
+        (
+            StreamProbe {
+                status: None,
+                got_sse: false,
+            },
+            StreamProbe {
+                status: None,
+                got_sse: false,
+            },
+        )
     } else {
         futures_util::join!(
             probe_responses_stream(base_url, api_key, &model),
@@ -416,15 +538,18 @@ pub async fn preflight(base_url: &str, api_key: &str, model_hint: &str) -> Prefl
     // 错误分类(优先级:连不上 > 认证 > 地址/协议)。
     // 注意:model 为空时流探测全部跳过(status=None),此时须依据 /models 的 HTTP 状态
     // 辅助分类(实测:DeepSeek 坏 key 时 /models 返回 401,先前误报 timeout——真机暴露修复)。
-    let (probe1, probe2) = if resp_probe.status.is_none() && chat_probe.status.is_none() && !key_ok {
+    let (probe1, probe2) = if resp_probe.status.is_none() && chat_probe.status.is_none() && !key_ok
+    {
         probe_models_http_status(base_url, api_key).await
     } else {
         (resp_probe.status, chat_probe.status)
     };
     let error = if probe1.is_none() && probe2.is_none() && !key_ok {
         Some("timeout")
-    } else if probe1 == Some(401) || probe2 == Some(401)
-        || probe1 == Some(403) || probe2 == Some(403)
+    } else if probe1 == Some(401)
+        || probe2 == Some(401)
+        || probe1 == Some(403)
+        || probe2 == Some(403)
     {
         Some("auth")
     } else if !key_ok && !responses_compat && !chat_ok {
@@ -433,7 +558,11 @@ pub async fn preflight(base_url: &str, api_key: &str, model_hint: &str) -> Prefl
         None
     };
 
-    let suggest = if responses_compat || chat_ok { "gateway".to_string() } else { String::new() };
+    let suggest = if responses_compat || chat_ok {
+        "gateway".to_string()
+    } else {
+        String::new()
+    };
 
     PreflightResult {
         key_ok,

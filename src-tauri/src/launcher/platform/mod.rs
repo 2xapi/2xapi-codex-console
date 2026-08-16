@@ -1,9 +1,9 @@
 //! 平台启动器:统一 launch 入口、codex 路径解析、共享工具(方案 v2 §5)。
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 

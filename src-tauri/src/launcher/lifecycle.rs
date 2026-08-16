@@ -88,7 +88,11 @@ pub(crate) enum SweepAction {
 /// - has_marker:目录是否带本工具标记(不带 = 非本工具目录,绝不碰)
 /// - pid_alive:Some(存活/已死);None = pid 文件不存在(尚未启动或启动失败)
 /// - age_secs:目录年龄
-pub(crate) fn sweep_action(has_marker: bool, pid_alive: Option<bool>, age_secs: i64) -> SweepAction {
+pub(crate) fn sweep_action(
+    has_marker: bool,
+    pid_alive: Option<bool>,
+    age_secs: i64,
+) -> SweepAction {
     if !has_marker {
         return SweepAction::Keep;
     }
@@ -96,10 +100,10 @@ pub(crate) fn sweep_action(has_marker: bool, pid_alive: Option<bool>, age_secs: 
         return SweepAction::Delete; // 超期一律回收
     }
     match pid_alive {
-        Some(true) => SweepAction::Keep,    // codex 还在跑(app 重启后发现的活跃会话)
+        Some(true) => SweepAction::Keep, // codex 还在跑(app 重启后发现的活跃会话)
         Some(false) => SweepAction::Delete, // 进程已死 → 残留
         None if age_secs > 300 => SweepAction::Delete, // 无 pid 且非新建 → 启动失败残留
-        None => SweepAction::Keep,          // 刚创建,pid 未就绪
+        None => SweepAction::Keep,       // 刚创建,pid 未就绪
     }
 }
 
@@ -107,7 +111,9 @@ pub(crate) fn sweep_action(has_marker: bool, pid_alive: Option<bool>, age_secs: 
 /// 只删带 launcher.json 标记(launcher=="2xapi")的目录,防误删他人文件。
 pub fn sweep_orphans() {
     let root = std::env::temp_dir();
-    let Ok(entries) = std::fs::read_dir(&root) else { return };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
     let now = chrono::Utc::now().timestamp();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -132,11 +138,14 @@ pub fn sweep_orphans() {
             .and_then(|m| m.get("created_at"))
             .and_then(|v| v.as_i64())
             .or_else(|| {
-                e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs() as i64)
-                })
+                e.metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs() as i64)
+                    })
             })
             .unwrap_or(0);
         let pid_alive = std::fs::read_to_string(dir.join("codex.pid"))
@@ -165,7 +174,10 @@ mod tests {
         // 进程已死 → 删
         assert_eq!(sweep_action(true, Some(false), 60), SweepAction::Delete);
         // 超过 48h → 删(即使 pid 显示存活,大概率 pid 复用)
-        assert_eq!(sweep_action(true, Some(true), 48 * 3600 + 1), SweepAction::Delete);
+        assert_eq!(
+            sweep_action(true, Some(true), 48 * 3600 + 1),
+            SweepAction::Delete
+        );
         // 无 pid 且非新建(>300s)→ 删(启动失败残留)
         assert_eq!(sweep_action(true, None, 301), SweepAction::Delete);
     }

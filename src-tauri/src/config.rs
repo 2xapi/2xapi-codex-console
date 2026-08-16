@@ -126,7 +126,10 @@ pub fn build_config_value(current: &Value, provider: &Provider, catalog_path: &s
             }
             obj.remove("model_catalog_json");
             // 删除 [model_providers.custom]，保留其他 provider 条目
-            if let Some(mp) = obj.get_mut("model_providers").and_then(|v| v.as_object_mut()) {
+            if let Some(mp) = obj
+                .get_mut("model_providers")
+                .and_then(|v| v.as_object_mut())
+            {
                 mp.remove("custom");
             }
         }
@@ -230,7 +233,10 @@ pub fn apply_provider(
 
     // model catalog 文件（Mixed/PureApi 且有模型才写；Official 删除）
     if provider.access_mode != AccessMode::Official && !provider.models.is_empty() {
-        let catalog = build_model_catalog(&provider.models, provider.reasoning_levels.as_deref().unwrap_or(&[]));
+        let catalog = build_model_catalog(
+            &provider.models,
+            provider.reasoning_levels.as_deref().unwrap_or(&[]),
+        );
         let raw = serde_json::to_string_pretty(&catalog).unwrap_or_default();
         std::fs::write(&catalog_path, format!("{raw}\n")).map_err(|e| e.to_string())?;
     } else if provider.access_mode == AccessMode::Official {
@@ -253,7 +259,10 @@ pub fn apply_provider(
             // 设 OPENAI_API_KEY（幂等）
             let mut existing = read_auth_json(&auth_p);
             let key = provider.api_key.clone();
-            let changed = existing.get("OPENAI_API_KEY").and_then(|v| v.as_str()).map(|s| s.to_string())
+            let changed = existing
+                .get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
                 != Some(key.clone());
             if changed {
                 if let Some(o) = existing.as_object_mut() {
@@ -282,18 +291,25 @@ pub fn apply_provider(
 
 // ── preview（FR-3.3/8.2：与 apply 结果一致）──────────────────
 
-pub fn preview_provider(config_path: &Path, codex_home: &Path, provider: &Provider) -> Result<PreviewOutcome, String> {
+pub fn preview_provider(
+    config_path: &Path,
+    codex_home: &Path,
+    provider: &Provider,
+) -> Result<PreviewOutcome, String> {
     let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
     let current_cfg = read_toml(config_path);
     let merged = build_config_value(&current_cfg, provider, &catalog_path.to_string_lossy());
     let new_toml = config_to_toml_string(&merged)?;
 
     let (auth_action, auth_diff) = match provider.access_mode {
-        AccessMode::PureApi => ("set_key".to_string(), Some(vec!["OPENAI_API_KEY".to_string()])),
+        AccessMode::PureApi => (
+            "set_key".to_string(),
+            Some(vec!["OPENAI_API_KEY".to_string()]),
+        ),
         _ => ("noop".to_string(), None),
     };
-    let backup_will_create = provider.access_mode == AccessMode::PureApi
-        && !codex_home.join(AUTH_OFFICIAL_BAK).exists();
+    let backup_will_create =
+        provider.access_mode == AccessMode::PureApi && !codex_home.join(AUTH_OFFICIAL_BAK).exists();
 
     Ok(PreviewOutcome {
         config_toml: new_toml,
@@ -366,7 +382,12 @@ pub fn activate_official(
     let merged = build_config_value(&current_cfg, &official, "");
     let new_toml = config_to_toml_string(&merged)?;
     let config_written = if new_toml != current_toml {
-        let _ = backup_file(config_path, backup_dir, "config-apply", "pre-activate-official");
+        let _ = backup_file(
+            config_path,
+            backup_dir,
+            "config-apply",
+            "pre-activate-official",
+        );
         write_toml(config_path, &merged)?;
         true
     } else {
@@ -390,21 +411,29 @@ pub fn activate_official(
 pub(crate) fn build_model_catalog(models: &[ModelConfig], reasoning_levels: &[String]) -> Value {
     // 若上游探测到 levels 用它；否则用默认 5 级
     let levels: Vec<String> = if reasoning_levels.is_empty() {
-        vec!["low","medium","high","xhigh","max"].iter().map(|s|s.to_string()).collect()
-    } else { reasoning_levels.to_vec() };
+        ["low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        reasoning_levels.to_vec()
+    };
     let default_level = levels.first().cloned().unwrap_or_else(|| "medium".into());
-    let rl_json: Vec<Value> = levels.iter().map(|e| {
-        let desc = match e.as_str() {
-            "low" => "Fast responses with lighter reasoning",
-            "medium" => "Balances speed and reasoning depth for everyday tasks",
-            "high" => "Greater reasoning depth for complex problems",
-            "xhigh" => "Extra high reasoning depth for complex problems",
-            "max" => "Maximum reasoning depth for the hardest problems",
-            "ultra" => "Maximum reasoning with automatic task delegation",
-            _ => "Custom",
-        };
-        json!({"effort": e, "description": desc})
-    }).collect();
+    let rl_json: Vec<Value> = levels
+        .iter()
+        .map(|e| {
+            let desc = match e.as_str() {
+                "low" => "Fast responses with lighter reasoning",
+                "medium" => "Balances speed and reasoning depth for everyday tasks",
+                "high" => "Greater reasoning depth for complex problems",
+                "xhigh" => "Extra high reasoning depth for complex problems",
+                "max" => "Maximum reasoning depth for the hardest problems",
+                "ultra" => "Maximum reasoning with automatic task delegation",
+                _ => "Custom",
+            };
+            json!({"effort": e, "description": desc})
+        })
+        .collect();
     let arr: Vec<Value> = models
         .iter()
         .enumerate()
@@ -447,7 +476,12 @@ pub(crate) fn build_model_catalog(models: &[ModelConfig], reasoning_levels: &[St
 // ── 备份 / 快照 / 恢复（/api/backups、/api/config/* 用）──────
 
 /// 备份一个文件到 backup_dir（带 sha256 manifest）。
-pub fn backup_file(src: &Path, backup_dir: &Path, prefix: &str, purpose: &str) -> Result<(), String> {
+pub fn backup_file(
+    src: &Path,
+    backup_dir: &Path,
+    prefix: &str,
+    purpose: &str,
+) -> Result<(), String> {
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let backup_name = format!("{prefix}-{timestamp}.toml");
     let backup_path = backup_dir.join(&backup_name);
@@ -468,7 +502,11 @@ pub fn backup_file(src: &Path, backup_dir: &Path, prefix: &str, purpose: &str) -
                 "sha256": hash,
             });
             let manifest_path = format!("{}.manifest.json", backup_path.display());
-            std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default()).ok();
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            )
+            .ok();
         }
         Err(_) => {
             std::fs::write(&backup_path, "# original config.toml did not exist\n").ok();
@@ -488,7 +526,10 @@ pub fn restore(config_path: &Path, backup_path: &str) -> Result<(), String> {
 pub fn create_snapshot(config_path: &Path, backup_dir: &Path) -> Result<Value, String> {
     backup_file(config_path, backup_dir, "config-snapshot", "manual")?;
     let entries = crate::backups::list(backup_dir);
-    Ok(entries.first().cloned().unwrap_or(json!({ "created": true })))
+    Ok(entries
+        .first()
+        .cloned()
+        .unwrap_or(json!({ "created": true })))
 }
 
 // ── 单测（M2 Gate）────────────────────────────────────────────
@@ -503,7 +544,8 @@ mod tests {
     /// 临时 sandbox：返回 (root, config_path, backup_dir, codex_home)，自动清理旧的同名。
     fn sandbox(label: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("2xapi-m2-{label}-{}-{n}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("2xapi-m2-{label}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let codex_home = root.join("codex");
         let backup_dir = root.join("backups");
@@ -526,14 +568,15 @@ mod tests {
     }
 
     fn provider_with(mode: AccessMode) -> Provider {
-        let mut p = Provider::default();
-        p.id = format!("p-{mode:?}").to_lowercase();
-        p.name = format!("{mode:?}");
-        p.base_url = "https://up.example.com".into();
-        p.api_key = "sk-secret".into();
-        p.access_mode = mode;
-        p.model = "gpt-x".into();
-        p
+        Provider {
+            id: format!("p-{mode:?}").to_lowercase(),
+            name: format!("{mode:?}"),
+            base_url: "https://up.example.com".into(),
+            api_key: "sk-secret".into(),
+            access_mode: mode,
+            model: "gpt-x".into(),
+            ..Default::default()
+        }
     }
 
     /// Official/Mixed/PureApi：config 的 custom.base_url 必须是网关而非上游（核心架构修正）。
@@ -543,8 +586,14 @@ mod tests {
         let p = provider_with(AccessMode::Mixed);
         apply_provider(&cfg, &bk, &home, &p).unwrap();
         let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(written.contains("base_url = \"http://127.0.0.1:8787\""), "base_url 必须指向网关:\n{written}");
-        assert!(!written.contains("https://up.example.com"), "config 里不应出现上游地址:\n{written}");
+        assert!(
+            written.contains("base_url = \"http://127.0.0.1:8787\""),
+            "base_url 必须指向网关:\n{written}"
+        );
+        assert!(
+            !written.contains("https://up.example.com"),
+            "config 里不应出现上游地址:\n{written}"
+        );
         let _ = std::fs::remove_dir_all(&_root);
     }
 
@@ -556,13 +605,19 @@ mod tests {
         let p = provider_with(AccessMode::Mixed);
         apply_provider(&cfg, &bk, &home, &p).unwrap();
         let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(written.contains("experimental_bearer_token"), "Mixed 应含 experimental_bearer_token:\n{written}");
+        assert!(
+            written.contains("experimental_bearer_token"),
+            "Mixed 应含 experimental_bearer_token:\n{written}"
+        );
         // PureApi 不应含
         std::fs::write(&cfg, "").ok();
         let p2 = provider_with(AccessMode::PureApi);
         apply_provider(&cfg, &bk, &home, &p2).unwrap();
         let written2 = std::fs::read_to_string(&cfg).unwrap();
-        assert!(!written2.contains("experimental_bearer_token"), "PureApi 不应含 experimental_bearer_token:\n{written2}");
+        assert!(
+            !written2.contains("experimental_bearer_token"),
+            "PureApi 不应含 experimental_bearer_token:\n{written2}"
+        );
         let _ = std::fs::remove_dir_all(&_root);
     }
 
@@ -589,7 +644,10 @@ mod tests {
         let p = provider_with(AccessMode::Mixed);
         apply_provider(&cfg, &bk, &home, &p).unwrap();
         let written = std::fs::read_to_string(&cfg).unwrap();
-        assert!(written.contains("my_custom_setting = \"keep_me\""), "用户字段丢失:\n{written}");
+        assert!(
+            written.contains("my_custom_setting = \"keep_me\""),
+            "用户字段丢失:\n{written}"
+        );
         assert!(written.contains("foo = 123"));
         let _ = std::fs::remove_dir_all(&_root);
     }
@@ -614,7 +672,11 @@ mod tests {
     fn pureapi_backup_and_idempotent_auth() {
         let (_root, cfg, bk, home) = sandbox("pureapi-bak");
         // 预置一个「官方」auth.json
-        std::fs::write(home.join("auth.json"), "{\"tokens\":{\"id_token\":\"official\"}}").unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            "{\"tokens\":{\"id_token\":\"official\"}}",
+        )
+        .unwrap();
 
         let p = pureapi_provider();
         let o1 = apply_provider(&cfg, &bk, &home, &p).unwrap();
@@ -643,17 +705,28 @@ mod tests {
         std::fs::write(home.join("auth.json"), official_auth).unwrap();
         // providers.json
         let providers_path = home.join("providers.json");
-        std::fs::write(&providers_path, "{\"schema_version\":1,\"active_provider_id\":null,\"providers\":[]}").unwrap();
+        std::fs::write(
+            &providers_path,
+            "{\"schema_version\":1,\"active_provider_id\":null,\"providers\":[]}",
+        )
+        .unwrap();
 
         // 先切 PureApi（产生 .bak，auth 被改）
         let p = pureapi_provider();
         apply_provider(&cfg, &bk, &home, &p).unwrap();
-        assert_ne!(std::fs::read_to_string(home.join("auth.json")).unwrap(), official_auth);
+        assert_ne!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            official_auth
+        );
 
         // activate-official 恢复
         let out = activate_official(&cfg, &bk, &providers_path, &home).unwrap();
         assert!(out.auth_restored, "应从 .bak 恢复");
-        assert_eq!(std::fs::read_to_string(home.join("auth.json")).unwrap(), official_auth, "恢复后应等于官方态");
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            official_auth,
+            "恢复后应等于官方态"
+        );
         let _ = std::fs::remove_dir_all(&_root);
     }
 

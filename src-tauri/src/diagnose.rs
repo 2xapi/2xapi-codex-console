@@ -82,7 +82,10 @@ fn validate_config(p: &Provider, errors: &mut Vec<DiagError>) -> bool {
     ok
 }
 
-async fn connect_test(p: &Provider, errors: &mut Vec<DiagError>) -> (bool, Option<u64>, Vec<ModelConfig>) {
+async fn connect_test(
+    p: &Provider,
+    errors: &mut Vec<DiagError>,
+) -> (bool, Option<u64>, Vec<ModelConfig>) {
     let base = p.base_url.trim_end_matches('/');
     let client = build_client(p);
     // FR-6.2：先 /models，404 再 /v1/models
@@ -100,7 +103,11 @@ async fn connect_test(p: &Provider, errors: &mut Vec<DiagError>) -> (bool, Optio
                     let models = parse_models(r).await;
                     return (true, Some(latency), models);
                 } else {
-                    errors.push(err("connect", &format!("http_{}", status.as_u16()), &format!("{path} 返回 {}", status.as_u16())));
+                    errors.push(err(
+                        "connect",
+                        &format!("http_{}", status.as_u16()),
+                        &format!("{path} 返回 {}", status.as_u16()),
+                    ));
                 }
             }
             Err(e) => {
@@ -133,10 +140,20 @@ async fn real_request(p: &Provider, errors: &mut Vec<DiagError>) -> bool {
             json!({ "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }] }),
         ),
     };
-    match client.post(&url).bearer_auth(&p.api_key).json(&body).send().await {
+    match client
+        .post(&url)
+        .bearer_auth(&p.api_key)
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => true,
         Ok(r) => {
-            errors.push(err("request", &format!("http_{}", r.status().as_u16()), &format!("真实请求返回 {}", r.status().as_u16())));
+            errors.push(err(
+                "request",
+                &format!("http_{}", r.status().as_u16()),
+                &format!("真实请求返回 {}", r.status().as_u16()),
+            ));
             false
         }
         Err(e) => {
@@ -147,7 +164,8 @@ async fn real_request(p: &Provider, errors: &mut Vec<DiagError>) -> bool {
 }
 
 fn build_client(p: &Provider) -> reqwest::Client {
-    let mut b = reqwest::Client::builder().timeout(Duration::from_secs(p.timeout_secs.unwrap_or(30)));
+    let mut b =
+        reqwest::Client::builder().timeout(Duration::from_secs(p.timeout_secs.unwrap_or(30)));
     if let Some(px) = p.proxy_url.as_deref().filter(|s| !s.is_empty()) {
         if let Ok(proxy) = reqwest::Proxy::all(px) {
             b = b.proxy(proxy);
@@ -158,15 +176,25 @@ fn build_client(p: &Provider) -> reqwest::Client {
 
 async fn parse_models(r: reqwest::Response) -> Vec<ModelConfig> {
     let v: Value = r.json().await.unwrap_or(json!({}));
-    let arr = v.get("data").or_else(|| v.get("models")).and_then(|x| x.as_array());
+    let arr = v
+        .get("data")
+        .or_else(|| v.get("models"))
+        .and_then(|x| x.as_array());
     arr.map(|a| {
         a.iter()
             .filter_map(|m| {
-                let name = m.get("id").or_else(|| m.get("name")).and_then(|x| x.as_str()).unwrap_or("");
+                let name = m
+                    .get("id")
+                    .or_else(|| m.get("name"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
                 if name.is_empty() {
                     None
                 } else {
-                    Some(ModelConfig { name: name.into(), ..Default::default() })
+                    Some(ModelConfig {
+                        name: name.into(),
+                        ..Default::default()
+                    })
                 }
             })
             .collect()
@@ -175,7 +203,11 @@ async fn parse_models(r: reqwest::Response) -> Vec<ModelConfig> {
 }
 
 fn err(step: &str, code: &str, message: &str) -> DiagError {
-    DiagError { step: step.into(), code: code.into(), message: message.into() }
+    DiagError {
+        step: step.into(),
+        code: code.into(),
+        message: message.into(),
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +219,12 @@ mod tests {
     static N: AtomicU64 = AtomicU64::new(0);
 
     fn provider_official() -> Provider {
-        Provider { name: "O".into(), access_mode: AccessMode::Official, model: "gpt".into(), ..Default::default() }
+        Provider {
+            name: "O".into(),
+            access_mode: AccessMode::Official,
+            model: "gpt".into(),
+            ..Default::default()
+        }
     }
 
     /// Official：configValid=true、无上游错误、testOk=false（无上游可测）。
@@ -209,7 +246,10 @@ mod tests {
         p.model = "m".into();
         let r = diagnose(&p).await;
         assert!(!r.configValid);
-        assert!(r.errors.iter().any(|e| e.step == "config" && e.code == "base_url"));
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| e.step == "config" && e.code == "base_url"));
         assert!(!r.reachable);
     }
 
@@ -217,8 +257,14 @@ mod tests {
     #[tokio::test]
     async fn good_provider_all_green() {
         let app = Router::new()
-            .route("/models", get(|| async { Json(json!({ "data": [{ "id": "gpt-x" }] })) }))
-            .route("/responses", axum::routing::post(|| async { (reqwest::StatusCode::OK, "ok") }));
+            .route(
+                "/models",
+                get(|| async { Json(json!({ "data": [{ "id": "gpt-x" }] })) }),
+            )
+            .route(
+                "/responses",
+                axum::routing::post(|| async { (reqwest::StatusCode::OK, "ok") }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

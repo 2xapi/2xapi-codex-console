@@ -15,22 +15,40 @@ pub struct TomlStore {
 
 impl TomlStore {
     pub fn new(config_path: &Path) -> Self {
-        Self { path: config_path.to_path_buf() }
+        Self {
+            path: config_path.to_path_buf(),
+        }
     }
 
     fn parse_root(&self) -> Result<toml::value::Table, super::OpError> {
         if !self.path.exists() {
             return Ok(toml::value::Table::new());
         }
-        let raw = std::fs::read_to_string(&self.path)
-            .map_err(|e| (500, "E_IO".to_string(), format!("读取 config.toml 失败: {e}")))?;
+        let raw = std::fs::read_to_string(&self.path).map_err(|e| {
+            (
+                500,
+                "E_IO".to_string(),
+                format!("读取 config.toml 失败: {e}"),
+            )
+        })?;
         raw.parse::<toml::Value>()
             .map_err(|_| {
-                (500, "E_PARSE".to_string(), "config.toml 不是合法 TOML,已拒绝写入(避免破坏手动配置);请先修复该文件".to_string())
+                (
+                    500,
+                    "E_PARSE".to_string(),
+                    "config.toml 不是合法 TOML,已拒绝写入(避免破坏手动配置);请先修复该文件"
+                        .to_string(),
+                )
             })?
             .as_table()
             .cloned()
-            .ok_or_else(|| (500, "E_PARSE".to_string(), "config.toml 顶层必须是表".to_string()))
+            .ok_or_else(|| {
+                (
+                    500,
+                    "E_PARSE".to_string(),
+                    "config.toml 顶层必须是表".to_string(),
+                )
+            })
     }
 
     fn render(&self, root: &toml::value::Table) -> Result<(), super::OpError> {
@@ -69,7 +87,9 @@ impl TomlStore {
                 if let Some(i) = n.as_i64() {
                     Ok(toml::Value::Integer(i))
                 } else {
-                    n.as_f64().map(toml::Value::Float).ok_or_else(|| "不支持的数字".to_string())
+                    n.as_f64()
+                        .map(toml::Value::Float)
+                        .ok_or_else(|| "不支持的数字".to_string())
                 }
             }
             Value::Array(a) => {
@@ -114,8 +134,8 @@ impl EcoStore for TomlStore {
         } else {
             let mut t = toml::value::Table::new();
             for (k, v) in servers {
-                let tv = Self::json_to_toml(v)
-                    .map_err(|e| (400, "E_ECO_BAD_SPEC".to_string(), e))?;
+                let tv =
+                    Self::json_to_toml(v).map_err(|e| (400, "E_ECO_BAD_SPEC".to_string(), e))?;
                 t.insert(k.clone(), tv);
             }
             root.insert("mcp_servers".into(), toml::Value::Table(t));
@@ -165,7 +185,10 @@ mod tests {
         assert_eq!(doc["custom"]["base_url"].as_str(), Some("http://x"));
         assert_eq!(doc["mcp_servers"]["fetch"]["command"].as_str(), Some("uvx"));
         assert_eq!(doc["mcp_servers"]["fetch"]["env"]["K"].as_str(), Some("v"));
-        assert_eq!(doc["mcp_servers"]["computer-use"]["command"].as_str(), Some("node"));
+        assert_eq!(
+            doc["mcp_servers"]["computer-use"]["command"].as_str(),
+            Some("node")
+        );
         // 读回形状
         let back = s.read().unwrap();
         assert_eq!(back["fetch"]["args"][0], "mcp-server-fetch");
@@ -179,7 +202,10 @@ mod tests {
         std::fs::write(&path, "[mcp_servers.x]\ncommand = \"c\"\n").unwrap();
         let s = TomlStore::new(&path);
         s.write(&BTreeMap::new()).unwrap();
-        let doc = std::fs::read_to_string(&path).unwrap().parse::<toml::Value>().unwrap();
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Value>()
+            .unwrap();
         assert!(doc.get("mcp_servers").is_none());
     }
 

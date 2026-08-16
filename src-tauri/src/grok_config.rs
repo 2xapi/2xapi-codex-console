@@ -82,7 +82,10 @@ pub fn default_grok_config_path() -> PathBuf {
 // ── 纯校验/解析(无 IO,单测主体)────────────────────────────
 
 /// TOML 表里取「非空字符串」字段;缺失/非字符串/全空白 → 报「缺少有效的 {key} 字段」。
-fn required_non_empty_string<'a>(table: &'a toml::value::Table, key: &str) -> Result<&'a str, String> {
+fn required_non_empty_string<'a>(
+    table: &'a toml::value::Table,
+    key: &str,
+) -> Result<&'a str, String> {
     table
         .get(key)
         .and_then(toml::Value::as_str)
@@ -176,12 +179,25 @@ pub fn validate_config(config_toml: &str) -> Result<(), String> {
 pub fn extract_model_config(config_toml: &str) -> Option<GrokModelConfig> {
     let document = config_toml.parse::<toml::Value>().ok()?;
     let root = document.as_table()?;
-    let default_model = root.get("models")?.as_table()?.get("default")?.as_str()?.trim();
-    let m = root.get("model")?.as_table()?.get(default_model)?.as_table()?;
+    let default_model = root
+        .get("models")?
+        .as_table()?
+        .get("default")?
+        .as_str()?
+        .trim();
+    let m = root
+        .get("model")?
+        .as_table()?
+        .get(default_model)?
+        .as_table()?;
     Some(GrokModelConfig {
         profile: default_model.to_string(),
         model: m.get("model")?.as_str()?.trim().to_string(),
-        base_url: m.get("base_url")?.as_str()?.trim_end_matches('/').to_string(),
+        base_url: m
+            .get("base_url")?
+            .as_str()?
+            .trim_end_matches('/')
+            .to_string(),
         name: m.get("name")?.as_str()?.trim().to_string(),
         api_key: optional_non_empty_string(m, "api_key"),
         env_key: optional_non_empty_string(m, "env_key"),
@@ -198,16 +214,14 @@ pub fn extract_model_config(config_toml: &str) -> Option<GrokModelConfig> {
 /// 声明缺失必须以「无凭据」(None)浮出,让调用方显式失败而非带着错误的密钥出门。
 pub fn extract_credentials(config_toml: &str) -> Option<(String, String)> {
     let config = extract_model_config(config_toml)?;
-    let api_key = config
-        .api_key
-        .or_else(|| {
-            config
-                .env_key
-                .as_deref()
-                .and_then(|key| std::env::var(key).ok())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })?;
+    let api_key = config.api_key.or_else(|| {
+        config
+            .env_key
+            .as_deref()
+            .and_then(|key| std::env::var(key).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })?;
     Some((config.base_url, api_key))
 }
 
@@ -220,7 +234,7 @@ fn api_backend_for(provider: &Provider) -> &'static str {
         WireApi::Responses => "responses",
         WireApi::ChatCompletions => "chat_completions",
         WireApi::Anthropic => DEFAULT_API_BACKEND, // Grok 不说 Anthropic 协议,回退默认
-        WireApi::Gemini => DEFAULT_API_BACKEND, // Grok 不说 Gemini 协议,回退默认
+        WireApi::Gemini => DEFAULT_API_BACKEND,    // Grok 不说 Gemini 协议,回退默认
     }
 }
 
@@ -271,7 +285,11 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
 /// 合并出托管态配置文本:受控段(`[models]`/`[model.*]`)整段替换为本产品条目
 /// (切换语义),其余顶层段原样保留。gateway = 零 Key(base_url 指网关 + 占位);
 /// direct = Key 落盘(base_url 直指供应商 + 供应商 Key)。
-pub fn build_hosted_toml(current_text: &str, provider: &Provider, way: &str) -> Result<String, String> {
+pub fn build_hosted_toml(
+    current_text: &str,
+    provider: &Provider,
+    way: &str,
+) -> Result<String, String> {
     let (base_url, api_key, api_backend) = match way {
         "gateway" => (
             format!("{}/grokbuild", crate::config::GATEWAY_BASE_URL),
@@ -287,7 +305,11 @@ pub fn build_hosted_toml(current_text: &str, provider: &Provider, way: &str) -> 
     };
     let display_name = {
         let n = provider.name.trim();
-        if n.is_empty() { "2xapi" } else { n }
+        if n.is_empty() {
+            "2xapi"
+        } else {
+            n
+        }
     };
 
     let mut root = parse_or_empty(current_text);
@@ -295,15 +317,24 @@ pub fn build_hosted_toml(current_text: &str, provider: &Provider, way: &str) -> 
     root.remove("model");
 
     let mut profile = toml::value::Table::new();
-    profile.insert("model".into(), toml::Value::String(provider.model.trim().to_string()));
+    profile.insert(
+        "model".into(),
+        toml::Value::String(provider.model.trim().to_string()),
+    );
     profile.insert("base_url".into(), toml::Value::String(base_url));
     profile.insert("name".into(), toml::Value::String(display_name.to_string()));
     profile.insert("api_key".into(), toml::Value::String(api_key));
     profile.insert("api_backend".into(), toml::Value::String(api_backend));
-    profile.insert("context_window".into(), toml::Value::Integer(resolve_context_window(provider)));
+    profile.insert(
+        "context_window".into(),
+        toml::Value::Integer(resolve_context_window(provider)),
+    );
 
     let mut models = toml::value::Table::new();
-    models.insert("default".into(), toml::Value::String(MANAGED_PROFILE.to_string()));
+    models.insert(
+        "default".into(),
+        toml::Value::String(MANAGED_PROFILE.to_string()),
+    );
 
     let mut model_tbl = toml::value::Table::new();
     model_tbl.insert(MANAGED_PROFILE.into(), toml::Value::Table(profile));
@@ -347,7 +378,11 @@ pub fn detect_hosting(grok_config_path: &Path) -> Value {
     if cfg.profile != MANAGED_PROFILE {
         return Value::Null;
     }
-    let way = if cfg.base_url.trim_end_matches('/').starts_with(crate::config::GATEWAY_BASE_URL) {
+    let way = if cfg
+        .base_url
+        .trim_end_matches('/')
+        .starts_with(crate::config::GATEWAY_BASE_URL)
+    {
         "gateway"
     } else {
         "direct"
@@ -366,7 +401,9 @@ fn find_pre_host_snapshot_text(backup_dir: &Path) -> Option<String> {
         if !name.ends_with(".manifest.json") {
             continue;
         }
-        let Ok(meta) = serde_json::from_str::<Value>(&std::fs::read_to_string(&manifest).unwrap_or_default()) else {
+        let Ok(meta) =
+            serde_json::from_str::<Value>(&std::fs::read_to_string(&manifest).unwrap_or_default())
+        else {
             continue;
         };
         if meta.get("purpose").and_then(|v| v.as_str()) != Some("pre-host") {
@@ -377,14 +414,18 @@ fn find_pre_host_snapshot_text(backup_dir: &Path) -> Option<String> {
             candidates.push((entry.metadata().and_then(|m| m.modified()).ok(), text));
         }
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // 最新在前
+    candidates.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts)); // 最新在前
     candidates.into_iter().next().map(|(_, text)| text)
 }
 
 /// live 读取:只做语法校验(官方态同样放行,供切换回填与界面展示)。
 pub fn read_live_config(grok_config_path: &Path) -> Result<String, OpError> {
     if !grok_config_path.exists() {
-        return Err((404, "E_GROK_CONFIG_MISSING".into(), "Grok Build 配置文件不存在".into()));
+        return Err((
+            404,
+            "E_GROK_CONFIG_MISSING".into(),
+            "Grok Build 配置文件不存在".into(),
+        ));
     }
     let text = std::fs::read_to_string(grok_config_path)
         .map_err(|e| (500, "E_IO".to_string(), e.to_string()))?;
@@ -413,13 +454,25 @@ pub fn host(
     way: &str,
 ) -> Result<Value, OpError> {
     if way != "gateway" && way != "direct" {
-        return Err((400, "E_BAD_WAY".into(), "未知托管方式,仅支持 gateway / direct".into()));
+        return Err((
+            400,
+            "E_BAD_WAY".into(),
+            "未知托管方式,仅支持 gateway / direct".into(),
+        ));
     }
     if provider.model.trim().is_empty() {
-        return Err((422, "E_NO_MODEL".into(), "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into()));
+        return Err((
+            422,
+            "E_NO_MODEL".into(),
+            "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into(),
+        ));
     }
     if way == "direct" && provider.base_url.trim().is_empty() {
-        return Err((422, "E_NO_BASE_URL".into(), "该供应商未配置 API 地址".into()));
+        return Err((
+            422,
+            "E_NO_BASE_URL".into(),
+            "该供应商未配置 API 地址".into(),
+        ));
     }
     let io = |e: String| -> OpError { (500, "E_IO".to_string(), e) };
 
@@ -432,8 +485,13 @@ pub fn host(
     let config_written = if new_text != current {
         // 首次托管 pre-host(供 unhost 受控还原);换供应商/换路 pre-switch
         //(不新增 pre-host 快照,保住最初快照还原到首次托管前,同 codex host 语义)
-        let purpose = if already.is_null() { "pre-host" } else { "pre-switch" };
-        crate::config::backup_file(grok_config_path, backup_dir, "config-apply", purpose).map_err(io)?;
+        let purpose = if already.is_null() {
+            "pre-host"
+        } else {
+            "pre-switch"
+        };
+        crate::config::backup_file(grok_config_path, backup_dir, "config-apply", purpose)
+            .map_err(io)?;
         if let Some(p) = grok_config_path.parent() {
             std::fs::create_dir_all(p).map_err(|e| io(e.to_string()))?;
         }
@@ -464,7 +522,8 @@ pub fn unhost(grok_config_path: &Path, backup_dir: &Path) -> Result<Value, OpErr
         None => build_unhosted_toml(&current).map_err(io)?,
     };
     let config_written = if merged != current {
-        crate::config::backup_file(grok_config_path, backup_dir, "config-apply", "pre-unhost").map_err(io)?;
+        crate::config::backup_file(grok_config_path, backup_dir, "config-apply", "pre-unhost")
+            .map_err(io)?;
         write_text_atomic(grok_config_path, &merged).map_err(io)?;
         true
     } else {
@@ -510,7 +569,10 @@ mod tests {
 
     fn sandbox(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("2xapi-grokbuild-{label}-{}-{n}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "2xapi-grokbuild-{label}-{}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let grok_home = root.join("grok");
         let backup_dir = root.join("backups");
@@ -574,8 +636,7 @@ context_window = 500000
     fn syntax_validation_accepts_official_snapshots() {
         validate_syntax("").expect("空文档(官方态)合法");
         validate_syntax("  \n# comment only\n").expect("仅注释合法");
-        validate_syntax("[mcp_servers.echo]\ncommand = \"echo\"\n")
-            .expect("官方态(无模型表)合法");
+        validate_syntax("[mcp_servers.echo]\ncommand = \"echo\"\n").expect("官方态(无模型表)合法");
         assert!(validate_syntax("not = [valid").is_err(), "语法坏必须报错");
     }
 
@@ -587,8 +648,14 @@ context_window = 500000
         assert!(is_official_live("[mcp_servers.echo]\ncommand = \"echo\"\n"));
         // 出现过任一自定义键(哪怕残缺)都不是官方态,交给强校验报错
         assert!(!is_official_live(valid_config()));
-        assert!(!is_official_live("[models]\ndefault = \"x\"\n"), "残缺 [models] 不算官方态");
-        assert!(!is_official_live("[model.x]\nmodel = \"x\"\n"), "残缺 [model.x] 不算官方态");
+        assert!(
+            !is_official_live("[models]\ndefault = \"x\"\n"),
+            "残缺 [models] 不算官方态"
+        );
+        assert!(
+            !is_official_live("[model.x]\nmodel = \"x\"\n"),
+            "残缺 [model.x] 不算官方态"
+        );
         // 语法不合法不是官方态
         assert!(!is_official_live("not = [valid"));
     }
@@ -614,21 +681,30 @@ context_window = 500000
         }
         // 缺整段
         let no_models = valid_config().replace("[models]\ndefault = \"grok-4.5\"\n\n", "");
-        assert!(validate_config(&no_models).unwrap_err().contains("[models]"));
+        assert!(validate_config(&no_models)
+            .unwrap_err()
+            .contains("[models]"));
         let no_default = valid_config().replace("default = \"grok-4.5\"", "");
-        assert!(validate_config(&no_default).unwrap_err().contains("default"));
+        assert!(validate_config(&no_default)
+            .unwrap_err()
+            .contains("default"));
         let no_table = "[models]\ndefault = \"grok-4.5\"\n";
         assert!(validate_config(no_table).unwrap_err().contains("model"));
         // default 指向不存在的 profile
         let dangling = valid_config().replace("default = \"grok-4.5\"", "default = \"missing\"");
-        assert!(validate_config(&dangling).unwrap_err().contains("[model.\"missing\"]"));
+        assert!(validate_config(&dangling)
+            .unwrap_err()
+            .contains("[model.\"missing\"]"));
     }
 
     #[test]
     fn rejects_config_without_api_key_or_env_key() {
         let broken = valid_config().replace("api_key = \"secret\"\n", "");
         let err = validate_config(&broken).expect_err("凭据缺失必须报错");
-        assert!(err.contains("api_key") && err.contains("env_key"), "报错应同时点名两字段: {err}");
+        assert!(
+            err.contains("api_key") && err.contains("env_key"),
+            "报错应同时点名两字段: {err}"
+        );
         // api_key 全空白同样视为缺失(env_key 也没有 → 报错)
         let blank = valid_config().replace("api_key = \"secret\"", "api_key = \"   \"");
         assert!(validate_config(&blank).is_err());
@@ -636,7 +712,11 @@ context_window = 500000
 
     #[test]
     fn rejects_invalid_context_window() {
-        for bad in ["context_window = 0", "context_window = -5", "context_window = \"big\""] {
+        for bad in [
+            "context_window = 0",
+            "context_window = -5",
+            "context_window = \"big\"",
+        ] {
             let broken = valid_config().replace("context_window = 500000", bad);
             let err = validate_config(&broken).unwrap_err();
             assert!(err.contains("context_window"), "应报 context_window: {err}");
@@ -649,7 +729,10 @@ context_window = 500000
     fn credentials_api_key_takes_priority_over_env_key() {
         with_env_lock(|| {
             let original = set_env_var("GROK_TEST_API_KEY", Some("env-secret"));
-            let both = valid_env_key_config().replace("name = \"Example Env\"", "name = \"Example Env\"\napi_key = \"inline-secret\"");
+            let both = valid_env_key_config().replace(
+                "name = \"Example Env\"",
+                "name = \"Example Env\"\napi_key = \"inline-secret\"",
+            );
             let (base, key) = extract_credentials(&both).expect("应解析出凭据");
             assert_eq!(base, "https://example.com/v1");
             assert_eq!(key, "inline-secret", "api_key 内联值必须优先于 env_key");
@@ -661,7 +744,8 @@ context_window = 500000
     fn resolves_api_key_from_configured_environment_variable() {
         with_env_lock(|| {
             let original = set_env_var("GROK_TEST_API_KEY", Some("  env-secret  "));
-            let (base, key) = extract_credentials(valid_env_key_config()).expect("应从环境变量解析");
+            let (base, key) =
+                extract_credentials(valid_env_key_config()).expect("应从环境变量解析");
             assert_eq!(base, "https://example.com/v1");
             assert_eq!(key, "env-secret", "环境变量取值应 trim");
             restore_env_var("GROK_TEST_API_KEY", original);
@@ -692,7 +776,10 @@ context_window = 500000
         let cfg = extract_model_config(valid_config()).unwrap();
         assert_eq!(cfg.base_url, "https://example.com/v1");
         let trailing = valid_config().replace("https://example.com/v1", "https://example.com/v1/");
-        assert_eq!(extract_model_config(&trailing).unwrap().base_url, "https://example.com/v1");
+        assert_eq!(
+            extract_model_config(&trailing).unwrap().base_url,
+            "https://example.com/v1"
+        );
     }
 
     // ── 托管写入 / 受控还原 / live 读写 ──
@@ -703,7 +790,10 @@ context_window = 500000
         // gateway:零 Key 契约(网关地址 + 占位),api_backend 恒 responses
         let gateway = build_hosted_toml("", &p, "gateway").unwrap();
         validate_config(&gateway).expect("生成的网关配置必须过强校验");
-        assert!(gateway.contains(&format!("base_url = \"{}/grokbuild\"", crate::config::GATEWAY_BASE_URL)));
+        assert!(gateway.contains(&format!(
+            "base_url = \"{}/grokbuild\"",
+            crate::config::GATEWAY_BASE_URL
+        )));
         assert!(gateway.contains(&format!("api_key = \"{GATEWAY_KEY_PLACEHOLDER}\"")));
         assert!(gateway.contains("api_backend = \"responses\""));
         assert!(gateway.contains("context_window = 500000"));
@@ -721,10 +811,17 @@ context_window = 500000
 
     #[test]
     fn build_hosted_toml_preserves_foreign_sections() {
-        let current = "[mcp_servers.echo]\ncommand = \"echo\"\n\n[models]\ndefault = \"user-own\"\n";
+        let current =
+            "[mcp_servers.echo]\ncommand = \"echo\"\n\n[models]\ndefault = \"user-own\"\n";
         let built = build_hosted_toml(current, &provider("p1", "2xapi"), "gateway").unwrap();
-        assert!(built.contains("[mcp_servers.echo]"), "非受控段必须保留:\n{built}");
-        assert!(!built.contains("user-own"), "受控段([models]/[model.*])必须整段替换:\n{built}");
+        assert!(
+            built.contains("[mcp_servers.echo]"),
+            "非受控段必须保留:\n{built}"
+        );
+        assert!(
+            !built.contains("user-own"),
+            "受控段([models]/[model.*])必须整段替换:\n{built}"
+        );
         validate_config(&built).unwrap();
     }
 
@@ -738,7 +835,10 @@ context_window = 500000
         assert_eq!(out["changed"]["config"], json!(true));
         let written = std::fs::read_to_string(&cfg).unwrap();
         validate_config(&written).expect("写盘内容必须过强校验");
-        assert!(written.contains("[mcp_servers.echo]"), "用户 mcp 段保留:\n{written}");
+        assert!(
+            written.contains("[mcp_servers.echo]"),
+            "用户 mcp 段保留:\n{written}"
+        );
         assert_eq!(detect_hosting(&cfg)["way"], json!("gateway"));
     }
 
@@ -758,8 +858,16 @@ context_window = 500000
         host(&cfg, &bk, &p, "gateway").unwrap();
         let first = std::fs::read_to_string(&cfg).unwrap();
         let out = host(&cfg, &bk, &p, "gateway").unwrap();
-        assert_eq!(out["changed"]["config"], json!(false), "同供应商同方式应 no-op");
-        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), first, "文件不得被重写");
+        assert_eq!(
+            out["changed"]["config"],
+            json!(false),
+            "同供应商同方式应 no-op"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            first,
+            "文件不得被重写"
+        );
         // 换供应商 → pre-switch 备份 + 重写
         let out2 = host(&cfg, &bk, &provider("p2", "另一家"), "gateway").unwrap();
         assert_eq!(out2["switched"], json!(true));
@@ -792,7 +900,10 @@ context_window = 500000
         assert_eq!(out["restored"], json!(true));
         let after = std::fs::read_to_string(&cfg).unwrap();
         assert!(is_official_live(&after), "还原后应为官方态:\n{after}");
-        assert!(after.contains("[mcp_servers.echo]"), "用户 mcp 段保留:\n{after}");
+        assert!(
+            after.contains("[mcp_servers.echo]"),
+            "用户 mcp 段保留:\n{after}"
+        );
         assert!(detect_hosting(&cfg).is_null());
         // 再 unhost:幂等 no-op
         let again = unhost(&cfg, &bk).unwrap();
@@ -810,7 +921,10 @@ context_window = 500000
 
         unhost(&cfg, &bk).unwrap();
         let after = std::fs::read_to_string(&cfg).unwrap();
-        assert!(after.contains("[model.\"grok-4.5\"]"), "用户自己的 profile 应从快照还原:\n{after}");
+        assert!(
+            after.contains("[model.\"grok-4.5\"]"),
+            "用户自己的 profile 应从快照还原:\n{after}"
+        );
         validate_config(&after).expect("还原后仍是完整合法的自定义配置");
         // 还原后 default 指向用户 profile → 非托管态
         assert!(detect_hosting(&cfg).is_null());
@@ -825,7 +939,10 @@ context_window = 500000
         std::fs::create_dir_all(&bk).unwrap();
         unhost(&cfg, &bk).unwrap();
         let after = std::fs::read_to_string(&cfg).unwrap();
-        assert!(is_official_live(&after), "无快照时移除受控段应回落官方态:\n{after}");
+        assert!(
+            is_official_live(&after),
+            "无快照时移除受控段应回落官方态:\n{after}"
+        );
     }
 
     #[test]
@@ -848,7 +965,10 @@ context_window = 500000
         let (_root, cfg, _bk) = sandbox("detect");
         assert!(detect_hosting(&cfg).is_null(), "文件不存在 → 未托管");
         std::fs::write(&cfg, valid_config()).unwrap();
-        assert!(detect_hosting(&cfg).is_null(), "用户自己的 profile → 未托管");
+        assert!(
+            detect_hosting(&cfg).is_null(),
+            "用户自己的 profile → 未托管"
+        );
         host(&cfg, &_bk, &provider("p1", "2xapi"), "direct").unwrap();
         assert_eq!(detect_hosting(&cfg)["way"], json!("direct"));
     }
@@ -883,9 +1003,14 @@ context_window = 500000
         assert_eq!(out["way"], json!("direct"));
         let written = std::fs::read_to_string(&cfg).unwrap();
         validate_config(&written).unwrap();
-        assert!(written.contains("base_url = \"https://up.example.com\""), "direct 应写供应商地址(尾 / trim):\n{written}");
-        assert!(written.contains("api_key = \"sk-test-secret\""), "direct = Key 落盘(已定稿差异)");
+        assert!(
+            written.contains("base_url = \"https://up.example.com\""),
+            "direct 应写供应商地址(尾 / trim):\n{written}"
+        );
+        assert!(
+            written.contains("api_key = \"sk-test-secret\""),
+            "direct = Key 落盘(已定稿差异)"
+        );
         assert_eq!(detect_hosting(&cfg)["way"], json!("direct"));
     }
 }
-

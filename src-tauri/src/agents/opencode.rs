@@ -19,7 +19,10 @@ pub const PROVIDER_ID: &str = "2xapi-gateway";
 
 /// 配置文件路径:`<oc_home>/.config/opencode/opencode.json`(oc_home=HOME 根,测试传 tempdir)。
 pub fn config_path(oc_home: &Path) -> PathBuf {
-    oc_home.join(".config").join("opencode").join("opencode.json")
+    oc_home
+        .join(".config")
+        .join("opencode")
+        .join("opencode.json")
 }
 
 /// 模型 id slug 化(引用形态 `2xapi-gateway/<slug>`;非法字符归并为 `-`)。
@@ -27,10 +30,20 @@ fn slug(name: &str) -> String {
     let s: String = name
         .trim()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "model".into() } else { s }
+    if s.is_empty() {
+        "model".into()
+    } else {
+        s
+    }
 }
 
 fn read_root(oc_home: &Path) -> Result<Map<String, Value>, OpError> {
@@ -39,14 +52,25 @@ fn read_root(oc_home: &Path) -> Result<Map<String, Value>, OpError> {
         return Ok(Map::new());
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
-    let v: Value = serde_json::from_str(&raw)
-        .map_err(|_| (422, "E_CONFIG_PARSE".into(), "opencode.json 含注释或非法 JSON,暂不支持安全合并,请先整理为标准 JSON".into()))?;
+    let v: Value = serde_json::from_str(&raw).map_err(|_| {
+        (
+            422,
+            "E_CONFIG_PARSE".into(),
+            "opencode.json 含注释或非法 JSON,暂不支持安全合并,请先整理为标准 JSON".into(),
+        )
+    })?;
     Ok(v.as_object().cloned().unwrap_or_default())
 }
 
-fn write_root(oc_home: &Path, backup_dir: &Path, root: &Map<String, Value>, purpose: &str) -> Result<bool, OpError> {
+fn write_root(
+    oc_home: &Path,
+    backup_dir: &Path,
+    root: &Map<String, Value>,
+    purpose: &str,
+) -> Result<bool, OpError> {
     let path = config_path(oc_home);
-    let new_text = serde_json::to_string_pretty(&Value::Object(root.clone())).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
+    let new_text = serde_json::to_string_pretty(&Value::Object(root.clone()))
+        .map_err(|e| (500, "E_IO".into(), e.to_string()))?;
     if path.exists() {
         let cur = std::fs::read_to_string(&path).unwrap_or_default();
         if cur == new_text {
@@ -61,12 +85,21 @@ fn write_root(oc_home: &Path, backup_dir: &Path, root: &Map<String, Value>, purp
     Ok(true)
 }
 
-fn find_provider(providers_path: &Path, provider_id: &str) -> Result<crate::providers::Provider, OpError> {
+fn find_provider(
+    providers_path: &Path,
+    provider_id: &str,
+) -> Result<crate::providers::Provider, OpError> {
     crate::providers::load(providers_path)
         .providers
         .into_iter()
         .find(|p| p.id == provider_id)
-        .ok_or_else(|| (404, "E_NO_PROVIDER".into(), format!("供应商不存在: {provider_id}")))
+        .ok_or_else(|| {
+            (
+                404,
+                "E_NO_PROVIDER".into(),
+                format!("供应商不存在: {provider_id}"),
+            )
+        })
 }
 
 /// 托管态:我们条目是否存在 + 指针归属 + jsonc 冲突告警。
@@ -85,7 +118,10 @@ pub fn state(oc_home: &Path) -> Value {
     });
     let default_model = root.get("model").and_then(|v| v.as_str()).unwrap_or("");
     let jsonc_conflict = {
-        let jsonc = oc_home.join(".config").join("opencode").join("opencode.jsonc");
+        let jsonc = oc_home
+            .join(".config")
+            .join("opencode")
+            .join("opencode.jsonc");
         jsonc.exists()
             && std::fs::read_to_string(&jsonc)
                 .map(|t| t.contains(PROVIDER_ID))
@@ -107,28 +143,52 @@ pub fn host(
     way: &str,
 ) -> Result<Value, OpError> {
     if way != "gateway" && way != "direct" {
-        return Err((400, "E_BAD_WAY".into(), "未知托管方式,仅支持 gateway / direct".into()));
+        return Err((
+            400,
+            "E_BAD_WAY".into(),
+            "未知托管方式,仅支持 gateway / direct".into(),
+        ));
     }
     let provider = find_provider(providers_path, provider_id)?;
     if provider.model.trim().is_empty() {
-        return Err((422, "E_NO_MODEL".into(), "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into()));
+        return Err((
+            422,
+            "E_NO_MODEL".into(),
+            "该供应商未配置默认模型,请先在编辑里拉取模型或手填".into(),
+        ));
     }
     if way == "direct" && provider.base_url.trim().is_empty() {
-        return Err((422, "E_NO_BASE_URL".into(), "该供应商未配置 API 地址".into()));
+        return Err((
+            422,
+            "E_NO_BASE_URL".into(),
+            "该供应商未配置 API 地址".into(),
+        ));
     }
 
     let mut root = read_root(oc_home)?;
     let (base_url, api_key, key_note) = if way == "gateway" {
-        (format!("{GATEWAY_BASE}/opencode/v1"), PLACEHOLDER_KEY.to_string(), "占位(真实 Key 只在网关)")
+        (
+            format!("{GATEWAY_BASE}/opencode/v1"),
+            PLACEHOLDER_KEY.to_string(),
+            "占位(真实 Key 只在网关)",
+        )
     } else {
         let b = provider.base_url.trim().trim_end_matches('/').to_string();
-        (b, provider.api_key.clone(), "直连:真实 Key 落盘于 opencode.json")
+        (
+            b,
+            provider.api_key.clone(),
+            "直连:真实 Key 落盘于 opencode.json",
+        )
     };
 
     let model_ids: Vec<(String, String)> = if provider.models.is_empty() {
         vec![(slug(&provider.model), provider.model.clone())]
     } else {
-        provider.models.iter().map(|m| (slug(&m.name), m.name.clone())).collect()
+        provider
+            .models
+            .iter()
+            .map(|m| (slug(&m.name), m.name.clone()))
+            .collect()
     };
     let mut models = Map::new();
     for (id, name) in &model_ids {
@@ -140,21 +200,42 @@ pub fn host(
         "options": { "apiKey": api_key, "baseURL": base_url },
         "models": models,
     });
-    let providers = root.entry("provider".to_string()).or_insert_with(|| json!({}));
+    let providers = root
+        .entry("provider".to_string())
+        .or_insert_with(|| json!({}));
     providers
         .as_object_mut()
-        .ok_or_else(|| (422, "E_CONFIG_PARSE".into(), "provider 段存在但不是对象,拒绝写入".into()))?
+        .ok_or_else(|| {
+            (
+                422,
+                "E_CONFIG_PARSE".into(),
+                "provider 段存在但不是对象,拒绝写入".into(),
+            )
+        })?
         .insert(PROVIDER_ID.into(), entry);
 
     // D1:默认指针仅原值空/缺失才切;否则不动并建议(suggested 供前端提示「已写入,可在 opencode 内选择」)
-    let existing_model = root.get("model").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let existing_model = root
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let mut switched = false;
     if existing_model.is_empty() {
-        root.insert("model".to_string(), json!(format!("{PROVIDER_ID}/{}", model_ids[0].0)));
+        root.insert(
+            "model".to_string(),
+            json!(format!("{PROVIDER_ID}/{}", model_ids[0].0)),
+        );
         switched = true;
     }
 
-    let written = write_root(oc_home, backup_dir, &root, if switched { "pre-host" } else { "pre-switch" })?;
+    let written = write_root(
+        oc_home,
+        backup_dir,
+        &root,
+        if switched { "pre-host" } else { "pre-switch" },
+    )?;
     Ok(json!({
         "hosted": true, "way": way, "switched": !existing_model.is_empty(),
         "defaultModelSwitched": switched,
@@ -185,5 +266,7 @@ pub fn unhost(oc_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
         root.remove("model");
     }
     let written = write_root(oc_home, backup_dir, &root, "pre-unhost")?;
-    Ok(json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }))
+    Ok(
+        json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }),
+    )
 }

@@ -32,9 +32,9 @@ pub struct Cred {
 pub struct AccLine {
     pub id: String,
     pub name: String,
-    pub endpoint: String,       // 加速线上游 base_url(经线装配方用于 Proxy+basic auth)
-    pub scope: Vec<String>,     // 供应商 base_url 域名匹配条目(host 命中任一即走此线)
-    pub priority: u32,          // 越小越优先
+    pub endpoint: String, // 加速线上游 base_url(经线装配方用于 Proxy+basic auth)
+    pub scope: Vec<String>, // 供应商 base_url 域名匹配条目(host 命中任一即走此线)
+    pub priority: u32,    // 越小越优先
     pub enabled: bool,
     pub credential: Option<Cred>, // basic auth 凭证;内置线从 accel-credentials.json 注入
 }
@@ -49,7 +49,10 @@ impl std::fmt::Debug for AccLine {
             .field("scope", &self.scope)
             .field("priority", &self.priority)
             .field("enabled", &self.enabled)
-            .field("credential", &self.credential.as_ref().map(|_| "<redacted>"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -113,7 +116,10 @@ fn write_cache(codex_home: &Path, lines: &AccLines) {
         l.credential = None;
     }
     std::fs::create_dir_all(codex_home).ok();
-    let _ = std::fs::write(cache_path(codex_home), serde_json::to_string_pretty(&clean).unwrap_or_default());
+    let _ = std::fs::write(
+        cache_path(codex_home),
+        serde_json::to_string_pretty(&clean).unwrap_or_default(),
+    );
 }
 
 /// 读缓存并注入本地凭证;缺失/非法 → None。
@@ -149,8 +155,13 @@ pub fn load_lines(codex_home: &Path) -> AccLines {
 /// 约定(服务端未就绪,本处定义契约):
 ///   - `pubkey_hex`:32 字节 ed25519 公钥的 hex(64 字符)
 ///   - 签名:对响应体原始字节签名的 64 字节 hex,放响应头 `X-Signature`
+///
 /// `service_url` 或 `pubkey_hex` 为空 → 视为服务端未就绪,直接走缓存/内置。
-pub async fn fetch_lines(codex_home: &Path, service_url: &str, pubkey_hex: &str) -> Result<AccLines, String> {
+pub async fn fetch_lines(
+    codex_home: &Path,
+    service_url: &str,
+    pubkey_hex: &str,
+) -> Result<AccLines, String> {
     if !service_url.trim().is_empty() && !pubkey_hex.trim().is_empty() {
         if let Ok(mut lines) = fetch_remote(codex_home, service_url, pubkey_hex).await {
             attach_credentials(codex_home, &mut lines);
@@ -163,14 +174,22 @@ pub async fn fetch_lines(codex_home: &Path, service_url: &str, pubkey_hex: &str)
     Ok(builtin_default(codex_home))
 }
 
-async fn fetch_remote(codex_home: &Path, service_url: &str, pubkey_hex: &str) -> Result<AccLines, String> {
+async fn fetch_remote(
+    codex_home: &Path,
+    service_url: &str,
+    pubkey_hex: &str,
+) -> Result<AccLines, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .no_proxy() // 绕过系统代理,仿 probe.rs
         .build()
         .map_err(|e| e.to_string())?;
     let url = format!("{}/lines.json", service_url.trim_end_matches('/'));
-    let resp = client.get(&url).send().await.map_err(|e| format!("拉取失败: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("拉取失败: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("服务端未就绪(HTTP {})", resp.status()));
     }
@@ -180,9 +199,13 @@ async fn fetch_remote(codex_home: &Path, service_url: &str, pubkey_hex: &str) ->
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| "响应缺 X-Signature".to_string())?
         .to_string();
-    let body = resp.bytes().await.map_err(|e| format!("读响应体失败: {e}"))?;
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读响应体失败: {e}"))?;
     verify_signature(pubkey_hex, &sig_hex, &body)?;
-    let lines: AccLines = serde_json::from_slice(&body).map_err(|e| format!("解析线路表失败: {e}"))?;
+    let lines: AccLines =
+        serde_json::from_slice(&body).map_err(|e| format!("解析线路表失败: {e}"))?;
     write_cache(codex_home, &lines);
     Ok(lines)
 }
@@ -190,12 +213,20 @@ async fn fetch_remote(codex_home: &Path, service_url: &str, pubkey_hex: &str) ->
 /// ed25519 验签(公钥/签名均为 hex;对原始 body 字节验签)。
 fn verify_signature(pubkey_hex: &str, sig_hex: &str, body: &[u8]) -> Result<(), String> {
     let pk_bytes = hex::decode(pubkey_hex.trim()).map_err(|e| format!("pubkey hex 非法: {e}"))?;
-    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| "pubkey 长度须为 32 字节".to_string())?;
-    let key = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr).map_err(|e| format!("公钥解析失败: {e}"))?;
+    let pk_arr: [u8; 32] = pk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "pubkey 长度须为 32 字节".to_string())?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr)
+        .map_err(|e| format!("公钥解析失败: {e}"))?;
     let sig_bytes = hex::decode(sig_hex.trim()).map_err(|e| format!("签名 hex 非法: {e}"))?;
-    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| "签名长度须为 64 字节".to_string())?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "签名长度须为 64 字节".to_string())?;
     let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-    key.verify_strict(body, &sig).map_err(|_| "ed25519 验签失败".to_string())
+    key.verify_strict(body, &sig)
+        .map_err(|_| "ed25519 验签失败".to_string())
 }
 
 // ── scope 匹配(任务书 §五:命中走加速线,未命中直连)──────────
@@ -213,7 +244,7 @@ fn host_of(base_url: &str) -> Option<String> {
     };
     // 去路径/查询/片段
     let end = after_scheme
-        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
     let mut host = &after_scheme[..end];
     // 去端口(IPv6 字面量 [::1]:8080 特判;仅当 ':' 后全为数字才截断)
@@ -353,9 +384,10 @@ fn probe_client() -> reqwest::Client {
 /// - !ok → fails +1,连续 FAIL_THRESHOLD 次 → 摘除(is_available=false / is_unhealthy=true)。
 pub fn apply_probe(state: &HealthState, line_id: &str, ok: bool) {
     let mut m = state.table.lock().unwrap();
-    let e = m
-        .entry(line_id.to_string())
-        .or_insert(LineHealth { latency_ms: 0, fails: 0 });
+    let e = m.entry(line_id.to_string()).or_insert(LineHealth {
+        latency_ms: 0,
+        fails: 0,
+    });
     e.fails = if ok { 0 } else { e.fails + 1 };
 }
 
@@ -409,7 +441,8 @@ mod tests {
 
     fn sandbox(label: &str) -> PathBuf {
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!("2xapi-acclines-{label}-{}-{n}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("2xapi-acclines-{label}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -435,23 +468,41 @@ mod tests {
             line("a", "http://x:1", &["2xa.cc.cd"], 1, true),
             line("b", "http://x:2", &["other.com"], 2, true),
         ];
-        assert_eq!(match_line("https://api.2xa.cc.cd:443", &lines).unwrap().id, "a", "host 命中 scope");
+        assert_eq!(
+            match_line("https://api.2xa.cc.cd:443", &lines).unwrap().id,
+            "a",
+            "host 命中 scope"
+        );
+        assert!(
+            match_line("https://openai.com", &lines).is_none(),
+            "未命中 → None"
+        );
+        // scheme/端口/路径不影响 host 解析
+        assert_eq!(
+            match_line("http://api.2xa.cc.cd/v1/chat", &lines)
+                .unwrap()
+                .id,
+            "a"
+        );
+    }
 
     #[test]
     fn wildcard_scope_matches_any_provider() {
         // 通用线(官方加速不限供应商,2026-08-16 用户定稿):scope="*" 对任意 base_url 命中
         let lines = vec![line("u1", "http://x:1", &["*"], 1, true)];
-        for url in ["https://2xapi.cc.cd", "https://api.deepseek.example.com/v1", "https://opencode.ai/zen/go/v1"] {
+        for url in [
+            "https://2xapi.cc.cd",
+            "https://api.deepseek.example.com/v1",
+            "https://opencode.ai/zen/go/v1",
+        ] {
             assert_eq!(match_line(url, &lines).unwrap().id, "u1", "通配命中 {url}");
         }
         // 既有语义不受影响:具体域名 scope 仍按域匹配
         let scoped = vec![line("s1", "http://x:2", &["2xa.cc.cd"], 1, true)];
-        assert!(match_line("https://other.example.com", &scoped).is_none(), "非通配仍不命中他域");
-    }
-
-        assert!(match_line("https://openai.com", &lines).is_none(), "未命中 → None");
-        // scheme/端口/路径不影响 host 解析
-        assert_eq!(match_line("http://api.2xa.cc.cd/v1/chat", &lines).unwrap().id, "a");
+        assert!(
+            match_line("https://other.example.com", &scoped).is_none(),
+            "非通配仍不命中他域"
+        );
     }
 
     #[test]
@@ -461,7 +512,10 @@ mod tests {
             line("high", "http://x:2", &["2xa.cc.cd"], 1, true),
             line("mid", "http://x:3", &["2xa.cc.cd"], 5, true),
         ];
-        assert_eq!(match_line("https://api.2xa.cc.cd", &lines).unwrap().id, "high");
+        assert_eq!(
+            match_line("https://api.2xa.cc.cd", &lines).unwrap().id,
+            "high"
+        );
     }
 
     #[test]
@@ -470,16 +524,32 @@ mod tests {
             line("off", "http://x:1", &["2xa.cc.cd"], 1, false),
             line("on", "http://x:2", &["2xa.cc.cd"], 2, true),
         ];
-        assert_eq!(match_line("https://api.2xa.cc.cd", &lines).unwrap().id, "on");
+        assert_eq!(
+            match_line("https://api.2xa.cc.cd", &lines).unwrap().id,
+            "on"
+        );
         let all_off = vec![line("off2", "http://x:3", &["2xa.cc.cd"], 1, false)];
-        assert!(match_line("https://api.2xa.cc.cd", &all_off).is_none(), "全 disabled → None");
+        assert!(
+            match_line("https://api.2xa.cc.cd", &all_off).is_none(),
+            "全 disabled → None"
+        );
     }
 
     #[test]
     fn match_line_exact_and_substring_and_dot_scope() {
         let lines = vec![line("a", "http://x:1", &["2xa.cc.cd"], 1, true)];
-        assert_eq!(match_line("https://2xa.cc.cd", &lines).unwrap().id, "a", "完全相等");
-        assert_eq!(match_line("https://evil2xa.cc.cd.evil.com", &lines).unwrap().id, "a", "子串匹配");
+        assert_eq!(
+            match_line("https://2xa.cc.cd", &lines).unwrap().id,
+            "a",
+            "完全相等"
+        );
+        assert_eq!(
+            match_line("https://evil2xa.cc.cd.evil.com", &lines)
+                .unwrap()
+                .id,
+            "a",
+            "子串匹配"
+        );
         // scope 带前导点也能匹配
         let dot = vec![line("b", "http://x:2", &[".2xa.cc.cd"], 1, true)];
         assert_eq!(match_line("https://api.2xa.cc.cd", &dot).unwrap().id, "b");
@@ -494,10 +564,22 @@ mod tests {
         apply_probe(&state, "l1", false);
         apply_probe(&state, "l1", false);
         assert!(state.is_available("l1"), "1、2 败仍可用");
-        assert!(!state.table.lock().unwrap().get("l1").unwrap().is_unhealthy());
+        assert!(!state
+            .table
+            .lock()
+            .unwrap()
+            .get("l1")
+            .unwrap()
+            .is_unhealthy());
         apply_probe(&state, "l1", false);
         assert!(!state.is_available("l1"), "连续 3 败应摘除");
-        assert!(state.table.lock().unwrap().get("l1").unwrap().is_unhealthy());
+        assert!(state
+            .table
+            .lock()
+            .unwrap()
+            .get("l1")
+            .unwrap()
+            .is_unhealthy());
         assert_eq!(state.table.lock().unwrap().get("l1").unwrap().fails, 3);
         // 1 成 → 恢复
         apply_probe(&state, "l1", true);
@@ -511,7 +593,11 @@ mod tests {
         apply_probe(&state, "l2", false);
         apply_probe(&state, "l2", false);
         apply_probe(&state, "l2", true);
-        assert_eq!(state.table.lock().unwrap().get("l2").unwrap().fails, 0, "中途一成就清零");
+        assert_eq!(
+            state.table.lock().unwrap().get("l2").unwrap().fails,
+            0,
+            "中途一成就清零"
+        );
         apply_probe(&state, "l2", false);
         assert_eq!(state.table.lock().unwrap().get("l2").unwrap().fails, 1);
     }
@@ -521,7 +607,11 @@ mod tests {
     #[test]
     fn builtin_default_has_test_line_and_credential_from_file() {
         let home = sandbox("builtin");
-        std::fs::write(home.join("accel-credentials.json"), r#"{"user":"u","pass":"p"}"#).unwrap();
+        std::fs::write(
+            home.join("accel-credentials.json"),
+            r#"{"user":"u","pass":"p"}"#,
+        )
+        .unwrap();
         let t = builtin_default(&home);
         assert_eq!(t.lines.len(), 1);
         assert_eq!(t.lines[0].id, "test-1");
@@ -550,11 +640,18 @@ mod tests {
                 line("remote-x", "http://r:1", &["api.cd"], 2, true),
             ],
         };
-        std::fs::write(home.join("acclines-cache.json"), serde_json::to_string(&cached).unwrap()).unwrap();
+        std::fs::write(
+            home.join("acclines-cache.json"),
+            serde_json::to_string(&cached).unwrap(),
+        )
+        .unwrap();
         let merged = load_lines(&home);
         let ids: Vec<&str> = merged.lines.iter().map(|l| l.id.as_str()).collect();
         assert_eq!(ids, vec!["test-1", "remote-x"], "缓存覆盖同名、新增追加");
-        assert_eq!(merged.lines[0].endpoint, "http://new:1", "缓存应覆盖内置 test-1");
+        assert_eq!(
+            merged.lines[0].endpoint, "http://new:1",
+            "缓存应覆盖内置 test-1"
+        );
         assert_eq!(merged.version, 2);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -572,7 +669,6 @@ mod tests {
 
     /// 固定种子签名对,返回 (pubkey_hex, SigningKey)。
     fn signer() -> (String, ed25519_dalek::SigningKey) {
-        use ed25519_dalek::Signer;
         let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let pub_hex = hex::encode(key.verifying_key().to_bytes());
         (pub_hex, key)
@@ -580,14 +676,16 @@ mod tests {
 
     /// 本地签名线路服务器:固定 body + X-Signature 头。
     async fn spawn_signed_server(body: Arc<Vec<u8>>, sig_hex: Arc<String>) -> String {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let body = body.clone();
                 let sig_hex = sig_hex.clone();
                 tokio::spawn(async move {
@@ -623,8 +721,10 @@ mod tests {
         let got = fetch_lines(&home, &url, &pub_hex).await.unwrap();
         assert_eq!(got.lines[0].id, "remote-a");
         // 缓存已写,且凭证被剥离(安全约定)
-        let cached: AccLines =
-            serde_json::from_str(&std::fs::read_to_string(home.join("acclines-cache.json")).unwrap()).unwrap();
+        let cached: AccLines = serde_json::from_str(
+            &std::fs::read_to_string(home.join("acclines-cache.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(cached.lines[0].id, "remote-a");
         assert!(cached.lines[0].credential.is_none(), "缓存不应含凭证");
         let _ = std::fs::remove_dir_all(&home);
@@ -637,13 +737,21 @@ mod tests {
             version: 9,
             lines: vec![line("cached-1", "http://c:1", &["c.cd"], 1, true)],
         };
-        std::fs::write(home.join("acclines-cache.json"), serde_json::to_string(&cached).unwrap()).unwrap();
+        std::fs::write(
+            home.join("acclines-cache.json"),
+            serde_json::to_string(&cached).unwrap(),
+        )
+        .unwrap();
         // 远程不可达(127.0.0.1:9 连接拒绝) → 回退缓存
-        let got = fetch_lines(&home, "http://127.0.0.1:9", "00").await.unwrap();
+        let got = fetch_lines(&home, "http://127.0.0.1:9", "00")
+            .await
+            .unwrap();
         assert_eq!(got.lines[0].id, "cached-1");
         // 删缓存 → 回退内置
         std::fs::remove_file(home.join("acclines-cache.json")).unwrap();
-        let got2 = fetch_lines(&home, "http://127.0.0.1:9", "00").await.unwrap();
+        let got2 = fetch_lines(&home, "http://127.0.0.1:9", "00")
+            .await
+            .unwrap();
         assert_eq!(got2.lines[0].id, "test-1");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -653,7 +761,13 @@ mod tests {
         use ed25519_dalek::Signer;
         let home = sandbox("fetch-tamper");
         let (pub_hex, _key) = signer();
-        let body = Arc::new(serde_json::to_vec(&AccLines { version: 1, lines: vec![] }).unwrap());
+        let body = Arc::new(
+            serde_json::to_vec(&AccLines {
+                version: 1,
+                lines: vec![],
+            })
+            .unwrap(),
+        );
         // 用错误私钥签名 → 验签必失败
         let wrong_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let sig = wrong_key.sign(body.as_slice());
@@ -662,7 +776,10 @@ mod tests {
 
         let got = fetch_lines(&home, &url, &pub_hex).await.unwrap();
         assert_eq!(got.lines[0].id, "test-1", "验签失败应回退内置");
-        assert!(!home.join("acclines-cache.json").exists(), "验签失败不应写缓存");
+        assert!(
+            !home.join("acclines-cache.json").exists(),
+            "验签失败不应写缓存"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -670,14 +787,16 @@ mod tests {
 
     /// 可控 mock 上游:should_fail=true 时读请求后直接断连(连接层失败);false 时回 200。
     async fn spawn_mock(should_fail: Arc<AtomicBool>) -> String {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let flag = should_fail.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
@@ -714,7 +833,13 @@ mod tests {
     async fn health_loop_removes_after_three_fails_and_recovers() {
         let flag = Arc::new(AtomicBool::new(true)); // 先断连
         let base = spawn_mock(flag.clone()).await;
-        let state = Arc::new(HealthState::new(vec![line("bad", &base, &["2xa.cc.cd"], 1, true)]));
+        let state = Arc::new(HealthState::new(vec![line(
+            "bad",
+            &base,
+            &["2xa.cc.cd"],
+            1,
+            true,
+        )]));
         spawn_health_loop(state.clone(), Duration::from_millis(100));
 
         // 连续失败 → 摘除

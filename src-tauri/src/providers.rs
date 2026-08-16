@@ -18,16 +18,12 @@ const SCHEMA_VERSION: i64 = 1;
 /// 接入模式：序列化 `"official"`/`"mixed"`/`"pure_api"`；反序列化兼容历史 `"pureApi"` 等。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AccessMode {
     Official,
     Mixed,
+    #[default]
     PureApi,
-}
-
-impl Default for AccessMode {
-    fn default() -> Self {
-        AccessMode::PureApi
-    }
 }
 
 impl AccessMode {
@@ -45,7 +41,8 @@ impl AccessMode {
 impl<'de> Deserialize<'de> for AccessMode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        AccessMode::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("未知 access_mode: {s}")))
+        AccessMode::parse(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("未知 access_mode: {s}")))
     }
 }
 
@@ -53,17 +50,13 @@ impl<'de> Deserialize<'de> for AccessMode {
 /// `gemini`(多平台阶段 C):上游原生 Google generateContent 协议(2xa 实测支持),/v1beta 入口透传不转换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WireApi {
+    #[default]
     Responses,
     ChatCompletions,
     Anthropic,
     Gemini,
-}
-
-impl Default for WireApi {
-    fn default() -> Self {
-        WireApi::Responses
-    }
 }
 
 impl WireApi {
@@ -180,7 +173,7 @@ fn default_agent() -> String {
 /// gemini 随阶段 C 第一段在注册表置 available=true,此处零改动)。
 fn normalize_agent(agent: &str) -> String {
     let norm = agent.trim().to_ascii_lowercase();
-    if crate::agents::find(&norm).map_or(false, |m| m.available) {
+    if crate::agents::find(&norm).is_some_and(|m| m.available) {
         norm
     } else {
         default_agent()
@@ -272,7 +265,11 @@ fn append_audit(providers_path: &Path, op: &str, data: &ProviderData) {
         "providers": data.providers.iter().map(|p| json!({"id": p.id, "name": p.name})).collect::<Vec<_>>(),
         "count": data.providers.len(),
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&audit_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&audit_path)
+    {
         let _ = writeln!(f, "{}", line);
     }
 }
@@ -320,36 +317,60 @@ pub fn validate(input: &ProviderInput) -> Result<(), Vec<ValidationError>> {
 
     let name_len = input.name.trim().chars().count();
     if name_len == 0 || name_len > 40 {
-        errs.push(ValidationError { field: "name".into(), message: "名称需 1~40 字符".into() });
+        errs.push(ValidationError {
+            field: "name".into(),
+            message: "名称需 1~40 字符".into(),
+        });
     }
 
     // 非 Official 模式：base_url / api_key 必填
     if input.access_mode != AccessMode::Official {
         let base = input.base_url.trim();
         if base.is_empty() {
-            errs.push(ValidationError { field: "base_url".into(), message: "非 Official 模式必填 base_url".into() });
+            errs.push(ValidationError {
+                field: "base_url".into(),
+                message: "非 Official 模式必填 base_url".into(),
+            });
         } else if !(base.starts_with("http://") || base.starts_with("https://")) {
-            errs.push(ValidationError { field: "base_url".into(), message: "base_url 须为 http(s):// 开头".into() });
+            errs.push(ValidationError {
+                field: "base_url".into(),
+                message: "base_url 须为 http(s):// 开头".into(),
+            });
         } else if base.ends_with('/') {
-            errs.push(ValidationError { field: "base_url".into(), message: "base_url 末尾不带 /".into() });
+            errs.push(ValidationError {
+                field: "base_url".into(),
+                message: "base_url 末尾不带 /".into(),
+            });
         }
         if input.api_key.trim().is_empty() {
-            errs.push(ValidationError { field: "api_key".into(), message: "非 Official 模式必填 api_key".into() });
+            errs.push(ValidationError {
+                field: "api_key".into(),
+                message: "非 Official 模式必填 api_key".into(),
+            });
         }
     }
 
     if input.model.trim().is_empty() {
-        errs.push(ValidationError { field: "model".into(), message: "model 不能为空".into() });
+        errs.push(ValidationError {
+            field: "model".into(),
+            message: "model 不能为空".into(),
+        });
     }
 
     if let Some(t) = input.timeout_secs {
         if !(5..=3600).contains(&t) {
-            errs.push(ValidationError { field: "timeout_secs".into(), message: "timeout_secs 须在 5~3600".into() });
+            errs.push(ValidationError {
+                field: "timeout_secs".into(),
+                message: "timeout_secs 须在 5~3600".into(),
+            });
         }
     }
 
     if input.sub2api_multiplier <= 0.0 {
-        errs.push(ValidationError { field: "sub2api_multiplier".into(), message: "sub2api_multiplier 须 > 0".into() });
+        errs.push(ValidationError {
+            field: "sub2api_multiplier".into(),
+            message: "sub2api_multiplier 须 > 0".into(),
+        });
     }
 
     // reasoning_levels：不做校验约束。归一化（逐项 trim + 去掉空串）已在 value_to_input 的
@@ -376,7 +397,13 @@ pub fn format_errors(errs: &[ValidationError]) -> String {
 pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<ValidationError>> {
     validate(&input)?;
     let mut data = load(path);
-    let sort_index = data.providers.iter().map(|p| p.sort_index).max().unwrap_or(-1) + 1;
+    let sort_index = data
+        .providers
+        .iter()
+        .map(|p| p.sort_index)
+        .max()
+        .unwrap_or(-1)
+        + 1;
     let provider = Provider {
         id: uuid::Uuid::new_v4().to_string(),
         name: input.name,
@@ -411,14 +438,23 @@ pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<Validat
 
 /// FR-1.4 编辑：合并更新，**id/created_at/sort_index/snapshot 不变**。
 /// key 敏感：编辑时不回填（06 §7），传入空 api_key 则保留旧值。
-pub fn update(path: &Path, id: &str, input: ProviderInput) -> Result<Provider, Vec<ValidationError>> {
+pub fn update(
+    path: &Path,
+    id: &str,
+    input: ProviderInput,
+) -> Result<Provider, Vec<ValidationError>> {
     let mut data = load(path);
     let existing_key = data
         .providers
         .iter()
         .find(|p| p.id == id)
         .map(|p| p.api_key.clone())
-        .ok_or_else(|| vec![ValidationError { field: "id".into(), message: "供应商不存在".into() }])?;
+        .ok_or_else(|| {
+            vec![ValidationError {
+                field: "id".into(),
+                message: "供应商不存在".into(),
+            }]
+        })?;
 
     let mut eff = input;
     if eff.api_key.trim().is_empty() {
@@ -426,7 +462,11 @@ pub fn update(path: &Path, id: &str, input: ProviderInput) -> Result<Provider, V
     }
     validate(&eff)?;
 
-    let p = data.providers.iter_mut().find(|p| p.id == id).expect("已校验存在");
+    let p = data
+        .providers
+        .iter_mut()
+        .find(|p| p.id == id)
+        .expect("已校验存在");
     p.name = eff.name;
     p.agent = normalize_agent(&eff.agent);
     p.icon = eff.icon;
@@ -578,13 +618,20 @@ fn mask_key(key: &str) -> String {
 }
 
 fn io_errs(e: String) -> Vec<ValidationError> {
-    vec![ValidationError { field: "_io".into(), message: e }]
+    vec![ValidationError {
+        field: "_io".into(),
+        message: e,
+    }]
 }
 
 /// 前端 camelCase JSON → ProviderInput。
 pub fn value_to_input(body: &Value) -> ProviderInput {
     ProviderInput {
-        name: body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        name: body
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         agent: normalize_agent(body.get("agent").and_then(|v| v.as_str()).unwrap_or("")),
         icon: opt_str(body, &["icon"]),
         icon_color: opt_str(body, &["iconColor", "icon_color"]),
@@ -599,7 +646,11 @@ pub fn value_to_input(body: &Value) -> ProviderInput {
             .and_then(|s| WireApi::parse(&s))
             .unwrap_or_default(),
         user_agent: opt_str(body, &["userAgent", "user_agent"]),
-        model: body.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        model: body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         models: body.get("models").map(parse_models).unwrap_or_default(),
         context_window: opt_str(body, &["contextWindow", "context_window"]),
         proxy_url: opt_str(body, &["proxyUrl", "proxy_url"]),
@@ -617,7 +668,10 @@ pub fn value_to_input(body: &Value) -> ProviderInput {
             .or_else(|| body.get("sub2api_multiplier"))
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0),
-        custom_headers: body.get("customHeaders").or_else(|| body.get("custom_headers")).map(parse_headers),
+        custom_headers: body
+            .get("customHeaders")
+            .or_else(|| body.get("custom_headers"))
+            .map(parse_headers),
         reasoning_levels: body
             .get("reasoningLevels")
             .or_else(|| body.get("reasoning_levels"))
@@ -635,16 +689,31 @@ fn parse_models(v: &Value) -> Vec<ModelConfig> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|m| {
-                    let name = m.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let name = m
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if name.is_empty() {
                         return None;
                     }
                     Some(ModelConfig {
                         name,
                         display_name: opt_str(m, &["displayName", "display_name"]),
-                        context_window: m.get("contextWindow").or_else(|| m.get("context_window")).and_then(|x| x.as_u64()),
-                        is_multimodal: m.get("isMultimodal").or_else(|| m.get("is_multimodal")).and_then(|x| x.as_bool()).unwrap_or(false),
-                        send_as_is: m.get("sendAsIs").or_else(|| m.get("send_as_is")).and_then(|x| x.as_bool()).unwrap_or(false),
+                        context_window: m
+                            .get("contextWindow")
+                            .or_else(|| m.get("context_window"))
+                            .and_then(|x| x.as_u64()),
+                        is_multimodal: m
+                            .get("isMultimodal")
+                            .or_else(|| m.get("is_multimodal"))
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
+                        send_as_is: m
+                            .get("sendAsIs")
+                            .or_else(|| m.get("send_as_is"))
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
                     })
                 })
                 .collect()
@@ -654,7 +723,11 @@ fn parse_models(v: &Value) -> Vec<ModelConfig> {
 
 fn parse_headers(v: &Value) -> HashMap<String, String> {
     v.as_object()
-        .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -681,7 +754,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!("2xapi-m1-{}-{}-{}.json", label, std::process::id(), n));
+        let p = std::env::temp_dir().join(format!(
+            "2xapi-m1-{}-{}-{}.json",
+            label,
+            std::process::id(),
+            n
+        ));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -738,11 +816,26 @@ mod tests {
 
     #[test]
     fn enum_serialization_is_snake_case() {
-        assert_eq!(serde_json::to_string(&AccessMode::Official).unwrap(), "\"official\"");
-        assert_eq!(serde_json::to_string(&AccessMode::Mixed).unwrap(), "\"mixed\"");
-        assert_eq!(serde_json::to_string(&AccessMode::PureApi).unwrap(), "\"pure_api\"");
-        assert_eq!(serde_json::to_string(&WireApi::Responses).unwrap(), "\"responses\"");
-        assert_eq!(serde_json::to_string(&WireApi::ChatCompletions).unwrap(), "\"chat_completions\"");
+        assert_eq!(
+            serde_json::to_string(&AccessMode::Official).unwrap(),
+            "\"official\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AccessMode::Mixed).unwrap(),
+            "\"mixed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AccessMode::PureApi).unwrap(),
+            "\"pure_api\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WireApi::Responses).unwrap(),
+            "\"responses\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WireApi::ChatCompletions).unwrap(),
+            "\"chat_completions\""
+        );
         // 历史 camelCase 反序列化兼容
         let am: AccessMode = serde_json::from_str("\"pureApi\"").unwrap();
         assert!(matches!(am, AccessMode::PureApi));
@@ -759,7 +852,10 @@ mod tests {
     #[test]
     fn validation_branches() {
         // 空 name
-        assert!(has_field(&validate(&sample_input("", AccessMode::Official)).unwrap_err(), "name"));
+        assert!(has_field(
+            &validate(&sample_input("", AccessMode::Official)).unwrap_err(),
+            "name"
+        ));
         // name 过长
         let mut long = sample_input(&"x".repeat(41), AccessMode::Official);
         assert!(has_field(&validate(&long).unwrap_err(), "name"));
@@ -892,7 +988,10 @@ mod tests {
         assert_eq!(l[0].name, "C");
         assert_eq!(l[1].name, "A");
         assert_eq!(l[2].name, "B");
-        assert_eq!((l[0].sort_index, l[1].sort_index, l[2].sort_index), (0, 1, 2));
+        assert_eq!(
+            (l[0].sort_index, l[1].sort_index, l[2].sort_index),
+            (0, 1, 2)
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -954,7 +1053,7 @@ mod tests {
         assert_eq!(third["op"], "set_active");
         assert_eq!(third["active"], a.id);
         // 删除后审计记录 b 消失
-        let _ = delete(&path, &b.id);
+        delete(&path, &b.id);
         let raw2 = std::fs::read_to_string(&audit_path).unwrap();
         assert_eq!(raw2.lines().filter(|l| !l.trim().is_empty()).count(), 4);
 
@@ -971,7 +1070,10 @@ mod tests {
         assert_eq!(p.reasoning_levels, Some(vec!["low".into(), "high".into()]));
         // 重载后仍在
         let data = load(&path);
-        assert_eq!(data.providers[0].reasoning_levels, Some(vec!["low".into(), "high".into()]));
+        assert_eq!(
+            data.providers[0].reasoning_levels,
+            Some(vec!["low".into(), "high".into()])
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -992,11 +1094,17 @@ mod tests {
         let mut set = sample_input("RLU3", AccessMode::Official);
         set.reasoning_levels = Some(vec!["medium".into(), "high".into()]);
         let p3 = update(&path, &p.id, set).expect("update-set");
-        assert_eq!(p3.reasoning_levels, Some(vec!["medium".into(), "high".into()]));
+        assert_eq!(
+            p3.reasoning_levels,
+            Some(vec!["medium".into(), "high".into()])
+        );
 
         // 持久化后仍在
         let data = load(&path);
-        assert_eq!(data.providers[0].reasoning_levels, Some(vec!["medium".into(), "high".into()]));
+        assert_eq!(
+            data.providers[0].reasoning_levels,
+            Some(vec!["medium".into(), "high".into()])
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1028,10 +1136,16 @@ mod tests {
             "reasoning_levels": [" low ", " ", "medium", ""],
             "reasoningLevels": ["high"]
         });
-        assert_eq!(value_to_input(&body).reasoning_levels, Some(vec!["high".into()]));
+        assert_eq!(
+            value_to_input(&body).reasoning_levels,
+            Some(vec!["high".into()])
+        );
         // 仅 snake_case：trim + 去空
         let body2 = json!({"name":"Y","model":"m","reasoning_levels":[" low ",""," high ","  "]});
-        assert_eq!(value_to_input(&body2).reasoning_levels, Some(vec!["low".into(), "high".into()]));
+        assert_eq!(
+            value_to_input(&body2).reasoning_levels,
+            Some(vec!["low".into(), "high".into()])
+        );
     }
 
     #[test]
@@ -1102,14 +1216,35 @@ mod tests {
     #[test]
     fn value_to_input_and_update_normalize_agent() {
         // 缺省 / 空 / 非法(白名单外)→ codex;白名单内 → 原样(codex / claude / gemini)
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m"})).agent, "codex");
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":""})).agent, "codex");
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"codex"})).agent, "codex");
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"  Claude  "})).agent, "claude");
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"CLAUDE"})).agent, "claude");
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m"})).agent,
+            "codex"
+        );
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","agent":""})).agent,
+            "codex"
+        );
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","agent":"codex"})).agent,
+            "codex"
+        );
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","agent":"  Claude  "})).agent,
+            "claude"
+        );
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","agent":"CLAUDE"})).agent,
+            "claude"
+        );
         // gemini(多平台阶段 C 白名单扩容)原样保留;未知(白名单外)→ codex
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"gemini"})).agent, "gemini");
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"grok"})).agent, "codex");
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","agent":"gemini"})).agent,
+            "gemini"
+        );
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","agent":"grok"})).agent,
+            "codex"
+        );
         // update 对缺省 agent 输入归一化为 codex
         let path = tmp_path("agent_update");
         let mut i = sample_input("AU", AccessMode::Official);
@@ -1143,14 +1278,26 @@ mod tests {
         set_active(&path, &p_c.id); // 全局 active 是 codex
 
         // active 归属 codex → codex 路径取 p_c
-        assert_eq!(get_provider_for_agent(&path, "codex").map(|p| p.id), Some(p_c.id.clone()));
+        assert_eq!(
+            get_provider_for_agent(&path, "codex").map(|p| p.id),
+            Some(p_c.id.clone())
+        );
         // claude 路径:active 不是 claude → 取 claude 中 sort 首个(p1)
-        assert_eq!(get_provider_for_agent(&path, "claude").map(|p| p.id), Some(p1.id.clone()));
+        assert_eq!(
+            get_provider_for_agent(&path, "claude").map(|p| p.id),
+            Some(p1.id.clone())
+        );
 
         // 切 active 到 claude2 → claude 路径取 p2(active 优先),codex 路径仍取 p_c(active 归属 claude → 取 codex 首个)
         set_active(&path, &p2.id);
-        assert_eq!(get_provider_for_agent(&path, "claude").map(|p| p.id), Some(p2.id.clone()));
-        assert_eq!(get_provider_for_agent(&path, "codex").map(|p| p.id), Some(p_c.id.clone()));
+        assert_eq!(
+            get_provider_for_agent(&path, "claude").map(|p| p.id),
+            Some(p2.id.clone())
+        );
+        assert_eq!(
+            get_provider_for_agent(&path, "codex").map(|p| p.id),
+            Some(p_c.id.clone())
+        );
 
         // 无该 agent → None
         let empty = tmp_path("agent_select_empty");
@@ -1163,10 +1310,18 @@ mod tests {
 
     #[test]
     fn wire_api_parses_anthropic_aliases() {
-        assert!(matches!(WireApi::parse("anthropic"), Some(WireApi::Anthropic)));
-        assert!(matches!(WireApi::parse("Messages"), Some(WireApi::Anthropic)));
-        assert!(matches!(WireApi::parse("responses"), Some(WireApi::Responses)));
+        assert!(matches!(
+            WireApi::parse("anthropic"),
+            Some(WireApi::Anthropic)
+        ));
+        assert!(matches!(
+            WireApi::parse("Messages"),
+            Some(WireApi::Anthropic)
+        ));
+        assert!(matches!(
+            WireApi::parse("responses"),
+            Some(WireApi::Responses)
+        ));
         assert!(WireApi::parse("grpc").is_none());
     }
-
 }

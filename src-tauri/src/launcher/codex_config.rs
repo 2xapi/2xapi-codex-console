@@ -1,6 +1,6 @@
 //! 独立 CODEX_HOME 的 config.toml 生成(env_key 模式,方案 v2 §6.4)。
 
-use std::path::PathBuf;
+use std::path::Path;
 
 /// TOML 双引号字符串转义。
 fn toml_str(s: &str) -> String {
@@ -8,7 +8,12 @@ fn toml_str(s: &str) -> String {
 }
 
 /// 写 config.toml(env_key 指向环境变量;key 本身不落盘)。
-pub(crate) fn write(temp_dir: &PathBuf, base_url: &str, model: &str, wire_api: &str) -> Result<(), String> {
+pub(crate) fn write(
+    temp_dir: &Path,
+    base_url: &str,
+    model: &str,
+    wire_api: &str,
+) -> Result<(), String> {
     let cfg = format!(
         "model_provider = \"custom\"\nmodel = {}\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = {}\nwire_api = \"{}\"\nenv_key = \"{}\"\nrequires_openai_auth = false\n",
         toml_str(model),
@@ -16,7 +21,8 @@ pub(crate) fn write(temp_dir: &PathBuf, base_url: &str, model: &str, wire_api: &
         wire_api,
         crate::launcher::ENV_KEY_NAME,
     );
-    std::fs::write(temp_dir.join("config.toml"), cfg).map_err(|e| format!("写 config.toml 失败: {e}"))
+    std::fs::write(temp_dir.join("config.toml"), cfg)
+        .map_err(|e| format!("写 config.toml 失败: {e}"))
 }
 
 #[cfg(test)]
