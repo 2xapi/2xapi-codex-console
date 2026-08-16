@@ -73,7 +73,7 @@ fn builtin_default(codex_home: &Path) -> AccLines {
             id: "test-1".into(),
             name: "测试线路".into(),
             endpoint: "http://156.238.251.207:443".into(),
-            scope: vec!["2xa.cc.cd".into()],
+            scope: vec!["*".into()], // 通用线:官方加速不限供应商(2026-08-16 用户定稿)
             priority: 1,
             enabled: true,
             credential: load_credentials(codex_home),
@@ -240,6 +240,9 @@ fn host_matches(host: &str, scope: &str) -> bool {
     let s = scope.trim().trim_start_matches('.').to_ascii_lowercase();
     if s.is_empty() {
         return false;
+    }
+    if s == "*" {
+        return true; // 通用线:不限供应商
     }
     host == s || host.ends_with(&format!(".{s}")) || host.contains(&s)
 }
@@ -433,6 +436,19 @@ mod tests {
             line("b", "http://x:2", &["other.com"], 2, true),
         ];
         assert_eq!(match_line("https://api.2xa.cc.cd:443", &lines).unwrap().id, "a", "host 命中 scope");
+
+    #[test]
+    fn wildcard_scope_matches_any_provider() {
+        // 通用线(官方加速不限供应商,2026-08-16 用户定稿):scope="*" 对任意 base_url 命中
+        let lines = vec![line("u1", "http://x:1", &["*"], 1, true)];
+        for url in ["https://2xapi.cc.cd", "https://api.deepseek.example.com/v1", "https://opencode.ai/zen/go/v1"] {
+            assert_eq!(match_line(url, &lines).unwrap().id, "u1", "通配命中 {url}");
+        }
+        // 既有语义不受影响:具体域名 scope 仍按域匹配
+        let scoped = vec![line("s1", "http://x:2", &["2xa.cc.cd"], 1, true)];
+        assert!(match_line("https://other.example.com", &scoped).is_none(), "非通配仍不命中他域");
+    }
+
         assert!(match_line("https://openai.com", &lines).is_none(), "未命中 → None");
         // scheme/端口/路径不影响 host 解析
         assert_eq!(match_line("http://api.2xa.cc.cd/v1/chat", &lines).unwrap().id, "a");
@@ -509,7 +525,7 @@ mod tests {
         let t = builtin_default(&home);
         assert_eq!(t.lines.len(), 1);
         assert_eq!(t.lines[0].id, "test-1");
-        assert_eq!(t.lines[0].scope, vec!["2xa.cc.cd".to_string()]);
+        assert_eq!(t.lines[0].scope, vec!["*".to_string()]);
         assert_eq!(t.lines[0].endpoint, "http://156.238.251.207:443");
         assert_eq!(t.lines[0].credential.as_ref().unwrap().user, "u");
         let _ = std::fs::remove_dir_all(&home);
@@ -526,7 +542,7 @@ mod tests {
                     id: "test-1".into(),
                     name: "测试线路".into(),
                     endpoint: "http://new:1".into(),
-                    scope: vec!["2xa.cc.cd".into()],
+                    scope: vec!["*".into()], // 通用线:官方加速不限供应商(2026-08-16 用户定稿)
                     priority: 1,
                     enabled: true,
                     credential: None,
