@@ -1712,7 +1712,7 @@ async fn handle_launcher_status(State(s): State<Arc<AppState>>) -> Response {
 fn eco_store_for(
     s: &AppState,
     agent: &str,
-) -> Result<Box<dyn crate::agents::eco::EcoStore>, Response> {
+) -> Result<Box<dyn crate::agents::eco::EcoStore>, Box<Response>> {
     match crate::agents::eco::supported(agent) {
         Some("codex") => Ok(Box::new(crate::agents::eco::codex::TomlStore::new(&s.config_path))),
         Some("cursor") => Ok(Box::new(crate::agents::eco::cursor::JsonStore::new(&s.cursor_home))),
@@ -1720,7 +1720,8 @@ fn eco_store_for(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "E_ECO_UNKNOWN_AGENT", "message": format!("「{agent}」暂未支持生态管理") })),
         )
-            .into_response()),
+            .into_response()
+            .into()), // Box:Response 过大,clippy result_large_err
     }
 }
 
@@ -1742,7 +1743,7 @@ async fn handle_agent_eco(
 ) -> Response {
     let store = match eco_store_for(&s, &agent) {
         Ok(st) => st,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     eco_op_response(crate::agents::eco::list(store.as_ref(), &s.codex_home))
 }
@@ -1755,7 +1756,7 @@ async fn handle_agent_eco_op(
 ) -> Response {
     let store = match eco_store_for(&s, &agent) {
         Ok(st) => st,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let op = body
         .get("op")

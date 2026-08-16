@@ -50,42 +50,44 @@ pub fn unhost(grok_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
     crate::grok_config::unhost(&config_path(grok_home), backup_dir)
 }
 
-/// 生成启动命令(对齐 gemini/workbuddy 的 start 形态;前端「⌘ 生成启动命令」按钮)。
-/// Grok 与 gemini(env 注入式)不同:CLI 唯一配置入口即 ~/.grok/config.toml,托管态
-/// 下直接运行 `grok` 即走网关——命令本体无需 env 前缀,真实 Key 只在网关(零 Key 契约)。
-/// 非交互单发可用 `grok -p "<提示词>"`(真机 e2e 实证走 /grokbuild/responses 通路)。
-pub fn start(
-    providers_path: &Path,
-    way: &str,
-    provider_id: &str,
-    grok_home: &Path,
-) -> Result<Value, OpError> {
-    if state(grok_home)["hosting"].is_null() {
-        return Err((409, "E_NOT_HOSTED".into(), "请先托管,再启动".into()));
-    }
-    let p = if !provider_id.trim().is_empty() {
-        find_provider(providers_path, provider_id)?
-    } else {
-        crate::providers::get_provider_for_agent(providers_path, "grokbuild").ok_or((
-            503u16,
-            "E_NO_GROK_PROVIDER".to_string(),
-            "请先选择 Grok Build 供应商".to_string(),
-        ))?
-    };
-    Ok(json!({
-        "command": "grok",
-        "way": way,
-        "providerId": p.id,
-        "providerName": p.name,
-        "model": p.model,
-        "hint": "托管配置已生效,直接运行 grok 即走中转;非交互单发可用:grok -p \"你的问题\"",
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::{AccessMode, ProviderInput, WireApi};
+
+    /// 仅测试使用的旧 start 形态:生产启动走通用 launcher 路径,
+    /// 此处保留 4 个 start 行为测试的被测对象(2026-08-17 后端开发部裁决)。
+    /// 生成启动命令(对齐 gemini/workbuddy 的 start 形态;前端「⌘ 生成启动命令」按钮)。
+    /// Grok 与 gemini(env 注入式)不同:CLI 唯一配置入口即 ~/.grok/config.toml,托管态
+    /// 下直接运行 `grok` 即走网关——命令本体无需 env 前缀,真实 Key 只在网关(零 Key 契约)。
+    /// 非交互单发可用 `grok -p "<提示词>"`(真机 e2e 实证走 /grokbuild/responses 通路)。
+    fn start(
+        providers_path: &Path,
+        way: &str,
+        provider_id: &str,
+        grok_home: &Path,
+    ) -> Result<Value, OpError> {
+        if state(grok_home)["hosting"].is_null() {
+            return Err((409, "E_NOT_HOSTED".into(), "请先托管,再启动".into()));
+        }
+        let p = if !provider_id.trim().is_empty() {
+            find_provider(providers_path, provider_id)?
+        } else {
+            crate::providers::get_provider_for_agent(providers_path, "grokbuild").ok_or((
+                503u16,
+                "E_NO_GROK_PROVIDER".to_string(),
+                "请先选择 Grok Build 供应商".to_string(),
+            ))?
+        };
+        Ok(json!({
+            "command": "grok",
+            "way": way,
+            "providerId": p.id,
+            "providerName": p.name,
+            "model": p.model,
+            "hint": "托管配置已生效,直接运行 grok 即走中转;非交互单发可用:grok -p \"你的问题\"",
+        }))
+    }
 
     fn sandbox(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let root =

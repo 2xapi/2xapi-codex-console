@@ -51,6 +51,7 @@ pub struct SessionItem {
     pub provider_tag: String,
     pub updated_at_ms: i64,
     pub archived: bool,
+    /// 对账缺失标记(repair 写 missing_candidate):API 输出供前端展示「缺失会话」用。
     pub missing: bool,
 }
 
@@ -183,6 +184,7 @@ pub fn list_sessions(codex_home: &Path, page: usize, size: usize, provider: &str
         "items": items.iter().map(|s| json!({
             "id": s.id, "title": s.title, "cwd": s.cwd,
             "providerTag": s.provider_tag, "updatedAt": s.updated_at_ms, "archived": s.archived,
+            "missing": s.missing,
         })).collect::<Vec<_>>(),
         "db": db_path.to_string_lossy(),
     })

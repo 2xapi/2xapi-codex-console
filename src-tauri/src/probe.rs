@@ -142,38 +142,6 @@ async fn try_probe(url: &str, api_key: &str) -> Vec<(String, Option<u64>)> {
     Vec::new()
 }
 
-/// 探测上游支持的 reasoning effort 等级（逐个试 /responses，记录 200 的）。
-pub async fn probe_reasoning_levels(base_url: &str, api_key: &str, model: &str) -> Vec<String> {
-    let base = base_url.trim_end_matches('/');
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .no_proxy()
-        .build()
-        .unwrap_or_default();
-    let candidates = ["low", "medium", "high", "xhigh", "max", "ultra"];
-    let mut supported = Vec::new();
-    for effort in &candidates {
-        for suffix in ["/responses", "/v1/responses"] {
-            let url = format!("{base}{suffix}");
-            let body = serde_json::json!({"model": model, "input": "1", "stream": false, "reasoning": {"effort": effort}, "max_output_tokens": 1});
-            match client
-                .post(&url)
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => {
-                    supported.push(effort.to_string());
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-    supported
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
