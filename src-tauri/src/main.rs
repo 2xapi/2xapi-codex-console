@@ -83,6 +83,17 @@ fn main() {
                 .unwrap_or_default(),
         ),
         grok_home: crate::grok_config::default_grok_home(),
+        oc_home: std::path::PathBuf::from(
+            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .unwrap_or_default(),
+        ),
+        oclaw_home: {
+            let home = std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .unwrap_or_default();
+            std::path::PathBuf::from(home).join(".openclaw")
+        },
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,

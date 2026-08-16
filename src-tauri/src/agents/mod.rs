@@ -10,6 +10,8 @@
 pub mod gemini;
 pub mod grok;
 pub mod hermes;
+pub mod openclaw;
+pub mod opencode;
 pub mod workbuddy;
 
 use serde_json::{json, Value};
@@ -78,7 +80,8 @@ static REGISTRY: &[AgentMeta] = &[
         id: "opencode",
         name: "OpenCode",
         tip: "OpenCode(即将上线)",
-        available: false,
+        // adapter 已并入(叠加写 opencode.json,侦察实证全闭环);前端世界批次交付时 frontend_ready 翻 true
+        available: true,
         frontend_ready: false,
         egress: "chat",
         hosting: "config",
@@ -87,7 +90,8 @@ static REGISTRY: &[AgentMeta] = &[
         id: "openclaw",
         name: "OpenClaw",
         tip: "OpenClaw(即将上线)",
-        available: false,
+        // adapter 已并入(叠加写 openclaw.json,JSON5 含注释时拒绝写入并提示);前端批次交付时翻
+        available: true,
         frontend_ready: false,
         egress: "anthropic",
         hosting: "config",
@@ -183,7 +187,7 @@ mod tests {
     fn supported_ids_are_backend_merged() {
         assert_eq!(
             supported_ids(),
-            vec!["codex", "claude", "gemini", "grokbuild", "hermes", "workbuddy"]
+            vec!["codex", "claude", "gemini", "grokbuild", "opencode", "openclaw", "hermes", "workbuddy"]
         );
     }
 

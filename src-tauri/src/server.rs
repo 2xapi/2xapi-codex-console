@@ -46,6 +46,10 @@ pub struct AppState {
     pub gem_home: PathBuf,
     /// grok 配置根(~/.grok;adapter 内 join("config.toml");测试传 tempdir)。
     pub grok_home: PathBuf,
+    /// opencode 载体根(HOME;adapter 内 join(".config/opencode/opencode.json");测试传 tempdir)。
+    pub oc_home: PathBuf,
+    /// openclaw 配置根(~/.openclaw;adapter 内 join("openclaw.json");测试传 tempdir)。
+    pub oclaw_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -76,6 +80,11 @@ pub fn build_router(state: AppState) -> Router {
         // --- 网关代理 /hermes/*（Hermes 接入;hermes 条目 base_url=网关+/hermes,SDK 追加 /chat/completions）---
         .route("/hermes/v1/chat/completions", post(crate::gateway::proxy_hermes_chat))
         .route("/hermes/chat/completions", post(crate::gateway::proxy_hermes_chat))
+        // OpenCode/OpenClaw 入口(多平台 B 阶段收尾;条目 baseURL=网关+/{agent}/v1)
+        .route("/opencode/v1/chat/completions", post(crate::gateway::proxy_opencode_chat))
+        .route("/opencode/chat/completions", post(crate::gateway::proxy_opencode_chat))
+        .route("/openclaw/v1/chat/completions", post(crate::gateway::proxy_openclaw_chat))
+        .route("/openclaw/chat/completions", post(crate::gateway::proxy_openclaw_chat))
         // Gemini 入口(多平台阶段 C):段内冒号无特殊含义,`gemini-2.5-flash:generateContent` 整段捕获
         .route("/v1beta/models/:model_action", post(crate::gateway::proxy_gemini))
         // --- Health & session ---
@@ -932,6 +941,8 @@ mod tests {
             hermes_home: PathBuf::from("/tmp/2xapi-m0-hermes-home"),
             gem_home: PathBuf::from("/tmp/2xapi-m0-gem-home"),
             grok_home: PathBuf::from("/tmp/2xapi-m0-grok-home"),
+            oc_home: PathBuf::from("/tmp/2xapi-m0-oc-home"),
+            oclaw_home: PathBuf::from("/tmp/2xapi-m0-oclaw-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1137,9 +1148,11 @@ mod tests {
             .unwrap();
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
+        // 501 样本须选「恒未实现」平台:B 阶段八平台已全部接入,唯一剩 claude-desktop(D 阶段);
+        // 它实现时须同步换样本(教训:gemini/grokbuild/opencode 样本先后被实现打烂过三次)
         let soon = app
             .clone()
-            .oneshot(Request::builder().uri("/api/desktop/opencode/state").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/api/desktop/claude-desktop/state").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(soon.status(), StatusCode::NOT_IMPLEMENTED);
@@ -1225,6 +1238,8 @@ mod tests {
             hermes_home: root.join("hermes"),
             gem_home: root.clone(),
             grok_home: root.join("grok"),
+            oc_home: root.join("ochome"),
+            oclaw_home: root.join("oclaw"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1301,6 +1316,111 @@ mod tests {
         assert_eq!(un.status(), StatusCode::OK);
         let uv = body_json(un).await;
         assert!(uv["data"]["restored"].is_boolean(), "unhost 应返回 restored 字段:{uv}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// opencode 泛化路由 e2e:建供应商 → host 叠加写 opencode.json(指针缺失才切,D1) → state → unhost 还原(隔离 oc_home)
+    #[tokio::test]
+    async fn opencode_routes_e2e() {
+        let (state, root) = unique_state("oc-e2e");
+        let app = build_router(state.clone());
+        let created = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/providers")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"OcT","agent":"opencode","baseUrl":"https://oc.example.com","apiKey":"sk-oc-test","model":"gpt-5.6-sol"}"#)).unwrap(),
+        ).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let cv = body_json(created).await;
+        let pid = cv["data"]["id"].as_str().unwrap().to_string();
+
+        let hosted = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/desktop/opencode/host")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"providerId": pid, "way": "gateway"}).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(hosted.status(), StatusCode::OK);
+        let hv = body_json(hosted).await;
+        assert_eq!(hv["data"]["hosted"], Value::Bool(true));
+        assert_eq!(hv["data"]["defaultModelSwitched"], Value::Bool(true), "指针缺失时应切");
+
+        // 已有第三方指针时再 host:不切指针,suggested=true(D1)
+        let raw = std::fs::read_to_string(root.join("ochome/.config/opencode/opencode.json")).unwrap();
+        let mut j: Value = serde_json::from_str(&raw).unwrap();
+        j["model"] = json!("custom/gpt-4o");
+        std::fs::write(root.join("ochome/.config/opencode/opencode.json"), serde_json::to_string(&j).unwrap()).unwrap();
+        let rehost = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/desktop/opencode/host")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"providerId": pid, "way": "gateway"}).to_string())).unwrap(),
+        ).await.unwrap();
+        let rv = body_json(rehost).await;
+        assert_eq!(rv["data"]["suggested"], Value::Bool(true), "已有指针不动(D1)");
+
+        let st = app.clone().oneshot(
+            Request::builder().uri("/api/desktop/opencode/state").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        let sv = body_json(st).await;
+        assert!(sv["data"]["hosting"].is_object(), "host 后 state.hosting 非空");
+
+        let un = app.oneshot(
+            Request::builder().method("POST").uri("/api/desktop/opencode/unhost").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        let uv = body_json(un).await;
+        assert_eq!(uv["data"]["restored"], Value::Bool(true));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// openclaw 泛化路由 e2e:建供应商 → host 叠加写 openclaw.json → state → unhost;JSON5(注释)文件拒绝写入
+    #[tokio::test]
+    async fn openclaw_routes_e2e() {
+        let (state, root) = unique_state("oclaw-e2e");
+        let app = build_router(state.clone());
+        let created = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/providers")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"ClawT","agent":"openclaw","baseUrl":"https://claw.example.com","apiKey":"sk-claw-test","model":"claude-opus-4"}"#)).unwrap(),
+        ).await.unwrap();
+        let cv = body_json(created).await;
+        let pid = cv["data"]["id"].as_str().unwrap().to_string();
+
+        let hosted = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/desktop/openclaw/host")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"providerId": pid, "way": "gateway"}).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(hosted.status(), StatusCode::OK);
+        let hv = body_json(hosted).await;
+        assert_eq!(hv["data"]["hosted"], Value::Bool(true));
+
+        let raw = std::fs::read_to_string(root.join("oclaw/openclaw.json")).unwrap();
+        let j: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(j["models"]["providers"]["2xapi-gateway"]["api"], json!("openai-completions"));
+        assert!(j["agents"]["defaults"]["model"].as_str().unwrap().starts_with("2xapi-gateway/"));
+
+        let st = app.clone().oneshot(
+            Request::builder().uri("/api/desktop/openclaw/state").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        let sv = body_json(st).await;
+        assert!(sv["data"]["hosting"].is_object());
+
+        let un = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/desktop/openclaw/unhost").body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        let uv = body_json(un).await;
+        assert_eq!(uv["data"]["restored"], Value::Bool(true));
+
+        // JSON5 边界:含注释的既有文件拒绝写入(E_CONFIG_JSON5)
+        std::fs::create_dir_all(root.join("oclaw2")).unwrap();
+        std::fs::write(root.join("oclaw2/openclaw.json"), "{\n  // my config\n}").unwrap();
+        let mut s2 = state.clone();
+        s2.oclaw_home = root.join("oclaw2");
+        let app2 = build_router(s2);
+        let rejected = app2.oneshot(
+            Request::builder().method("POST").uri("/api/desktop/openclaw/host")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"providerId": pid, "way": "gateway"}).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2123,6 +2243,8 @@ async fn handle_agent_state(
         "hermes" => ok_env(crate::agents::hermes::detect_state(&s.hermes_home.join("config.yaml"))),
         "gemini" => ok_env(crate::agents::gemini::state(&s.gem_home)),
         "grokbuild" => ok_env(crate::agents::grok::state(&s.grok_home)),
+        "opencode" => ok_env(crate::agents::opencode::state(&s.oc_home)),
+        "openclaw" => ok_env(crate::agents::openclaw::state(&s.oclaw_home)),
         _ => agent_unsupported_response(),
     }
 }
@@ -2158,6 +2280,16 @@ async fn handle_agent_host(
             body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
             body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
         )),
+        "opencode" => agent_op_response(crate::agents::opencode::host(
+            &s.oc_home, &s.backup_dir, &s.providers_path,
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
+        )),
+        "openclaw" => agent_op_response(crate::agents::openclaw::host(
+            &s.oclaw_home, &s.backup_dir, &s.providers_path,
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -2178,6 +2310,8 @@ async fn handle_agent_unhost(
         )),
         "gemini" => agent_op_response(crate::agents::gemini::unhost(&s.gem_home, &s.backup_dir)),
         "grokbuild" => agent_op_response(crate::agents::grok::unhost(&s.grok_home, &s.backup_dir)),
+        "opencode" => agent_op_response(crate::agents::opencode::unhost(&s.oc_home, &s.backup_dir)),
+        "openclaw" => agent_op_response(crate::agents::openclaw::unhost(&s.oclaw_home, &s.backup_dir)),
         _ => agent_unsupported_response(),
     }
 }
