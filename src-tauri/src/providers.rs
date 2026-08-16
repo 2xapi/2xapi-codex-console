@@ -49,12 +49,13 @@ impl<'de> Deserialize<'de> for AccessMode {
     }
 }
 
-/// 上游协议：序列化 `"responses"`/`"chat_completions"`；反序列化兼容 `"chat"` 等。
+/// 上游协议：序列化 `"responses"`/`"chat_completions"`/`"anthropic"`；反序列化兼容 `"chat"`/`"messages"` 等。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireApi {
     Responses,
     ChatCompletions,
+    Anthropic,
 }
 
 impl Default for WireApi {
@@ -68,6 +69,7 @@ impl WireApi {
         match s.trim().to_ascii_lowercase().as_str() {
             "responses" => Some(Self::Responses),
             "chat_completions" | "chatcompletions" | "chat" => Some(Self::ChatCompletions),
+            "anthropic" | "messages" => Some(Self::Anthropic),
             _ => None,
         }
     }
@@ -1152,4 +1154,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&empty);
     }
+
+    #[test]
+    fn wire_api_parses_anthropic_aliases() {
+        assert!(matches!(WireApi::parse("anthropic"), Some(WireApi::Anthropic)));
+        assert!(matches!(WireApi::parse("Messages"), Some(WireApi::Anthropic)));
+        assert!(matches!(WireApi::parse("responses"), Some(WireApi::Responses)));
+        assert!(WireApi::parse("grpc").is_none());
+    }
+
 }

@@ -57,11 +57,16 @@
         <div class="f" style="grid-column:1/-1"><label>上游地址 *</label><input class="mono" id="eUrl"></div>
         <div class="f" style="grid-column:1/-1"><label>api key · 留空不修改</label><input type="password" class="mono" id="eKey" placeholder="sk-..."></div>
         <div class="f"><label>默认模型 *</label><input class="mono" id="eModel" placeholder="点「拉取模型」后自动填入"></div>
-        <div class="f"><label>协议(默认自动)</label><select id="eWire"><option>自动</option></select></div>
+        <div class="f"><label>协议</label><select id="eWire">
+          <option value="auto">自动(探测上游)</option>
+          <option value="responses">Responses</option>
+          <option value="chat_completions">ChatCompletions</option>
+          <option value="anthropic">Messages(Anthropic)</option>
+        </select></div>
       </div>
       <table class="mtable"><thead><tr><th>模型名</th><th>上下文</th><th></th></tr></thead><tbody id="modelRows"></tbody></table>
       <div class="btn-row" style="margin-top:8px"><button class="btn ghost" data-a="mfetch">⤓ 拉取模型</button><button class="btn ghost" data-a="mrow-add">＋ 手动加一行</button></div>
-      <details style="margin-top:8px"><summary class="eyebrow" style="cursor:pointer">高级(代理 · 超时 · 备注)· 不用动</summary><div class="sub" style="margin-top:6px">协议默认自动;上游兼容 Responses / ChatCompletions 时自动转换,无需手动配置。</div></details>
+      <details style="margin-top:8px"><summary class="eyebrow" style="cursor:pointer">高级(代理 · 超时 · 备注)· 不用动</summary><div class="sub" style="margin-top:6px">协议默认自动(拉取模型时探测回写);上游兼容 Responses / ChatCompletions 时网关自动转换;Messages 供 Claude 供应商使用。</div></details>
     </div>
     <div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="edit-save">保存</button><button class="btn ghost" data-a="close-edit">取消</button></div>
   </div>
