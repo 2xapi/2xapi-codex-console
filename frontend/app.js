@@ -237,7 +237,13 @@ function railRowsHtml() {
   return list.map(function (p) {
     var i = mine.indexOf(p);
     return '<button class="line-row ' + (p.id === state.selId ? "sel" : "") + '" style="--lc:' + chipColor(p, i) + '" data-a="sel" data-id="' + esc(p.id) + '">'
-      + '<span class="line-chip">' + esc(p.icon || String(i + 1)) + '</span><span class="nm">' + esc(p.name) + '</span>'
+      + (function () {
+          var pre = (window.PRESETS || []).find(function (x) { return x.id === (p.icon || "") });
+          return pre
+            ? '<span class="line-chip logo"><img src="' + esc(pre.logo) + '" alt=""></span>'
+            : '<span class="line-chip">' + esc(p.icon || String(i + 1)) + '</span>';
+        })()
+      + '<span class="nm">' + esc(p.name) + '</span>'
       + (hostedBy(p.id) ? '<span class="tag on">托管中</span>' : '')
       + '<span class="mini-op" data-a="edit" data-id="' + esc(p.id) + '" title="编辑">✎</span></button>';
   }).join("");
@@ -882,6 +888,7 @@ function applyPreset(pid) {
   state.edit.name = p.name;
   state.edit.baseUrl = p.baseUrl || "";
   state.edit.iconColor = p.iconColor || null;
+  state.edit.icon = p.id;
   document.getElementById("eName").value = p.name;
   document.getElementById("eUrl").value = p.baseUrl || "";
   /* 协议保持「自动」:网关自动转译+拉取模型时探测回写,不预填 */
@@ -896,8 +903,8 @@ function openEdit(id) {
   var isH = state.agent === "hermes";
   var defWire = isC ? "anthropic" : (isH ? "chat_completions" : "responses");
   state.edit = p
-    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, models: (p.models || []).map(normModel) }
-    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, models: [] };
+    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, icon: p.icon || null, iconColor: p.iconColor || null, models: (p.models || []).map(normModel) }
+    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, icon: null, iconColor: null, models: [] };
   state.fieldErrors = {};
   document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + (isC ? "Claude" : (isH ? "Hermes" : "Codex"));
   document.getElementById("eName").value = state.edit.name;
@@ -949,6 +956,7 @@ async function doSaveEdit() {
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
     wireApi: (function () { var w = document.getElementById("eWire"); var v = w ? w.value : "auto"; return v === "auto" ? state.edit.wireApi : v; })(), models: models,
     proxyUrl: "", timeoutSecs: null, notes: "", reasoning_levels: [],
+    icon: state.edit.icon || null,
     iconColor: state.edit.iconColor || null,
     agent: state.agent,
   };
