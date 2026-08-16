@@ -615,7 +615,7 @@ function diagCard(d) {
 /* ── 通用平台世界(「全部做好」批次):gemini/grokbuild/opencode/openclaw/claude-desktop/workbuddy
  * 共享一个数据驱动的世界视图;后端契约=泛化路由 state/host/unhost(叠加或受控段托管,按 adapter 语义)。── */
 var GW_META = {
-  "gemini":       { label: "Gemini CLI", emoji: "✦", gw: "127.0.0.1:8787(生成协议转换)", overlay: "托管写入 ~/.gemini(.env 占位 Key + 认证类型),还原恢复快照;启动可注入进程环境变量", start: true },
+  "gemini":       { label: "Gemini CLI", emoji: "✦", gw: "127.0.0.1:8787(生成协议转换)", overlay: "托管写入 ~/.gemini(.env 占位 Key + 认证类型),还原恢复快照;当前版本仅文本与工具调用(图片/文件会明确报错);需已安装 gemini CLI(npm i -g @google/gemini-cli)", start: true },
   "grokbuild":    { label: "Grok Build", emoji: "𝕏", gw: "127.0.0.1:8787/grokbuild", overlay: "受控段写入 ~/.grok/config.toml([models]/[model.*]),已有其他段零触碰;还原按快照受控恢复" },
   "opencode":     { label: "OpenCode", emoji: "◐", gw: "127.0.0.1:8787/opencode", overlay: "叠加条目写入 opencode.json(provider.2xapi-gateway),已有供应商与插件零触碰;默认模型仅空缺时才接" },
   "openclaw":     { label: "OpenClaw", emoji: "🐾", gw: "127.0.0.1:8787/openclaw", overlay: "叠加条目写入 openclaw.json(models.providers),OpenClaw 自管理的派生注册表不碰;默认模型仅空缺时才接" },
@@ -1534,6 +1534,14 @@ document.addEventListener("click", function (ev) {
       if (state.confirmCb) { var cb = state.confirmCb; state.confirmCb = null; cb(true); }
       break;
     case "confirm-no": closeConfirm(); break;
+    case "host": {
+      /* 通用平台世界(genericDashHtml 按钮):确认后走泛化路由 host(固定 gateway 通路) */
+      var m = GW_META[state.agent] || {};
+      askConfirm("开启托管?", (m.label || state.agent) + " 将写入托管配置(" + (m.overlay || "指向本机网关") + ");已有配置零触碰;操作前自动备份。").then(function (yes) {
+        if (yes) doHost(t.dataset.id || state.selId, "gateway");
+      });
+      break;
+    }
     case "host-on": {
       if (state.agent === "hermes") {
         askConfirm("开启托管?", "Hermes 将写入叠加条目 2xapi-gateway(指向本机网关),已有配置零触碰;操作前自动备份。").then(function (yes) {
@@ -1552,6 +1560,13 @@ document.addEventListener("click", function (ev) {
     case "unhost":
       if (state.agent === "hermes") {
         askConfirm("还原官方?", "移除写入 ~/.hermes/config.yaml 的叠加条目并恢复模型指针;操作前自动备份。").then(function (yes) {
+          if (yes) doUnhost();
+        });
+        break;
+      }
+      if (GW_AGENTS[state.agent]) {
+        var mu = GW_META[state.agent] || {};
+        askConfirm("还原官方?", "移除本软件为 " + (mu.label || state.agent) + " 写入的托管内容并恢复快照;操作前自动备份。").then(function (yes) {
           if (yes) doUnhost();
         });
         break;

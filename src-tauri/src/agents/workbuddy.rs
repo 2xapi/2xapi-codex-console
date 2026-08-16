@@ -195,6 +195,8 @@ pub fn state(wb_home: &Path) -> Value {
         .iter().any(|p| Path::new(p).exists());
     json!({
         "agent": "workbuddy",
+        // hosting 契约对齐 B 阶段通用世界(grokbuild/opencode 等:{…}|null);hosted 保留兼容
+        "hosting": if hosted_any { json!({ "way": "gateway", "entryId": VENDOR }) } else { Value::Null },
         "hosted": hosted_any,
         "entries": Value::Object(entries),
         "installed": { "cli": cli_installed, "desktop": desktop_installed },
@@ -376,6 +378,7 @@ mod tests {
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         let s1 = state(&home);
         assert_eq!(s1["hosted"], json!(true));
+        assert_eq!(s1["hosting"]["way"], "gateway", "通用世界前端读 hosting 判定托管态");
         assert_eq!(s1["entries"]["desktop"]["ours"], 1);
     }
 
