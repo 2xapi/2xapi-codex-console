@@ -68,6 +68,7 @@ pub fn build_router(state: AppState) -> Router {
         // --- Health & session ---
         .route("/api/health", get(handle_health))
         .route("/api/session", get(handle_session))
+        .route("/api/open-url", post(handle_open_url))
         // --- Auth ---
         .route("/api/auth/captcha", get(handle_auth_captcha))
         .route("/api/auth/login", post(handle_auth_login))
@@ -244,6 +245,25 @@ async fn handle_gateway_health(State(s): State<Arc<AppState>>) -> Response {
         "active_provider_id": active_id,
         "access_mode": access_mode,
     }))
+}
+
+/// POST /api/open-url {url} —— 用系统默认浏览器打开外部链接(官网等)。
+/// 仅允许 http(s)(防 file:// 等协议);CSP 下 window.open 不会走系统浏览器,故经后端。
+async fn handle_open_url(Json(body): Json<Value>) -> Response {
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": "仅支持 http(s) 链接" }))).into_response();
+    }
+    #[cfg(target_os = "macos")]
+    let cmd = ("open", vec![url.clone()]);
+    #[cfg(target_os = "windows")]
+    let cmd = ("cmd", vec!["/C".into(), "start".into(), "".into(), url.clone()]);
+    #[cfg(target_os = "linux")]
+    let cmd = ("xdg-open", vec![url.clone()]);
+    match std::process::Command::new(cmd.0).args(&cmd.1).spawn() {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "ok": false, "error": format!("打开失败: {e}") }))).into_response(),
+    }
 }
 
 async fn handle_session(State(s): State<Arc<AppState>>) -> Response {

@@ -257,7 +257,13 @@ function renderTopAuth() {
   else if (bal == null) balHtml = '余额 <b>…</b>';
   else if (bal < 1) balHtml = '余额 <b style="color:var(--c-err)">$' + bal.toFixed(2) + '</b>';
   else balHtml = '余额 <b style="color:var(--c-official)">$' + bal.toFixed(2) + '</b>';
-  el.innerHTML = '<div class="userbox">'
+  var topBal = "";
+  if (state.balShow) {
+    var v = (bal == null) ? "…" : "$" + bal.toFixed(2);
+    var col = (bal != null && bal < 1) ? "var(--c-err)" : "var(--c-official)";
+    topBal = '<span class="chip" title="2xapi 账号余额(设置→账号 可关)" style="margin-right:6px">余额 <b style="color:' + col + '">' + v + '</b></span>';
+  }
+  el.innerHTML = topBal + '<div class="userbox">'
     + '<button class="avatar" data-a="user-menu" title="账号菜单">' + esc(initial) + '</button>'
     + (state.menuOpen
       ? '<div class="user-menu">'
@@ -1244,7 +1250,10 @@ document.addEventListener("click", function (ev) {
     case "do-login": doLogin(); break;
     case "login-close": document.getElementById("loginMask").style.display = "none"; break;
     case "logout": doLogout(); break;
-    case "site": showToast("2xapi 官网:请在浏览器打开 https://2xa.cc.cd", "ok"); break;
+    case "site":
+      api.openUrl("https://2xa.cc.cd").then(function () { showToast("已在浏览器打开 2xapi 官网", "ok"); })
+        .catch(function (e) { showToast("打开失败,请手动访问 https://2xa.cc.cd(" + e.message + ")", "error"); });
+      break;
     case "import-keys": openImport(); break;
     case "imp-close": document.getElementById("impMask").style.display = "none"; state.importBusy = false; break;
     case "imp-do": doImport(); break;
