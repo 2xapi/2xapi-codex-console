@@ -54,15 +54,24 @@ fn strip_ours(cfg: &Value) -> (Value, bool) {
     (out, removed)
 }
 
-/// 生成条目(网关模式 url 指向本机网关;direct 指向上游站,拼法对齐 gateway.rs:202)。
+/// 生成条目。**id 必须是真实模型名**(真机缺口修正 2026-08-16:CLI 把条目 id 作为请求的
+/// model 参数,网关与上游按模型名路由——网关 dispatch 原样转发 model,固定 id 会让上游
+/// 收到未知模型名返回空流);本产品身份由 vendor=2xapi-gateway 标记(unhost 按 vendor
+/// 整集移除),x-provider-id 溯源。direct url 拼法(真机实证:2xapi.cc.cd 无 /v1 的 chat
+/// 路径 404,带 /v1 通;与 dispatch_anthropic 同规则——base 已带 /v1 则续接,否则补 /v1)。
 fn build_entry(provider: &crate::providers::Provider, way: &str) -> Value {
     let url = if way == "gateway" {
         GATEWAY_CHAT_URL.to_string()
     } else {
-        format!("{}/chat/completions", provider.base_url.trim_end_matches('/'))
+        let base = provider.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{base}/chat/completions")
+        } else {
+            format!("{base}/v1/chat/completions")
+        }
     };
     json!({
-        "id": VENDOR,
+        "id": provider.model,
         "name": format!("2xapi 网关({})", provider.name),
         "vendor": VENDOR,
         "apiKey": provider.api_key,
@@ -71,6 +80,8 @@ fn build_entry(provider: &crate::providers::Provider, way: &str) -> Value {
         "maxOutputTokens": 16384,
         "supportsToolCall": true,
         "supportsImages": false,
+        // 本产品私有键(x- 前缀,CLI 宽松解析已实证容忍):识别当前托管供应商
+        "x-provider-id": provider.id,
     })
 }
 
@@ -144,9 +155,10 @@ pub fn host(
     Ok(json!({
         "hosted": true,
         "way": way,
-        "entryId": VENDOR,
+        "entryId": provider.model,
+        "entryName": format!("2xapi 网关({})", provider.name),
         "changed": Value::Object(changed),
-        "hint": "叠加平台:模型条目已写入,请在 CodeBuddy/WorkBuddy 模型列表中选择「2xapi 网关」",
+        "hint": "叠加平台:模型条目已写入,请在 CodeBuddy/WorkBuddy 模型列表选择「2xapi 网关」",
     }))
 }
 
@@ -174,20 +186,23 @@ pub fn unhost(wb_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
 pub fn state(wb_home: &Path) -> Value {
     let mut entries = serde_json::Map::new();
     let mut hosted_any = false;
+    let mut provider_id: Option<String> = None;
     for (key, root) in config_roots(wb_home) {
         let p = models_path(&root);
-        let (file_exists, ours) = match read_models(&root) {
+        let (file_exists, ours, pid) = match read_models(&root) {
             Ok(cfg) => {
-                let ours = cfg
+                let mine: Vec<&Value> = cfg
                     .get("models")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter(|m| m.get("vendor").and_then(|v| v.as_str()) == Some(VENDOR)).count())
-                    .unwrap_or(0);
-                (p.exists(), ours)
+                    .map(|a| a.iter().filter(|m| m.get("vendor").and_then(|v| v.as_str()) == Some(VENDOR)).collect())
+                    .unwrap_or_default();
+                let pid = mine.first().and_then(|m| m.get("x-provider-id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                (p.exists(), mine.len(), pid)
             }
-            Err(_) => (p.exists(), 0), // 坏 JSON:文件在但无法确认,不冒充托管态
+            Err(_) => (p.exists(), 0, None), // 坏 JSON:文件在但无法确认,不冒充托管态
         };
         hosted_any = hosted_any || ours > 0;
+        if provider_id.is_none() { provider_id = pid; }
         entries.insert(key.into(), json!({ "file": file_exists, "ours": ours }));
     }
     let cli_installed = which_codebuddy().is_some();
@@ -198,6 +213,7 @@ pub fn state(wb_home: &Path) -> Value {
         // hosting 契约对齐 B 阶段通用世界(grokbuild/opencode 等:{…}|null);hosted 保留兼容
         "hosting": if hosted_any { json!({ "way": "gateway", "entryId": VENDOR }) } else { Value::Null },
         "hosted": hosted_any,
+        "providerId": provider_id,
         "entries": Value::Object(entries),
         "installed": { "cli": cli_installed, "desktop": desktop_installed },
     })
@@ -232,8 +248,9 @@ pub fn start(providers_path: &Path, way: &str, provider_id: &str, wb_home: &Path
         return Err((409u16, "E_NOT_HOSTED".to_string(), "请先托管,再启动".to_string()));
     }
     Ok(json!({
-        "command": format!("codebuddy --model {VENDOR}"),
-        "model": VENDOR,
+        // --model 须用真实模型名(=条目 id,真机实证;见 build_entry 注释)
+        "command": format!("codebuddy --model {}", p.model),
+        "model": p.model,
         "way": way,
         "providerId": p.id,
         "providerName": p.name,
@@ -295,7 +312,8 @@ mod tests {
             let ours = models.iter().find(|m| m["vendor"] == VENDOR).unwrap();
             assert_eq!(ours["url"], GATEWAY_CHAT_URL);
             assert_eq!(ours["apiKey"], "sk-test-key");
-            assert_eq!(ours["id"], VENDOR);
+            assert_eq!(ours["id"], "gpt-test", "条目 id 必须是真实模型名(CLI 以之作请求 model)");
+            assert_eq!(ours["x-provider-id"], "pv1");
             if d == ".codebuddy" {
                 assert!(models.iter().any(|m| m["id"] == "user-model"), "用户条目零触碰");
                 assert_eq!(cfg["availableModels"], json!(["user-model"]), "availableModels 零触碰");
@@ -319,6 +337,14 @@ mod tests {
         host(&home, &home.join("bk"), &pp, "pv1", "direct").unwrap();
         let cfg: Value = serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap()).unwrap();
         assert_eq!(cfg["models"][0]["url"], "https://example.com/v1/chat/completions");
+        assert_eq!(cfg["models"][0]["id"], "gpt-test");
+        // base 不带 /v1(2xapi.cc.cd 形态)→ 补 /v1(真机实证:无 /v1 路径 404)
+        let mut d2: Value = serde_json::from_str(&fs::read_to_string(&pp).unwrap()).unwrap();
+        d2["providers"].as_array_mut().unwrap()[0]["base_url"] = json!("https://no-v1.example");
+        fs::write(&pp, d2.to_string()).unwrap();
+        host(&home, &home.join("bk"), &pp, "pv1", "direct").unwrap();
+        let cfg2: Value = serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap()).unwrap();
+        assert_eq!(cfg2["models"][0]["url"], "https://no-v1.example/v1/chat/completions");
     }
 
     /// unhost 仅移除本产品条目;二次 unhost no-op。
@@ -391,7 +417,7 @@ mod tests {
         assert_eq!(err.1, "E_NOT_HOSTED");
         host(&home, &home.join("bk"), &pp, "pv1", "gateway").unwrap();
         let v = start(&pp, "gateway", "pv1", &home).unwrap();
-        assert_eq!(v["command"], "codebuddy --model 2xapi-gateway");
+        assert_eq!(v["command"], "codebuddy --model gpt-test");
         assert!(v["desktopHint"].is_string());
     }
 
