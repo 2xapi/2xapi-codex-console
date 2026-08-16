@@ -38,6 +38,8 @@ pub struct AppState {
     pub backup_dir: PathBuf,
     pub providers_path: PathBuf,
     pub codex_home: PathBuf,
+    /// workbuddy 双配置载体(~/.codebuddy 与 ~/.workbuddy)的公共根(即用户 home;测试传 tempdir)。
+    pub wb_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -915,6 +917,7 @@ mod tests {
             backup_dir: PathBuf::from("/tmp/2xapi-m0-bk"),
             providers_path: PathBuf::from("/tmp/2xapi-m0-providers.json"),
             codex_home: PathBuf::from("/tmp/2xapi-m0-codex-home"),
+            wb_home: PathBuf::from("/tmp/2xapi-m0-wb-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -934,12 +937,77 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v["data"]["agents"].as_array().unwrap();
-        assert_eq!(arr.len(), 8);
+        assert_eq!(arr.len(), 9);
         assert_eq!(arr[0]["id"], "codex");
         assert_eq!(arr[0]["available"], Value::Bool(true));
         assert_eq!(arr[1]["id"], "claude");
         assert_eq!(arr[1]["available"], Value::Bool(true));
+        assert!(arr.iter().any(|m| m["id"] == "workbuddy" && m["available"] == Value::Bool(true)));
         assert!(!arr.iter().any(|m| m["id"] == "pi"), "pi 已裁撤不得出现");
+    }
+
+    /// workbuddy 泛化路由 e2e:host 写入双载体 → state 报 hosted → unhost 还原(隔离 wb_home)
+    #[tokio::test]
+    async fn workbuddy_routes_e2e() {
+        let (state, root) = unique_state("wb-e2e");
+        let app = build_router(state);
+        std::fs::write(
+            root.join("providers.json"),
+            serde_json::json!({"providers": [{"id": "wbp", "name": "测站", "agent": "workbuddy",
+                "base_url": "https://w.example/v1", "api_key": "sk-w", "model": "m1"}]}).to_string(),
+        )
+        .unwrap();
+
+        // host
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/workbuddy/host")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"providerId":"wbp","way":"gateway"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["data"]["hosted"], Value::Bool(true));
+        let cli: Value = serde_json::from_str(&std::fs::read_to_string(root.join(".codebuddy/models.json")).unwrap()).unwrap();
+        assert_eq!(cli["models"][0]["vendor"], "2xapi-gateway");
+        assert!(root.join(".workbuddy/models.json").exists(), "桌面版载体同步写入");
+
+        // state
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/desktop/workbuddy/state").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["data"]["hosted"], Value::Bool(true));
+
+        // start(已托管 → 命令返回)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/workbuddy/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"providerId":"wbp","way":"gateway"}"#)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // unhost
+        let resp = app
+            .oneshot(
+                Request::builder().method("POST").uri("/api/desktop/workbuddy/unhost").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cli: Value = serde_json::from_str(&std::fs::read_to_string(root.join(".codebuddy/models.json")).unwrap()).unwrap();
+        assert!(cli["models"].as_array().unwrap().is_empty(), "unhost 后条目移除");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A 阶段:泛化路由 /api/desktop/codex/state 与旧具名路由响应完全一致(别名等价)
@@ -1059,6 +1127,7 @@ mod tests {
             backup_dir: root.join("backups"),
             providers_path: root.join("providers.json"),
             codex_home: root.join("codex"),
+            wb_home: root.clone(),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1864,6 +1933,18 @@ fn agent_unsupported_response() -> Response {
         .into_response()
 }
 
+/// workbuddy host/unhost/start 的统一响应包装(与 codex impl 的错误形态一致)。
+fn agent_op_response(r: Result<Value, (u16, String, String)>) -> Response {
+    match r {
+        Ok(v) => ok_env(v),
+        Err((status, code, msg)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "error": code, "message": msg })),
+        )
+            .into_response(),
+    }
+}
+
 // GET /api/desktop/:agent/state —— agent=codex 与旧 /api/desktop/state 等价;
 // claude 托管态为前端本地(注入式),无 state 接口。
 async fn handle_agent_state(
@@ -1875,6 +1956,7 @@ async fn handle_agent_state(
     }
     match agent.as_str() {
         "codex" => ok_env(crate::desktop::state(&s.config_path, &s.providers_path, &s.codex_home)),
+        "workbuddy" => ok_env(crate::agents::workbuddy::state(&s.wb_home)),
         _ => agent_unsupported_response(),
     }
 }
@@ -1890,6 +1972,11 @@ async fn handle_agent_host(
     }
     match agent.as_str() {
         "codex" => desktop_host_impl(&s, &body),
+        "workbuddy" => agent_op_response(crate::agents::workbuddy::host(
+            &s.wb_home, &s.backup_dir, &s.providers_path,
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -1904,6 +1991,7 @@ async fn handle_agent_unhost(
     }
     match agent.as_str() {
         "codex" => desktop_unhost_impl(&s),
+        "workbuddy" => agent_op_response(crate::agents::workbuddy::unhost(&s.wb_home, &s.backup_dir)),
         _ => agent_unsupported_response(),
     }
 }
@@ -1919,6 +2007,12 @@ async fn handle_agent_start(
     }
     match agent.as_str() {
         "claude" => desktop_claude_start_impl(&s, &body),
+        "workbuddy" => agent_op_response(crate::agents::workbuddy::start(
+            &s.providers_path,
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("gateway").trim(),
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            &s.wb_home,
+        )),
         _ => agent_unsupported_response(),
     }
 }

@@ -2,10 +2,12 @@
 //!
 //! A 阶段:元数据 + 白名单 + 泛化路由分发骨架;外部行为零变化(codex/claude 照旧)。
 //! B 阶段起:每平台一个 adapter 模块挂载于此(registry 登记即可接入),
-//! trait 完整抽象(方案 §2.1 的 AgentAdapter)随第一个新平台接入时落地。
+//! workbuddy 为第一个新平台 adapter(2026-08-16,叠加写双 models.json,见 workbuddy.rs)。
 //!
 //! 注册表即产品事实源:前端导航(D3 决策「A 后一次全亮,未实现标即将上线」)与
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
+
+pub mod workbuddy;
 
 use serde_json::{json, Value};
 
@@ -92,6 +94,14 @@ static REGISTRY: &[AgentMeta] = &[
         egress: "anthropic",
         hosting: "config",
     },
+    AgentMeta {
+        id: "workbuddy",
+        name: "WorkBuddy",
+        tip: "WorkBuddy / CodeBuddy",
+        available: true,
+        egress: "chat",
+        hosting: "config",
+    },
 ];
 
 pub fn registry() -> impl Iterator<Item = &'static AgentMeta> {
@@ -136,11 +146,11 @@ pub fn registry_json() -> Value {
 mod tests {
     use super::*;
 
-    /// 注册表完整性:8 平台(pi 已裁撤不在内)、id 唯一。
+    /// 注册表完整性:9 平台(pi 已裁撤不在内)、id 唯一。
     #[test]
-    fn registry_has_eight_unique_platforms() {
+    fn registry_has_nine_unique_platforms() {
         let all: Vec<&str> = registry().map(|m| m.id).collect();
-        assert_eq!(all.len(), 8, "平台数应为 8(pi 已裁撤): {all:?}");
+        assert_eq!(all.len(), 9, "平台数应为 9(pi 已裁撤): {all:?}");
         let mut uniq = all.clone();
         uniq.sort_unstable();
         uniq.dedup();
@@ -148,10 +158,10 @@ mod tests {
         assert!(!all.contains(&"pi"), "pi 已裁撤,不得出现在注册表");
     }
 
-    /// A 阶段行为零变化:可用平台恰为 codex/claude,且均排在首位(导航顺序)。
+    /// 可用平台 = codex/claude/workbuddy(workbuddy 为 B 阶段第一个接入的新平台)。
     #[test]
-    fn supported_ids_exactly_codex_and_claude() {
-        assert_eq!(supported_ids(), vec!["codex", "claude"]);
+    fn supported_ids_includes_workbuddy() {
+        assert_eq!(supported_ids(), vec!["codex", "claude", "workbuddy"]);
     }
 
     /// find 大小写不敏感;未注册 id 返回 None(泛化路由据此 404)。
@@ -162,12 +172,12 @@ mod tests {
         assert!(find("cursor").is_none());
     }
 
-    /// registry_json 结构:agents 数组 8 项,每项带完整字段。
+    /// registry_json 结构:agents 数组 9 项,每项带完整字段。
     #[test]
     fn registry_json_shape() {
         let v = registry_json();
         let arr = v["agents"].as_array().unwrap();
-        assert_eq!(arr.len(), 8);
+        assert_eq!(arr.len(), 9);
         for m in arr {
             assert!(m["id"].is_string());
             assert!(m["name"].is_string());
