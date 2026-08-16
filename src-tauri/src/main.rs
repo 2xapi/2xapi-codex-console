@@ -8,6 +8,7 @@ mod server;
 mod launcher;
 mod config;
 mod desktop;
+mod grok_config;
 mod providers;
 mod probe;
 mod sessions;
@@ -81,6 +82,7 @@ fn main() {
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .unwrap_or_default(),
         ),
+        grok_home: crate::grok_config::default_grok_home(),
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,
