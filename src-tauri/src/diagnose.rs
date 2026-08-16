@@ -127,6 +127,11 @@ async fn real_request(p: &Provider, errors: &mut Vec<DiagError>) -> bool {
             format!("{base}/v1/messages"),
             json!({ "model": p.model, "max_tokens": 16, "messages": [{ "role": "user", "content": "ping" }] }),
         ),
+        // 多平台阶段 C:原生 generateContent ping(2xa 实测 Bearer 头亦过认证)
+        WireApi::Gemini => (
+            format!("{base}/v1beta/models/{}:generateContent", p.model),
+            json!({ "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }] }),
+        ),
     };
     match client.post(&url).bearer_auth(&p.api_key).json(&body).send().await {
         Ok(r) if r.status().is_success() => true,

@@ -42,6 +42,8 @@ pub struct AppState {
     pub wb_home: PathBuf,
     /// hermes 配置根(HERMES_HOME 优先,默认 ~/.hermes;测试传 tempdir,杜绝写真实活配置)。
     pub hermes_home: PathBuf,
+    /// gemini 配置载体根(~/.gemini 所在;adapter 内 join(".gemini");测试传 tempdir)。
+    pub gem_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -72,6 +74,8 @@ pub fn build_router(state: AppState) -> Router {
         // --- 网关代理 /hermes/*（Hermes 接入;hermes 条目 base_url=网关+/hermes,SDK 追加 /chat/completions）---
         .route("/hermes/v1/chat/completions", post(crate::gateway::proxy_hermes_chat))
         .route("/hermes/chat/completions", post(crate::gateway::proxy_hermes_chat))
+        // Gemini 入口(多平台阶段 C):段内冒号无特殊含义,`gemini-2.5-flash:generateContent` 整段捕获
+        .route("/v1beta/models/:model_action", post(crate::gateway::proxy_gemini))
         // --- Health & session ---
         .route("/api/health", get(handle_health))
         .route("/api/session", get(handle_session))
@@ -924,6 +928,7 @@ mod tests {
             codex_home: PathBuf::from("/tmp/2xapi-m0-codex-home"),
             wb_home: PathBuf::from("/tmp/2xapi-m0-wb-home"),
             hermes_home: PathBuf::from("/tmp/2xapi-m0-hermes-home"),
+            gem_home: PathBuf::from("/tmp/2xapi-m0-gem-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -1131,7 +1136,7 @@ mod tests {
 
         let soon = app
             .clone()
-            .oneshot(Request::builder().uri("/api/desktop/gemini/state").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/api/desktop/grokbuild/state").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(soon.status(), StatusCode::NOT_IMPLEMENTED);
@@ -1215,6 +1220,7 @@ mod tests {
             codex_home: root.join("codex"),
             wb_home: root.clone(),
             hermes_home: root.join("hermes"),
+            gem_home: root.clone(),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -2045,6 +2051,7 @@ async fn handle_agent_state(
         "codex" => ok_env(crate::desktop::state(&s.config_path, &s.providers_path, &s.codex_home)),
         "workbuddy" => ok_env(crate::agents::workbuddy::state(&s.wb_home)),
         "hermes" => ok_env(crate::agents::hermes::detect_state(&s.hermes_home.join("config.yaml"))),
+        "gemini" => ok_env(crate::agents::gemini::state(&s.gem_home)),
         _ => agent_unsupported_response(),
     }
 }
@@ -2070,6 +2077,11 @@ async fn handle_agent_host(
             body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
             body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
         )),
+        "gemini" => agent_op_response(crate::agents::gemini::host(
+            &s.gem_home, &s.backup_dir, &s.providers_path,
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("").trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -2088,6 +2100,7 @@ async fn handle_agent_unhost(
         "hermes" => agent_op_response(crate::agents::hermes::unhost(
             &s.hermes_home.join("config.yaml"), &s.backup_dir, &s.providers_path,
         )),
+        "gemini" => agent_op_response(crate::agents::gemini::unhost(&s.gem_home, &s.backup_dir)),
         _ => agent_unsupported_response(),
     }
 }
@@ -2108,6 +2121,12 @@ async fn handle_agent_start(
             body.get("way").and_then(|v| v.as_str()).unwrap_or("gateway").trim(),
             body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
             &s.wb_home,
+        )),
+        "gemini" => agent_op_response(crate::agents::gemini::start(
+            &s.providers_path,
+            body.get("way").and_then(|v| v.as_str()).unwrap_or("gateway").trim(),
+            body.get("providerId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+            &s.gem_home,
         )),
         _ => agent_unsupported_response(),
     }

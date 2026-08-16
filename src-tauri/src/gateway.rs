@@ -139,6 +139,245 @@ async fn dispatch_anthropic(state: &AppState, req: Request<Body>) -> Response<Bo
     }
 }
 
+/// Gemini 流量转发入口(`/v1beta/models/{model}:{action}`,server.rs 注册)。
+/// 路径段 `:model_action` 捕获整段(如 `gemini-2.5-flash:generateContent`,冒号在段内无特殊含义)。
+pub async fn proxy_gemini(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(model_action): axum::extract::Path<String>,
+    req: Request<Body>,
+) -> Response<Body> {
+    dispatch_gemini(&s, &model_action, req).await
+}
+
+/// Gemini 错误响应:Gemini 标准形态 `{"error":{code,message,status}}`(google-genai 客户端解析 friendly)。
+fn gemini_err(status: StatusCode, status_str: &str, msg: &str) -> Response<Body> {
+    let body = serde_json::json!({ "error": { "code": status.as_u16(), "message": msg, "status": status_str } });
+    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build gemini error body"))
+}
+
+/// Gemini 转发(多平台阶段 C 第一段)。两条路径按 provider.wire_api 分流:
+/// - `chat_completions` → 转换:Gemini 请求 → Chat(gateway_gemini_conv),响应/流式转回;
+/// - `gemini` → 透传:上游原生 generateContent(2xa 实测支持),原样转发,Key 注入 `x-goog-api-key`;
+/// - 其他协议 → 400 人话。
+/// agent=gemini 取供应商(规则同 dispatch_anthropic 的 claude);加速体系与 /anthropic 同款(R1 未接 per-Key 凭证确保段)。
+async fn dispatch_gemini(state: &AppState, model_action: &str, req: Request<Body>) -> Response<Body> {
+    let (model, action) = match model_action.rsplit_once(':') {
+        Some(x) => x,
+        None => return gemini_err(StatusCode::NOT_FOUND, "NOT_FOUND", "路径应为 /v1beta/models/{model}:generateContent 或 :streamGenerateContent"),
+    };
+    let stream = match action {
+        "generateContent" => false,
+        "streamGenerateContent" => {
+            // gemini CLI 流式固定用 ?alt=sse;alt 缺失/其他值不支持(JSON 数组分块)
+            let alt_ok = req.uri().query().map(|q| q.split('&').any(|kv| kv.trim() == "alt=sse")).unwrap_or(false);
+            if !alt_ok {
+                return gemini_err(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", "streamGenerateContent 仅支持 ?alt=sse 流式格式");
+            }
+            true
+        }
+        other => {
+            return gemini_err(StatusCode::NOT_FOUND, "NOT_FOUND", &format!("暂不支持 Gemini 操作 {other}(首版仅 generateContent / streamGenerateContent)"));
+        }
+    };
+
+    let provider = match crate::providers::get_provider_for_agent(&state.providers_path, "gemini") {
+        Some(p) => p,
+        None => return gemini_err(StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", "请先选择 Gemini 供应商"),
+    };
+    if provider.access_mode == AccessMode::Official {
+        return gemini_err(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", "Official 模式不走网关");
+    }
+
+    // ── 加速装配(与 dispatch_anthropic 同款)──
+    let line = accel_plan(state, &provider.base_url, &provider.api_key);
+    let direct_client = match build_client(&provider) {
+        Ok(c) => c,
+        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("build client: {e}")),
+    };
+    let timeout = Duration::from_secs(provider.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+    let line_client = match &line {
+        Some((l, _)) => match build_line_client(l, timeout) {
+            Ok(c) => Some(c),
+            Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &format!("build line client: {e}")),
+        },
+        None => None,
+    };
+    if let Some((l, pk)) = &line {
+        eprintln!("[GW] gemini accel line={} endpoint={} per_key={} (直连兜底开启)", l.id, l.endpoint, pk);
+    }
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
+    };
+
+    match provider.wire_api {
+        // ── 透传:上游原生 generateContent(2xa 实测路由存在,Key 头 x-goog-api-key 与 Bearer 均可)──
+        crate::providers::WireApi::Gemini => {
+            let base = provider.base_url.trim_end_matches('/');
+            let suffix = if base.ends_with("/v1beta") {
+                format!("/models/{model}:{action}")
+            } else {
+                format!("/v1beta/models/{model}:{action}")
+            };
+            let target = if stream { format!("{base}{suffix}?alt=sse") } else { format!("{base}{suffix}") };
+            eprintln!("[GW] gemini passthrough model={model} action={action} body={}B", body_bytes.len());
+
+            let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
+                let mut rb = client
+                    .post(&target)
+                    .header("x-goog-api-key", &provider.api_key)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json");
+                if let Some(ua) = provider.user_agent.as_deref().filter(|s| !s.is_empty()) {
+                    rb = rb.header(reqwest::header::USER_AGENT, ua);
+                }
+                if let Some(hs) = provider.custom_headers.as_ref() {
+                    for (k, v) in hs {
+                        rb = rb.header(k, v);
+                    }
+                }
+                if !body_bytes.is_empty() {
+                    rb = rb.body(body_bytes.clone());
+                }
+                rb
+            };
+            let upstream = match send_with_accel(state, &provider.api_key, &line, &line_client, &direct_client, timeout, &build_rb).await {
+                Ok(r) => r,
+                Err(resp) => return resp,
+            };
+            let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut resp = Response::builder().status(status);
+            if let Some(ct) = upstream.headers().get(reqwest::header::CONTENT_TYPE) {
+                if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
+                    resp = resp.header(axum::http::header::CONTENT_TYPE, hv);
+                }
+            }
+            let stream_out = upstream
+                .bytes_stream()
+                .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+            match resp.body(Body::from_stream(stream_out)) {
+                Ok(r) => r,
+                Err(_) => err_resp(StatusCode::BAD_GATEWAY, "build response body"),
+            }
+        }
+        // ── 转换:Gemini → ChatCompletions(M3b 同思路)──
+        crate::providers::WireApi::ChatCompletions => {
+            let conv = match crate::gateway_gemini_conv::gemini_to_chat_request(model, stream, &body_bytes) {
+                Ok(c) => c,
+                Err(e) => return gemini_err(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", e.message()),
+            };
+            eprintln!("[GW] gemini conv→chat model={model} action={action} stream={stream} body={}B", conv.body.len());
+
+            // /v1 双形态(与 dispatch_anthropic 同规则):裸域拼 /v1/chat/completions(OpenAI 惯例,
+            // 2xapi.cc.cd 实测仅 /v1 形态);base 已带 /v1 则直接拼(DeepSeek 等挂载根的站两形态均可)
+            let base = provider.base_url.trim_end_matches('/');
+            let target = if base.ends_with("/v1") {
+                format!("{base}/chat/completions")
+            } else {
+                format!("{base}/v1/chat/completions")
+            };
+            let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
+                let mut rb = client
+                    .post(&target)
+                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", provider.api_key))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json");
+                if let Some(ua) = provider.user_agent.as_deref().filter(|s| !s.is_empty()) {
+                    rb = rb.header(reqwest::header::USER_AGENT, ua);
+                }
+                if let Some(hs) = provider.custom_headers.as_ref() {
+                    for (k, v) in hs {
+                        rb = rb.header(k, v);
+                    }
+                }
+                if !conv.body.is_empty() {
+                    rb = rb.body(conv.body.clone());
+                }
+                rb
+            };
+            let upstream = match send_with_accel(state, &provider.api_key, &line, &line_client, &direct_client, timeout, &build_rb).await {
+                Ok(r) => r,
+                Err(resp) => return resp,
+            };
+
+            // 上游非成功:包装为 Gemini 错误形态(状态码透传)
+            if !upstream.status().is_success() {
+                let st = upstream.status().as_u16();
+                let up_bytes = match upstream.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
+                };
+                let wrapped = crate::gateway_gemini_conv::chat_error_to_gemini(st, &up_bytes);
+                let status = StatusCode::from_u16(st).unwrap_or(StatusCode::BAD_GATEWAY);
+                return Response::builder()
+                    .status(status)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(wrapped))
+                    .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build err body"));
+            }
+
+            if conv.stream {
+                // Chat SSE → Gemini SSE 逐块转换(不缓冲,M3b 增量思路)
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+                let up_stream = upstream.bytes_stream();
+                tokio::spawn(async move {
+                    let mut conv_state = crate::gateway_gemini_conv::GeminiSseConvState::new();
+                    let mut s = up_stream;
+                    while let Some(chunk) = s.next().await {
+                        match chunk {
+                            Ok(bytes) => {
+                                for out in conv_state.feed(&bytes) {
+                                    if tx.send(Ok(out.into_bytes())).await.is_err() { return; }
+                                }
+                            }
+                            Err(e) => { let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e))).await; return; }
+                        }
+                    }
+                    for out in conv_state.finish() {
+                        if tx.send(Ok(out.into_bytes())).await.is_err() { return; }
+                    }
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+                    .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build stream body"))
+            } else {
+                let up_bytes = match upstream.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
+                };
+                let converted = match crate::gateway_gemini_conv::chat_json_to_gemini_json(model, &up_bytes) {
+                    Ok(v) => v,
+                    Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("gemini conv: {e}")),
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(converted))
+                    .unwrap_or_else(|_| err_resp(StatusCode::BAD_GATEWAY, "build conv body"))
+            }
+        }
+        other => {
+            let name = match other {
+                crate::providers::WireApi::Responses => "responses",
+                crate::providers::WireApi::Anthropic => "anthropic",
+                _ => "unknown",
+            };
+            gemini_err(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ARGUMENT",
+                &format!("Gemini 入口暂不支持协议 {name} 的供应商:请把该供应商协议切为 ChatCompletions(网关自动转换)或 Gemini(原生透传)"),
+            )
+        }
+    }
+}
+
 /// 统一转发(Codex 路径 `/v1/*`):取 agent 的 active 供应商 → 注入凭证 → 转发 → 流式透传响应。
 /// 语义(按 agent 过滤取供应商,见 providers::get_provider_for_agent)——
 /// 全局 active 若属其他 agent,取本 agent sort_index 最小者,不串台。
@@ -768,6 +1007,7 @@ mod tests {
             codex_home: root.join("codex"),
             wb_home: root.clone(),
             hermes_home: root.join("hermes"),
+            gem_home: root.clone(),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(crate::server::AccelCfg::default())),
@@ -1016,6 +1256,331 @@ mod tests {
         p.id
     }
 
+    // ── Gemini 入口(多平台阶段 C 第一段)─────────────────────
+
+    /// 建 agent=gemini 供应商(不设 active,由调用方控制全局 active 以测不串台)。
+    fn add_gemini_provider(path: &std::path::Path, base_url: &str, api_key: &str, wire: crate::providers::WireApi) -> String {
+        let input = ProviderInput {
+            name: "GeminiT".into(),
+            agent: "gemini".into(),
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model: "gemini-2.5-flash".into(),
+            wire_api: wire,
+            sub2api_multiplier: 1.0,
+            ..ProviderInput::default()
+        };
+        providers::create(path, input).unwrap().id
+    }
+
+    /// mock Chat 上游:记录 (Authorization, 收到的请求 body),返回固定响应(支持 SSE)。
+    async fn mock_chat_upstream(resp_body: &'static str, resp_ctype: &'static str) -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |h: axum::http::HeaderMap, b: axum::body::Bytes| {
+                let seen = seen_c.clone();
+                async move {
+                    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).map(String::from).unwrap_or_default();
+                    seen.lock().unwrap().push((auth, b.to_vec()));
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, resp_ctype)],
+                        resp_body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        (format!("http://{}", addr), seen)
+    }
+
+    /// mock 原生 Gemini 上游(透传分支):记录 (x-goog-api-key, 收到的请求 body, 路径段),固定响应。
+    async fn mock_gemini_upstream() -> (String, Arc<Mutex<Vec<(String, Vec<u8>, String)>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let app = Router::new().route(
+            "/v1beta/models/:model_action",
+            post(move |ma: axum::extract::Path<String>, h: axum::http::HeaderMap, b: axum::body::Bytes| {
+                let seen = seen_c.clone();
+                async move {
+                    let ma = ma.0;
+                    let key = h.get("x-goog-api-key").and_then(|v| v.to_str().ok()).map(String::from).unwrap_or_default();
+                    seen.lock().unwrap().push((key, b.to_vec(), ma));
+                    (StatusCode::OK, "GEMINI_PASSTHROUGH_OK")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        (format!("http://{}", addr), seen)
+    }
+
+    fn req_gemini(model_action: &str, query: Option<&str>, body: String) -> Request<Body> {
+        let uri = match query {
+            Some(q) => format!("/v1beta/models/{model_action}?{q}"),
+            None => format!("/v1beta/models/{model_action}"),
+        };
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn gemini_route_converts_to_chat_and_injects_key() {
+        let chat_resp = r#"{"id":"c1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"收到"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#;
+        let (base, seen) = mock_chat_upstream(chat_resp, "application/json").await;
+        let (state, providers_path, root) = make_state("gemini-conv");
+        let _gid = add_gemini_provider(&providers_path, &base, "sk-gem-secret", crate::providers::WireApi::ChatCompletions);
+
+        let body = serde_json::json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }).to_string();
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("gemini-2.5-flash:generateContent".into()),
+            req_gemini("gemini-2.5-flash:generateContent", None, body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "收到", "响应应为 Gemini 形态:\n{v}");
+        assert_eq!(v["usageMetadata"]["totalTokenCount"], 7);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let seen = seen.lock().unwrap();
+        let (auth, up_body) = &seen[0];
+        assert_eq!(auth, "Bearer sk-gem-secret", "上游应收到注入的 Bearer Key");
+        let up: serde_json::Value = serde_json::from_slice(up_body).unwrap();
+        assert_eq!(up["model"], "gemini-2.5-flash", "URL 上的 model 应写入 chat body:\n{up}");
+        assert_eq!(up["messages"][0]["role"], "user");
+        assert_eq!(up["messages"][0]["content"], "hi");
+        assert_eq!(up["stream"], false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn gemini_route_stream_sse_converted() {
+        let sse = "data: {\"id\":\"1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\ndata: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"}}]}\n\ndata: {\"id\":\"1\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n";
+        let (base, _seen) = mock_chat_upstream(sse, "text/event-stream").await;
+        let (state, providers_path, root) = make_state("gemini-sse");
+        let _gid = add_gemini_provider(&providers_path, &base, "sk-gem", crate::providers::WireApi::ChatCompletions);
+
+        let body = serde_json::json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }).to_string();
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("m:streamGenerateContent".into()),
+            req_gemini("m:streamGenerateContent", Some("alt=sse"), body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "text/event-stream");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains(r#""text":"你""#), "流式文本分块:\n{s}");
+        assert!(s.contains(r#""text":"好""#));
+        assert!(s.contains(r#""finishReason":"STOP""#));
+        assert!(s.contains(r#""promptTokenCount":3"#), "usage 应转回:\n{s}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn gemini_route_no_provider_503() {
+        let (state, _providers_path, root) = make_state("gemini-503");
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("m:generateContent".into()),
+            req_gemini("m:generateContent", None, r#"{"contents":[]}"#.into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("Gemini 供应商"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D2:多模态请求明确报错,不静默降级。
+    #[tokio::test]
+    async fn gemini_route_multimodal_rejected_400() {
+        let (base, seen) = mock_chat_upstream("{}", "application/json").await;
+        let (state, providers_path, root) = make_state("gemini-mm");
+        let _gid = add_gemini_provider(&providers_path, &base, "sk-gem", crate::providers::WireApi::ChatCompletions);
+
+        let body = serde_json::json!({ "contents": [{ "role": "user", "parts": [{ "inlineData": { "mimeType": "image/png", "data": "iVBOR" } }] }] }).to_string();
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("m:generateContent".into()),
+            req_gemini("m:generateContent", None, body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("多模态"), "人话错误:\n{v}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(seen.lock().unwrap().is_empty(), "多模态请求不得打到上游");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 不串台:全局 active 是 codex 供应商时,/v1beta 仍取 agent=gemini 供应商。
+    #[tokio::test]
+    async fn gemini_route_uses_gemini_provider_even_when_active_is_codex() {
+        let (base_gem, seen_gem) = mock_chat_upstream(r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"G"},"finish_reason":"stop"}]}"#, "application/json").await;
+        let (base_codex, _seen_codex) = mock_chat_upstream(r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"C"},"finish_reason":"stop"}}]}"#, "application/json").await;
+        let (state, providers_path, root) = make_state("gemini-x");
+        let _cid = add_provider(&providers_path, &base_codex, "sk-codex"); // 全局 active=codex
+        let _gid = add_gemini_provider(&providers_path, &base_gem, "sk-gem", crate::providers::WireApi::ChatCompletions);
+
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("m:generateContent".into()),
+            req_gemini("m:generateContent", None, r#"{"contents":[{"role":"user","parts":[{"text":"x"}]}]}"#.into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "G", "必须走 gemini 供应商:\n{v}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let seen = seen_gem.lock().unwrap();
+        assert_eq!(seen[0].0, "Bearer sk-gem");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 协议不支持(Responses):400 人话,不打上游。
+    #[tokio::test]
+    async fn gemini_wire_responses_rejected_400() {
+        let (base, seen) = mock_chat_upstream("{}", "application/json").await;
+        let (state, providers_path, root) = make_state("gemini-wire");
+        let _gid = add_gemini_provider(&providers_path, &base, "sk-gem", crate::providers::WireApi::Responses);
+
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("m:generateContent".into()),
+            req_gemini("m:generateContent", None, r#"{"contents":[{"role":"user","parts":[{"text":"x"}]}]}"#.into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("responses"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(seen.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 透传分支:wire_api=gemini → 原样 body 打上游 /v1beta/models/…,Key 注入 x-goog-api-key,响应原样回。
+    #[tokio::test]
+    async fn gemini_wire_gemini_passthrough() {
+        let (base, seen) = mock_gemini_upstream().await;
+        let (state, providers_path, root) = make_state("gemini-pass");
+        let _gid = add_gemini_provider(&providers_path, &base, "sk-gem-native", crate::providers::WireApi::Gemini);
+
+        let body = r#"{"contents":[{"role":"user","parts":[{"text":"native"}]}]}"#;
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("gemini-2.5-pro:generateContent".into()),
+            req_gemini("gemini-2.5-pro:generateContent", None, body.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"GEMINI_PASSTHROUGH_OK", "透传分支响应应原样");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let seen = seen.lock().unwrap();
+        let (key, up_body, ma) = &seen[0];
+        assert_eq!(key, "sk-gem-native", "透传用 x-goog-api-key 注入");
+        assert_eq!(up_body, body.as_bytes(), "body 必须原样透传");
+        assert_eq!(ma, "gemini-2.5-pro:generateContent", "上游收到完整 model:action 路径");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// streamGenerateContent 缺 ?alt=sse → 400(gemini CLI 固定 alt=sse)。
+    #[tokio::test]
+    async fn gemini_stream_missing_alt_400() {
+        let (state, _providers_path, root) = make_state("gemini-alt");
+        let resp = proxy_gemini(
+            State(Arc::new(state)),
+            axum::extract::Path("m:streamGenerateContent".into()),
+            req_gemini("m:streamGenerateContent", None, r#"{"contents":[]}"#.into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("alt=sse"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 真机端到端(代替用户,惯例;手动触发:cargo test gemini_e2e_real_cli -- --ignored --nocapture):
+    /// 真实 gemini CLI → 本网关(转换分支 Gemini→Chat)→ 真实 2xa.cc.cd chat 上游(OpenAI 平台 Key)→ 转回。
+    /// Key 只读自 ~/.codex/providers.json 的 2xapi.cc.cd 条目;占位 Key 走 CLI→网关段,真 Key 只进网关→上游段。
+    #[tokio::test]
+    #[ignore]
+    async fn gemini_e2e_real_cli() {
+        // 1. 只读取真实 2xapi Key 与模型名
+        let home = std::env::var("HOME").unwrap();
+        let raw = std::fs::read_to_string(format!("{home}/.codex/providers.json")).expect("读 ~/.codex/providers.json");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("解析 providers.json");
+        let provs = v.get("providers").and_then(|p| p.as_array()).expect("providers 数组");
+        let entry = provs
+            .iter()
+            .find(|p| p.get("base_url").and_then(|b| b.as_str()).map(|s| s.contains("2xapi.cc.cd")).unwrap_or(false) && p.get("api_key").and_then(|k| k.as_str()).map(|s| !s.is_empty()).unwrap_or(false))
+            .expect("未找到带 Key 的 2xapi.cc.cd 供应商");
+        let real_key = entry["api_key"].as_str().unwrap().to_string();
+        let model = entry["model"].as_str().unwrap_or("deepseek-chat").to_string();
+        let upstream_base = entry["base_url"].as_str().unwrap_or("https://2xapi.cc.cd").to_string();
+        eprintln!("[E2E] 上游 = {upstream_base} 模型 = {model}");
+
+        // 2. 隔离环境:临时 providers.json(仅 1 个 gemini 供应商)+ 临时 HOME
+        let (state, providers_path, root) = make_state("gemini-e2e");
+        let _gid = add_gemini_provider(&providers_path, &upstream_base, &real_key, crate::providers::WireApi::ChatCompletions);
+        let home_e2e = root.join("cli-home");
+        std::fs::create_dir_all(home_e2e.join(".gemini")).unwrap();
+        std::fs::write(
+            home_e2e.join(".gemini/settings.json"),
+            r#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#,
+        )
+        .unwrap();
+
+        // 3. 起真实网关(随机端口,不与在跑 app 的 8787 冲突)
+        let router = crate::server::build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { let _ = axum::serve(listener, router).await; });
+
+        // 4. 真实 gemini CLI:注入式启动(Key=占位,真 Key 只在网关)
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(150),
+            tokio::process::Command::new("gemini")
+                .arg("-p")
+                .arg("请只回复两个字:收到")
+                .env("HOME", &home_e2e)
+                .env("GEMINI_API_KEY", "sk-gateway-placeholder")
+                .env("GOOGLE_GEMINI_BASE_URL", format!("http://127.0.0.1:{port}"))
+                .env("GEMINI_CLI_TRUST_WORKSPACE", "true")
+                .env("GEMINI_MODEL", &model)
+                .output(),
+        )
+        .await
+        .expect("CLI 150s 超时")
+        .expect("启动 gemini CLI 失败(已装?)");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("[E2E] exit={:?} stdout尾={:?} stderr尾={:?}", out.status.code(), stdout.chars().rev().take(120).collect::<String>(), &stderr[stderr.len().saturating_sub(200)..]);
+        assert!(out.status.success(), "CLI 应正常退出");
+        assert!(!stdout.trim().is_empty(), "应收到真实回复,stdout:\n{stdout}\nstderr:\n{stderr}");
+        eprintln!("[E2E] 全链走通:gemini CLI → 网关(Gemini→Chat 转换)→ 2xa 真实上游");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Claude 接入:base_url 无 /v1 前缀 → 拼 /v1/messages;注入 Bearer {claude api_key};body 透传。
     #[tokio::test]
     async fn anthropic_route_injects_claude_key_and_hits_v1_messages() {
@@ -1092,7 +1657,7 @@ mod tests {
 
     // ── Hermes 接入(/hermes/chat/completions 专属入口,共用 dispatch)──
 
-    async fn mock_chat_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
+    async fn mock_hermes_chat_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
         let app = Router::new().route(
@@ -1146,7 +1711,7 @@ mod tests {
     /// Hermes 接入:全局 active 是 codex,但存在 hermes 供应商 → /hermes/* 仍取 hermes(不串台)。
     #[tokio::test]
     async fn hermes_route_uses_hermes_provider_even_when_active_is_codex() {
-        let (base, seen) = mock_chat_upstream().await;
+        let (base, seen) = mock_hermes_chat_upstream().await;
         let (state, providers_path, root) = make_state("hermes-isolate");
         let input_cx = ProviderInput {
             name: "Cx".into(),
@@ -1335,6 +1900,7 @@ mod tests {
             codex_home: s.codex_home.clone(),
             wb_home: s.wb_home.clone(),
             hermes_home: s.hermes_home.clone(),
+            gem_home: s.gem_home.clone(),
             launcher: s.launcher.clone(),
             health: s.health.clone(),
             accel: s.accel.clone(),

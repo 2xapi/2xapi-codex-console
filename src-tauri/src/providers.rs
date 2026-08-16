@@ -49,13 +49,15 @@ impl<'de> Deserialize<'de> for AccessMode {
     }
 }
 
-/// 上游协议：序列化 `"responses"`/`"chat_completions"`/`"anthropic"`；反序列化兼容 `"chat"`/`"messages"` 等。
+/// 上游协议:序列化 `"responses"`/`"chat_completions"`/`"anthropic"`/`"gemini"`;反序列化兼容 `"chat"`/`"messages"` 等。
+/// `gemini`(多平台阶段 C):上游原生 Google generateContent 协议(2xa 实测支持),/v1beta 入口透传不转换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireApi {
     Responses,
     ChatCompletions,
     Anthropic,
+    Gemini,
 }
 
 impl Default for WireApi {
@@ -70,6 +72,7 @@ impl WireApi {
             "responses" => Some(Self::Responses),
             "chat_completions" | "chatcompletions" | "chat" => Some(Self::ChatCompletions),
             "anthropic" | "messages" => Some(Self::Anthropic),
+            "gemini" | "generatecontent" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -173,7 +176,8 @@ fn default_agent() -> String {
     "codex".to_string()
 }
 
-/// agent 白名单归一化:空 / 未知 → 默认 `"codex"`(白名单来自 agents 注册表的已实现平台,A 阶段恒为 codex/claude)。
+/// agent 白名单归一化:空 / 未知 → 默认 `"codex"`(白名单来自 agents 注册表的已实现平台;
+/// gemini 随阶段 C 第一段在注册表置 available=true,此处零改动)。
 fn normalize_agent(agent: &str) -> String {
     let norm = agent.trim().to_ascii_lowercase();
     if crate::agents::find(&norm).map_or(false, |m| m.available) {
@@ -1097,14 +1101,15 @@ mod tests {
 
     #[test]
     fn value_to_input_and_update_normalize_agent() {
-        // 缺省 / 空 / 非法(白名单外)→ codex;白名单内 → 原样(codex / claude)
+        // 缺省 / 空 / 非法(白名单外)→ codex;白名单内 → 原样(codex / claude / gemini)
         assert_eq!(value_to_input(&json!({"name":"X","model":"m"})).agent, "codex");
         assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":""})).agent, "codex");
         assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"codex"})).agent, "codex");
         assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"  Claude  "})).agent, "claude");
         assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"CLAUDE"})).agent, "claude");
-        // 未知(白名单外)→ codex
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"gemini"})).agent, "codex");
+        // gemini(多平台阶段 C 白名单扩容)原样保留;未知(白名单外)→ codex
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"gemini"})).agent, "gemini");
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m","agent":"grok"})).agent, "codex");
         // update 对缺省 agent 输入归一化为 codex
         let path = tmp_path("agent_update");
         let mut i = sample_input("AU", AccessMode::Official);

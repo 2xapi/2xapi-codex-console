@@ -7,6 +7,7 @@
 //! 注册表即产品事实源:前端导航(D3 决策「A 后一次全亮,未实现标即将上线」)与
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
 
+pub mod gemini;
 pub mod hermes;
 pub mod workbuddy;
 
@@ -50,8 +51,8 @@ static REGISTRY: &[AgentMeta] = &[
     AgentMeta {
         id: "gemini",
         name: "Gemini CLI",
-        tip: "Gemini CLI(即将上线)",
-        available: false,
+        tip: "Gemini CLI",
+        available: true,
         egress: "gemini",
         hosting: "config",
     },
@@ -159,13 +160,11 @@ mod tests {
         assert!(!all.contains(&"pi"), "pi 已裁撤,不得出现在注册表");
     }
 
-    /// 可用平台 ⊇ codex/claude/workbuddy(workbuddy 为 B 阶段第一个接入的新平台;
-    /// 包含式断言——并行平台批次(如 hermes)会继续追加,名单不在此写死)。
+    /// 可用平台 = codex/claude/gemini/hermes/workbuddy(gemini 阶段 C、hermes B 阶段接入;
+    /// workbuddy 为 B 阶段第一个新平台。顺序 = REGISTRY 声明序)。
     #[test]
     fn supported_ids_includes_workbuddy() {
-        let ids = supported_ids();
-        assert!(ids.contains(&"codex") && ids.contains(&"claude") && ids.contains(&"workbuddy"));
-        assert_eq!(ids[0], "codex");
+        assert_eq!(supported_ids(), vec!["codex", "claude", "gemini", "hermes", "workbuddy"]);
     }
 
     /// find 大小写不敏感;未注册 id 返回 None(泛化路由据此 404)。

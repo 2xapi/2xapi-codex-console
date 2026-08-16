@@ -17,6 +17,7 @@ mod backups;
 mod history;
 mod gateway;
 mod gateway_conv;
+mod gateway_gemini_conv;
 mod diagnose;
 mod acclines;
 mod nodecreds;
@@ -74,6 +75,12 @@ fn main() {
                 .unwrap_or_default(),
         ),
         hermes_home: crate::agents::hermes::hermes_home(),
+        // gemini 载体根(~/.gemini 所在);测试传 tempdir
+        gem_home: std::path::PathBuf::from(
+            std::env::var("HOME").ok().filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .unwrap_or_default(),
+        ),
         launcher: launcher_state,
         health: health_state.clone(),
         accel: accel_state,
