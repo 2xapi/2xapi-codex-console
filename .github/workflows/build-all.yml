@@ -5,6 +5,9 @@ on:
   push:
     tags: ['v*']          # 打 tag 自动打包
 
+permissions:
+  contents: write   # Release 发布需要
+
 jobs:
   build:
     strategy:
