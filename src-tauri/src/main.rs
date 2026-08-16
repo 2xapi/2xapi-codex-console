@@ -8,6 +8,7 @@ mod server;
 mod launcher;
 mod config;
 mod desktop;
+mod grok_config;
 mod providers;
 mod probe;
 mod sessions;
