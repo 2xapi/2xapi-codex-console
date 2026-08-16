@@ -881,12 +881,12 @@ function applyPreset(pid) {
   if (!p) return;
   state.edit.name = p.name;
   state.edit.baseUrl = p.baseUrl || "";
-  state.edit.wireApi = p.proto === "chat" ? "chat_completions" : p.proto;
   state.edit.iconColor = p.iconColor || null;
   document.getElementById("eName").value = p.name;
   document.getElementById("eUrl").value = p.baseUrl || "";
+  /* 协议保持「自动」:网关自动转译+拉取模型时探测回写,不预填 */
   var w = document.getElementById("eWire");
-  if (w) w.value = (p.proto === "chat" ? "chat_completions" : p.proto);
+  if (w) w.value = "auto";
   showToast("已填入「" + p.name + "」预设:补上 API Key,点「拉取模型」选默认模型即可", "ok");
 }
 
