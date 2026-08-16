@@ -894,7 +894,9 @@ function applyPreset(pid) {
   /* 协议保持「自动」:网关自动转译+拉取模型时探测回写,不预填 */
   var w = document.getElementById("eWire");
   if (w) w.value = "auto";
-  showToast("已填入「" + p.name + "」预设:补上 API Key,点「拉取模型」选默认模型即可", "ok");
+  showToast(p.top
+    ? "已填入「" + p.name + "」预设:API Key 填站内的 sk- 开头密钥;若「拉取模型」被站点限制,点「＋ 手动加一行」填模型名即可"
+    : "已填入「" + p.name + "」预设:补上 API Key,点「拉取模型」选默认模型即可", "ok");
 }
 
 function openEdit(id) {

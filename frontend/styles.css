@@ -192,5 +192,5 @@ button { font-family: inherit; }
 .preset-item .pn { font-size: 12px; font-weight: 600; color: #E8ECF4; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .preset-item .pe { font-size: 10px; color: #6b7890; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .preset-item.top { border-color: #3D7EFF; background: rgba(61,126,255,.08); }
-.line-chip.logo { padding: 2px; }
+.line-chip.logo { padding: 3px; background: #F0F3F8; }
 .line-chip.logo img { width: 100%; height: 100%; object-fit: contain; display: block; }
