@@ -179,13 +179,15 @@ async function refreshAll() {
 
 /* ── 渲染 ── */
 function renderNav() {
-  var noRail = state.view === "history";
+  var noRail = state.view === "history" || state.view === "eco";
   document.getElementById("frame").classList.toggle("no-rail", noRail);
   document.querySelectorAll(".nav-btn.agent").forEach(function (b) {
     b.classList.toggle("on", b.dataset.g === state.agent);
   });
   var hb = document.getElementById("nv-history");
   if (hb) hb.classList.toggle("on", state.view === "history");
+  var eb = document.getElementById("nv-eco");
+  if (eb) eb.classList.toggle("on", state.view === "eco");
   /* 网关 chip:地址 + 存活灯 */
   var gw = (state.dstate && state.dstate.gateway) || null;
   var chip = document.getElementById("gwChip");
@@ -254,6 +256,7 @@ function renderRailRows() {
 function renderContent() {
   var c = document.getElementById("content"); if (!c) return;
   if (state.view === "history") c.innerHTML = historyHtml();
+  else if (state.view === "eco") c.innerHTML = ecoCenterHtml();
   else c.innerHTML = (state.agent === "claude") ? claudeDashHtml()
     : (state.agent === "hermes") ? hermesDashHtml()
     : GW_AGENTS[state.agent] ? genericDashHtml(state.agent)
@@ -747,6 +750,124 @@ function hermesDashHtml() {
 }
 
 /* ── 历史会话视图(Codex 走 db 列表+修复;Claude 走 ~/.claude jsonl 只读列表)── */
+/* ── 生态中心(开发组·生态中心 A 段):平台 tab + MCP 服务器管理 + 预设市场 ──
+ * 后端契约:GET|POST /api/desktop/:agent/eco(信封 data={servers,tabs});手动条目只读(409 拒写)。
+ * 插件/技能 tab 为占位(B/C 段铺开);平台清单来自 /api/desktop/eco-presets。 */
+var ECO_STATE = { agent: "codex", tab: "mcp", data: null, presets: null, agentsList: null, loading: false };
+function loadEco(force) {
+  ECO_STATE.loading = true; render();
+  var p = api.ecoPresets().then(function (v) {
+    ECO_STATE.presets = (v && v.presets) || [];
+    ECO_STATE.agentsList = (v && v.agents) || [];
+  }).catch(function () { ECO_STATE.presets = []; });
+  var l = api.ecoList(ECO_STATE.agent).then(function (v) {
+    ECO_STATE.data = v;
+  }).catch(function (e) {
+    ECO_STATE.data = { error: e.message };
+  }).finally(function () { ECO_STATE.loading = false; });
+  return Promise.all([p, l]).then(function () { if (state.view === "eco") render(); });
+}
+function ecoServers() { return (ECO_STATE.data && ECO_STATE.data.servers) || []; }
+function ecoPresetInstalled(id) { return ecoServers().some(function (s) { return s.id === id; }); }
+function ecoCenterHtml() {
+  var agents = (ECO_STATE.agentsList && ECO_STATE.agentsList.length) ? ECO_STATE.agentsList : [{ id: "codex", name: "Codex" }, { id: "cursor", name: "Cursor" }];
+  var tabs = (ECO_STATE.data && ECO_STATE.data.tabs) || [
+    { id: "mcp", label: "MCP 服务器", ready: true }, { id: "plugins", label: "插件", ready: false }, { id: "skills", label: "技能", ready: false }
+  ];
+  var html = '<section class="card">'
+    + '<h2>🌱 生态中心 · 插件 / MCP / 技能</h2>'
+    + '<div class="sub" style="margin:4px 0 12px">为各平台管理工具生态:叠加写入 · 零触碰已有(手动添加的条目只读)· 备份先行 · 可随时卸载还原。</div>'
+    + '<div class="eco-tabs">';
+  agents.forEach(function (m) {
+    html += '<button class="eco-tab ' + (ECO_STATE.agent === m.id ? "on" : "") + '" data-a="eco-agent" data-g="' + esc(m.id) + '">' + esc(m.name) + '</button>';
+  });
+  html += '</div><div class="eco-tabs">';
+  tabs.forEach(function (tb) {
+    html += '<button class="eco-tab ' + (ECO_STATE.tab === tb.id ? "on" : "") + (tb.ready ? "" : " disabled") + '"'
+      + (tb.ready ? ' data-a="eco-tab" data-g="' + esc(tb.id) + '"' : ' title="即将上线"') + '>' + esc(tb.label) + (tb.ready ? ' (' + ecoServers().length + ')' : '') + '</button>';
+  });
+  html += '</div>';
+  if (ECO_STATE.loading) {
+    html += '<div class="sub" style="padding:20px 0;text-align:center">加载中…</div></section>';
+    return html;
+  }
+  if (ECO_STATE.data && ECO_STATE.data.error) {
+    html += '<div style="padding:10px 12px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.4);border-radius:8px;font-size:11.5px;color:#FFBAB4">'
+      + esc(ECO_STATE.data.error) + '</div></section>';
+    return html;
+  }
+  if (ECO_STATE.tab !== "mcp") {
+    html += '<div class="sub" style="padding:20px 0;text-align:center">即将上线(B/C 段铺开)</div></section>';
+    return html;
+  }
+  /* MCP 列表 */
+  var rows = ecoServers().map(function (s) {
+    var manual = s.source === "manual";
+    var srcTag = manual
+      ? '<span class="tag">手动添加</span>'
+      : '<span class="tag on" style="border-color:var(--c-gw);color:var(--c-gw)">Console</span>';
+    var stTag = s.enabled
+      ? '<span class="tag" style="border-color:var(--c-official);color:var(--c-official)">● 已启用</span>'
+      : '<span class="tag">○ 已停用</span>';
+    var ops = manual
+      ? '<span class="sub" style="font-size:10px">只读(手动条目)</span>'
+      : (s.enabled
+        ? '<button class="btn ghost" data-a="eco-op" data-op="disable" data-id="' + esc(s.id) + '">停用</button> '
+        : '<button class="btn ghost" data-a="eco-op" data-op="enable" data-id="' + esc(s.id) + '">启用</button> ')
+        + '<button class="btn ghost" data-a="eco-op" data-op="uninstall" data-id="' + esc(s.id) + '">卸载</button>';
+    return '<tr><td><b>' + esc(s.id) + '</b></td><td class="eco-summary">' + esc(s.summary || "") + '</td>'
+      + '<td>' + srcTag + '</td><td>' + stTag + '</td><td style="white-space:nowrap">' + ops + '</td></tr>';
+  }).join("");
+  html += '<table class="mtable"><thead><tr><th style="width:20%">MCP 服务器</th><th>命令 / 配置</th><th style="width:12%">来源</th><th style="width:12%">状态</th><th style="width:22%">操作</th></tr></thead>'
+    + (rows ? '<tbody>' + rows + '</tbody>' : '<tbody><tr><td colspan="5" class="sub" style="padding:14px 4px">还没有 MCP 服务器;从下方市场一键安装,或在平台配置中手动添加(手动条目这里只读展示)。</td></tr></tbody>')
+    + '</table>'
+    + '<div class="sub" style="margin-top:8px">⚙ 每条 = 平台原生 MCP 配置里的一个条目;操作前自动备份,卸载可完整还原。已安装的 CLI 需重启后生效。</div>'
+    + '</section>';
+  /* 预设市场 */
+  var cards = (ECO_STATE.presets || []).map(function (p) {
+    var installed = ecoPresetInstalled(p.id);
+    return '<div class="eco-card"><div class="ic">🔌</div><div style="min-width:0">'
+      + '<b>' + esc(p.name) + '</b><span class="d">' + esc(p.desc || "") + ((p.needsEnv && p.needsEnv.length) ? ' · 需 ' + esc(p.needsEnv.join(", ")) : '') + '</span></div>'
+      + (installed
+        ? '<span class="sub" style="font-size:10px;flex:none">已安装</span>'
+        : '<button class="eco-install" data-a="eco-install" data-id="' + esc(p.id) + '">点击安装</button>')
+      + '</div>';
+  }).join("");
+  html += '<section class="card" style="margin-top:12px"><h2>MCP 预设市场</h2>'
+    + '<div class="sub" style="margin:4px 0 10px">一键安装到当前平台(' + esc(agents.find(function (m) { return m.id === ECO_STATE.agent; }).name) + ');预设提炼自 cc-switch 与常用清单。</div>'
+    + '<div class="eco-grid">' + (cards || '<span class="sub">暂无预设</span>') + '</div></section>';
+  return html;
+}
+function doEcoOp(op, name) {
+  ECO_STATE.busy = name || op;
+  api.ecoOp(ECO_STATE.agent, { op: op, name: name }).then(function (v) {
+    ECO_STATE.data = v;
+    var label = { install: "安装", uninstall: "卸载", enable: "启用", disable: "停用" }[op] || op;
+    showToast(label + (name ? " " + name : "") + "完成", "ok");
+  }).catch(function (e) {
+    showToast(e.message || "操作失败", "error");
+  }).finally(function () {
+    ECO_STATE.busy = null;
+    if (state.view === "eco") render();
+  });
+}
+function doEcoInstall(presetId) {
+  var p = (ECO_STATE.presets || []).find(function (x) { return x.id === presetId; });
+  ECO_STATE.busy = presetId;
+  api.ecoOp(ECO_STATE.agent, { op: "install", presetId: presetId }).then(function (v) {
+    ECO_STATE.data = v;
+    var envNote = (p && p.needsEnv && p.needsEnv.length)
+      ? ";该服务器需要 " + p.needsEnv.join(", ") + " 环境变量,已按空值安装,请稍后在平台配置中补填"
+      : "";
+    showToast("已安装到 " + ECO_STATE.agent + envNote, "ok");
+  }).catch(function (e) {
+    showToast(e.message || "安装失败", "error");
+  }).finally(function () {
+    ECO_STATE.busy = null;
+    if (state.view === "eco") render();
+  });
+}
+
 function historyHtml() {  if (state.agent === "hermes") {
     /* Hermes 会话第一版不做(方案 §六);state.db 为 hermes 私有格式,后续批次再评估 */
     return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
@@ -1473,8 +1594,15 @@ document.addEventListener("click", function (ev) {
         if (state.agent === "codex") { loadSessions(); loadSessionsSettings(); }
         else loadClaudeSessions(true);
       }
+      if (state.view === "eco") loadEco();
       break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
+    case "eco-agent":
+      if (ECO_STATE.agent !== t.dataset.g) { ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; loadEco(); }
+      break;
+    case "eco-tab": ECO_STATE.tab = t.dataset.g; render(); break;
+    case "eco-install": doEcoInstall(t.dataset.id); break;
+    case "eco-op": doEcoOp(t.dataset.op, t.dataset.id); break;
     case "accel": doAccel(t.dataset.m); break;
     case "user-menu": state.menuOpen = !state.menuOpen; renderTopAuth(); break;
     case "settings-open": openSettings(); break;

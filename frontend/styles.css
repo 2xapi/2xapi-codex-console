@@ -194,3 +194,17 @@ button { font-family: inherit; }
 .preset-item.top { border-color: #3D7EFF; background: rgba(61,126,255,.08); }
 .line-chip.logo { padding: 3px; background: #F0F3F8; }
 .line-chip.logo img { width: 100%; height: 100%; object-fit: contain; display: block; }
+
+/* ── 生态中心(开发组·生态中心 A 段):平台 tab / 三类 tab / MCP 市场网格 ── */
+.eco-tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.eco-tab { padding: 5px 14px; border-radius: 8px; border: 1px solid var(--hair); background: var(--raised); font-size: 12px; color: var(--muted); cursor: pointer; }
+.eco-tab.on { border-color: var(--c-gw); color: var(--c-gw); background: rgba(61,126,255,.08); }
+.eco-tab.disabled { opacity: .45; cursor: default; }
+.eco-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 8px; }
+.eco-card { display: flex; gap: 9px; align-items: center; background: var(--panel); border: 1px solid var(--hair); border-radius: 10px; padding: 9px 11px; }
+.eco-card .ic { width: 26px; height: 26px; border-radius: 7px; background: var(--raised); display: flex; align-items: center; justify-content: center; font-size: 14px; flex: none; }
+.eco-card b { display: block; font-size: 12px; }
+.eco-card span.d { font-size: 10px; color: var(--muted); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.eco-install { flex: none; font-size: 10px; color: var(--c-gw); white-space: nowrap; background: none; border: none; cursor: pointer; }
+.eco-install:hover { text-decoration: underline; }
+.eco-summary { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
