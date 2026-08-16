@@ -1847,7 +1847,6 @@ async fn handle_eco_presets() -> Response {
     ok_env(crate::agents::eco::presets_json())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2515,9 +2514,12 @@ mod tests {
             let app = app.clone();
             async move {
                 app.oneshot(
-                    Request::builder().method("POST").uri(uri)
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
                         .header("content-type", "application/json")
-                        .body(Body::from(body)).unwrap(),
+                        .body(Body::from(body))
+                        .unwrap(),
                 )
                 .await
                 .unwrap()
@@ -2537,7 +2539,10 @@ mod tests {
         let resp = post!("claude-desktop", r#"{"op":"install","presetId":"fetch"}"#);
         assert_eq!(resp.status(), StatusCode::OK, "cd install");
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cd_cfg).unwrap()).unwrap();
-        assert_eq!(doc["mcpServers"]["zhipu-vision"]["command"], "node", "用户 MCP 保留");
+        assert_eq!(
+            doc["mcpServers"]["zhipu-vision"]["command"], "node",
+            "用户 MCP 保留"
+        );
         assert_eq!(doc["mcpServers"]["GPT-image"]["command"], "g");
         assert_eq!(doc["mcpServers"]["fetch"]["command"], "uvx", "新条目写入");
         assert_eq!(doc["globalShortcut"], "Ctrl+X", "其他键保留");
@@ -2597,20 +2602,32 @@ mod tests {
         let trae_cfg = root.join("traehome").join(".trae").join("mcp.json");
         let resp = post!("trae", r#"{"op":"install","presetId":"playwright"}"#);
         assert_eq!(resp.status(), StatusCode::OK, "trae install");
-        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
         assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx");
         let resp = post!("trae", r#"{"op":"uninstall","name":"playwright"}"#);
         assert_eq!(resp.status(), StatusCode::OK);
-        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
         assert!(doc.get("mcpServers").is_none());
 
         // ── 装时填参:filesystem 缺参 400,带参成功 ──
         let resp = post!("codex", r#"{"op":"install","presetId":"filesystem"}"#);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "缺 DIR 应 400");
-        let resp = post!("codex", r#"{"op":"install","presetId":"filesystem","params":{"DIR":"/tmp/eco-test"}}"#);
+        let resp = post!(
+            "codex",
+            r#"{"op":"install","presetId":"filesystem","params":{"DIR":"/tmp/eco-test"}}"#
+        );
         assert_eq!(resp.status(), StatusCode::OK, "带参 install");
-        let t: toml::Value = std::fs::read_to_string(root.join("config.toml")).unwrap().parse().unwrap();
-        assert_eq!(t["mcp_servers"]["filesystem"]["args"][2].as_str(), Some("/tmp/eco-test"), "$DIR 替换");
+        let t: toml::Value = std::fs::read_to_string(root.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            t["mcp_servers"]["filesystem"]["args"][2].as_str(),
+            Some("/tmp/eco-test"),
+            "$DIR 替换"
+        );
     }
 
     /// C 段 e2e:claude-code/workbuddy MCP 补平台 + codex 原生停用 list 层 + 技能路由。
@@ -2622,9 +2639,12 @@ mod tests {
             let app = app.clone();
             async move {
                 app.oneshot(
-                    Request::builder().method("POST").uri(uri)
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
                         .header("content-type", "application/json")
-                        .body(Body::from(body)).unwrap(),
+                        .body(Body::from(body))
+                        .unwrap(),
                 )
                 .await
                 .unwrap()
@@ -2633,45 +2653,111 @@ mod tests {
 
         // claude-code(User scope):projects 等键保留
         let cj = root.join(".claude.json");
-        std::fs::write(&cj, r#"{"numStartups": 42, "mcpServers": {}, "projects": {"a": {"x": 1}}}"#).unwrap();
-        let resp = post("/api/desktop/claude/eco".into(), r#"{"op":"install","presetId":"fetch"}"#.into()).await;
+        std::fs::write(
+            &cj,
+            r#"{"numStartups": 42, "mcpServers": {}, "projects": {"a": {"x": 1}}}"#,
+        )
+        .unwrap();
+        let resp = post(
+            "/api/desktop/claude/eco".into(),
+            r#"{"op":"install","presetId":"fetch"}"#.into(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK, "claude install");
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cj).unwrap()).unwrap();
         assert_eq!(doc["numStartups"], 42, "其他键保留");
         assert_eq!(doc["mcpServers"]["fetch"]["command"], "uvx");
-        let resp = post("/api/desktop/claude/eco".into(), r#"{"op":"uninstall","name":"fetch"}"#.into()).await;
+        let resp = post(
+            "/api/desktop/claude/eco".into(),
+            r#"{"op":"uninstall","name":"fetch"}"#.into(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cj).unwrap()).unwrap();
-        assert!(doc.get("mcpServers").is_none() || doc["mcpServers"].as_object().unwrap().is_empty());
+        assert!(
+            doc.get("mcpServers").is_none() || doc["mcpServers"].as_object().unwrap().is_empty()
+        );
         assert_eq!(doc["numStartups"], 42);
 
         // workbuddy(.mcp.json):connector-proxy 手动条目零触碰
         let wm = root.join(".workbuddy").join(".mcp.json");
         std::fs::create_dir_all(root.join(".workbuddy")).unwrap();
         std::fs::write(&wm, r#"{"mcpServers":{"connector-proxy":{"type":"http","url":"http://127.0.0.1:63685/mcp"}}}"#).unwrap();
-        let resp = post("/api/desktop/workbuddy/eco".into(), r#"{"op":"install","presetId":"memory"}"#.into()).await;
+        let resp = post(
+            "/api/desktop/workbuddy/eco".into(),
+            r#"{"op":"install","presetId":"memory"}"#.into(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK, "workbuddy install");
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&wm).unwrap()).unwrap();
-        assert_eq!(doc["mcpServers"]["connector-proxy"]["url"], "http://127.0.0.1:63685/mcp", "手动 http 条目零触碰");
+        assert_eq!(
+            doc["mcpServers"]["connector-proxy"]["url"], "http://127.0.0.1:63685/mcp",
+            "手动 http 条目零触碰"
+        );
         assert_eq!(doc["mcpServers"]["memory"]["command"], "npx");
-        let resp = post("/api/desktop/workbuddy/eco".into(), r#"{"op":"install","name":"connector-proxy","spec":{"command":"x"}}"#.into()).await;
+        let resp = post(
+            "/api/desktop/workbuddy/eco".into(),
+            r#"{"op":"install","name":"connector-proxy","spec":{"command":"x"}}"#.into(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT, "手动条目拒写");
-        let resp = post("/api/desktop/workbuddy/eco".into(), r#"{"op":"uninstall","name":"memory"}"#.into()).await;
+        let resp = post(
+            "/api/desktop/workbuddy/eco".into(),
+            r#"{"op":"uninstall","name":"memory"}"#.into(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // codex 原生停用 list 层
-        let resp = post("/api/desktop/codex/eco".into(), r#"{"op":"install","presetId":"fetch"}"#.into()).await;
+        let resp = post(
+            "/api/desktop/codex/eco".into(),
+            r#"{"op":"install","presetId":"fetch"}"#.into(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let resp = post("/api/desktop/codex/eco".into(), r#"{"op":"disable","name":"fetch"}"#.into()).await;
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp = post(
+            "/api/desktop/codex/eco".into(),
+            r#"{"op":"disable","name":"fetch"}"#.into(),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
-        let fetch = v["data"]["servers"].as_array().unwrap().iter().find(|x| x["id"] == "fetch").unwrap();
+        let fetch = v["data"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == "fetch")
+            .unwrap();
         assert_eq!(fetch["enabled"], Value::Bool(false), "list 应报停用(原生)");
 
         // 技能已裁撤(总部修订):openclaw 无 MCP 载体 → 404;skills 路由不存在
-        let resp = app.clone().oneshot(Request::builder().uri("/api/desktop/openclaw/eco").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "openclaw 无 MCP 载体应 404");
-        let resp = app.clone().oneshot(Request::builder().uri("/api/desktop/hermes/skills").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/desktop/openclaw/eco")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "openclaw 无 MCP 载体应 404"
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/desktop/hermes/skills")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "skills 路由已裁撤");
     }
 

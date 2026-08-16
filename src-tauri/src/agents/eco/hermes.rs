@@ -15,7 +15,9 @@ pub struct HermesStore {
 
 impl HermesStore {
     pub fn new(hermes_home: &Path) -> Self {
-        Self { path: hermes_home.join("config.yaml") }
+        Self {
+            path: hermes_home.join("config.yaml"),
+        }
     }
 }
 
@@ -28,7 +30,11 @@ fn find_section_range(raw: &str, key: &str) -> Option<(usize, usize)> {
     for line in raw.split_inclusive('\n') {
         let trimmed = line.trim_start();
         let is_top = line.len() == trimmed.len();
-        if is_top && !trimmed.starts_with('#') && !trimmed.starts_with("- ") && trimmed.contains(':') {
+        if is_top
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with("- ")
+            && trimmed.contains(':')
+        {
             let k = trimmed.split(':').next().unwrap_or("").trim();
             if !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 all_sections.push((offset, 0));
@@ -38,17 +44,17 @@ fn find_section_range(raw: &str, key: &str) -> Option<(usize, usize)> {
     }
     // 每段终点 = 下一段行首(末段 = 文件尾)
     for i in 0..all_sections.len() {
-        all_sections[i].1 = all_sections.get(i + 1).map(|&(s, _)| s).unwrap_or(raw.len());
+        all_sections[i].1 = all_sections
+            .get(i + 1)
+            .map(|&(s, _)| s)
+            .unwrap_or(raw.len());
     }
-    let (idx, &(start, _)) = all_sections
-        .iter()
-        .enumerate()
-        .find(|&(_, &(s, _))| {
-            let line_end = raw[s..].find('\n').map(|e| s + e + 1).unwrap_or(raw.len());
-            let line = &raw[s..line_end];
-            let t = line.trim_start();
-            !t.starts_with('#') && t.starts_with(&key_pat) && line.len() - t.len() == 0
-        })?;
+    let (idx, &(start, _)) = all_sections.iter().enumerate().find(|&(_, &(s, _))| {
+        let line_end = raw[s..].find('\n').map(|e| s + e + 1).unwrap_or(raw.len());
+        let line = &raw[s..line_end];
+        let t = line.trim_start();
+        !t.starts_with('#') && t.starts_with(&key_pat) && line.len() - t.len() == 0
+    })?;
     Some((start, all_sections[idx].1))
 }
 
@@ -97,14 +103,25 @@ fn read_yaml(path: &Path) -> Result<serde_yaml::Value, super::OpError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(serde_yaml::Value::Mapping(Default::default()))
         }
-        Err(e) => return Err((500, "E_IO".to_string(), format!("读取 config.yaml 失败: {e}"))),
+        Err(e) => {
+            return Err((
+                500,
+                "E_IO".to_string(),
+                format!("读取 config.yaml 失败: {e}"),
+            ))
+        }
     };
     if raw.trim().is_empty() {
         return Ok(serde_yaml::Value::Mapping(Default::default()));
     }
     let healed = deduplicate_top_level_keys(&raw);
-    serde_yaml::from_str(&healed)
-        .map_err(|_| (500, "E_PARSE".to_string(), "config.yaml 不是合法 YAML,已拒绝写入(避免破坏手动配置);请先修复该文件".to_string()))
+    serde_yaml::from_str(&healed).map_err(|_| {
+        (
+            500,
+            "E_PARSE".to_string(),
+            "config.yaml 不是合法 YAML,已拒绝写入(避免破坏手动配置);请先修复该文件".to_string(),
+        )
+    })
 }
 
 fn yaml_to_json(v: &serde_yaml::Value) -> Value {
@@ -184,7 +201,8 @@ fn replace_section(raw: &str, value: &serde_yaml::Value) -> Result<String, Strin
             out.push_str(&raw[..start]);
             out.push_str(&serialized);
             let remainder = remove_all_sections(&raw[end..], "mcp_servers");
-            if !serialized.ends_with('\n') && !remainder.is_empty() && !remainder.starts_with('\n') {
+            if !serialized.ends_with('\n') && !remainder.is_empty() && !remainder.starts_with('\n')
+            {
                 out.push('\n');
             }
             out.push_str(&remainder);
@@ -226,7 +244,13 @@ impl EcoStore for HermesStore {
         let raw = match std::fs::read_to_string(&self.path) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err((500, "E_IO".to_string(), format!("读取 config.yaml 失败: {e}"))),
+            Err(e) => {
+                return Err((
+                    500,
+                    "E_IO".to_string(),
+                    format!("读取 config.yaml 失败: {e}"),
+                ))
+            }
         };
         let mut mapping = serde_yaml::Mapping::new();
         for (k, v) in servers {
@@ -235,7 +259,13 @@ impl EcoStore for HermesStore {
         let new_raw = replace_section(&raw, &serde_yaml::Value::Mapping(mapping))
             .map_err(|e| (500, "E_IO".to_string(), e))?;
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| (500, "E_IO".to_string(), format!("创建 hermes 目录失败: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                (
+                    500,
+                    "E_IO".to_string(),
+                    format!("创建 hermes 目录失败: {e}"),
+                )
+            })?;
         }
         let tmp = self.path.with_extension("yaml.tmp");
         std::fs::write(&tmp, &new_raw)

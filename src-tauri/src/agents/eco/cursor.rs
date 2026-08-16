@@ -1,7 +1,10 @@
 //! JSON 载体生态 adapter:B 段泛化,Cursor / TRAE / Claude Desktop 共用。
 //! - cursor:`~/.cursor/mcp.json`(mcpServers 段)
-//! - trae:`~/.trae/mcp.json`(mcpServers 段;E1 定案,与 Cursor 同构,docs.trae.ai 官方)
-//! - claude-desktop:`claude_desktop_config.json`(mcpServers 段;文件含用户其他键,只动本段)
+//! - trae:`~/.trae/mcp.json`(mcpServers 段;E1 定案,与 Cursor 同构,
+//!   docs.trae.ai 官方)
+//! - claude-desktop:`claude_desktop_config.json`(mcpServers 段;文件含用户
+//!   其他键,只动本段)
+//!
 //! 读:不存在 → 空;parse 失败 → E_PARSE 拒碰(workbuddy 先例)。
 //! 写:读→改段→pretty JSON 原子写,其余顶层键保留。
 
@@ -24,7 +27,11 @@ impl JsonStore {
 
     /// 通用构造(段名默认 mcpServers)。
     pub fn at(id: &'static str, path: &Path) -> Self {
-        Self { id, path: path.to_path_buf(), section: "mcpServers" }
+        Self {
+            id,
+            path: path.to_path_buf(),
+            section: "mcpServers",
+        }
     }
 
     fn read_doc(&self) -> Result<serde_json::Map<String, Value>, super::OpError> {

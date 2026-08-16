@@ -227,7 +227,9 @@ pub fn list(store: &dyn EcoStore, codex_home: &Path) -> Result<Value, OpError> {
         };
         // 原生 enabled 平台(Codex):条目在场但可能 enabled=false(原生停用,不移除)
         let enabled = if store.native_enabled() {
-            spec.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+            spec.get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
         } else {
             true
         };
@@ -587,7 +589,10 @@ pub fn preset_spec(p: &Preset, params: Option<&Value>) -> Result<Value, OpError>
             *a = a.replace(&format!("${}", param.key), &val);
         }
     }
-    obj.insert("args".into(), Value::Array(args.into_iter().map(|a| json!(a)).collect()));
+    obj.insert(
+        "args".into(),
+        Value::Array(args.into_iter().map(|a| json!(a)).collect()),
+    );
     if !p.needs_env.is_empty() {
         let mut env = Map::new();
         for k in p.needs_env {
@@ -753,7 +758,11 @@ mod tests {
         assert!(preset_spec(fs_p, None).is_err(), "filesystem 无参数应 400");
         let spec = preset_spec(fs_p, Some(&serde_json::json!({ "DIR": "/tmp/docs" }))).unwrap();
         assert_eq!(spec["args"][2], "/tmp/docs", "$DIR 占位应被替换");
-        assert_eq!(v["agents"].as_array().unwrap().len(), 9, "MCP 支持 9 平台(claude/workbuddy 在编,技能已裁撤)");
+        assert_eq!(
+            v["agents"].as_array().unwrap().len(),
+            9,
+            "MCP 支持 9 平台(claude/workbuddy 在编,技能已裁撤)"
+        );
     }
 
     #[test]
@@ -926,7 +935,7 @@ mod real {
 #[cfg(test)]
 mod real_b {
     use crate::agents::eco::*;
-    use std::collections::BTreeMap;
+
     use std::path::PathBuf;
 
     fn home() -> PathBuf {
@@ -941,7 +950,7 @@ mod real_b {
     }
 
     /// 通用全链:副本上 install → 已有条目/其他内容零变化 → uninstall → 还原。
-    fn cycle(store: &dyn EcoStore, tmp: &PathBuf, tag: &str) {
+    fn cycle(store: &dyn EcoStore, tmp: &std::path::Path, tag: &str) {
         let before = store.read().unwrap();
         println!("[{tag}] 已有条目: {:?}", before.keys().collect::<Vec<_>>());
         let spec = preset_spec(find_preset("memory").unwrap(), None).unwrap();
@@ -972,10 +981,17 @@ mod real_b {
         let cd_dir = t.join("Claude");
         std::fs::create_dir_all(&cd_dir).unwrap();
         std::fs::write(cd_dir.join("claude_desktop_config.json"), &orig).unwrap();
-        let store = crate::agents::eco::cursor::JsonStore::at("claude-desktop", &cd_dir.join("claude_desktop_config.json"));
+        let store = crate::agents::eco::cursor::JsonStore::at(
+            "claude-desktop",
+            &cd_dir.join("claude_desktop_config.json"),
+        );
         cycle(&store, &t, "claude-desktop");
         let doc: serde_json::Value = serde_json::from_slice(&orig).unwrap();
-        assert_eq!(doc["mcpServers"].as_object().unwrap().len(), 5, "前提:5 条用户 MCP");
+        assert_eq!(
+            doc["mcpServers"].as_object().unwrap().len(),
+            5,
+            "前提:5 条用户 MCP"
+        );
         let _ = std::fs::remove_dir_all(&t);
 
         // ── grokbuild ──
@@ -983,11 +999,15 @@ mod real_b {
         let grok_real = h.join(".grok").join("config.toml");
         if grok_real.exists() {
             std::fs::write(t.join("config.toml"), std::fs::read(&grok_real).unwrap()).unwrap();
-            let store = crate::agents::eco::codex::TomlStore::at("grokbuild", &t.join("config.toml"));
+            let store =
+                crate::agents::eco::codex::TomlStore::at("grokbuild", &t.join("config.toml"));
             cycle(&store, &t, "grokbuild");
             let _ = std::fs::remove_dir_all(&t);
         } else {
-            println!("[grokbuild] 真实 config.toml 不存在,跳过(路径:{})", grok_real.display());
+            println!(
+                "[grokbuild] 真实 config.toml 不存在,跳过(路径:{})",
+                grok_real.display()
+            );
         }
 
         // ── opencode ──
@@ -996,7 +1016,11 @@ mod real_b {
         if oc_real.exists() {
             let oc_dir = t.join(".config/opencode");
             std::fs::create_dir_all(&oc_dir).unwrap();
-            std::fs::write(oc_dir.join("opencode.json"), std::fs::read(&oc_real).unwrap()).unwrap();
+            std::fs::write(
+                oc_dir.join("opencode.json"),
+                std::fs::read(&oc_real).unwrap(),
+            )
+            .unwrap();
             let store = crate::agents::eco::opencode::OpencodeStore::new(&t);
             cycle(&store, &t, "opencode");
             let _ = std::fs::remove_dir_all(&t);
@@ -1015,10 +1039,20 @@ mod real_b {
             // 顶层段级 diff:mcp_servers 之外的文本应不变
             let final_text = std::fs::read_to_string(t.join("config.yaml")).unwrap();
             let strip = |s: &str| -> String {
-                s.lines().filter(|l| !l.trim_start().starts_with("memory") && !l.contains("server-memory") && !l.contains("mcp_servers"))
-                    .collect::<Vec<_>>().join("\n")
+                s.lines()
+                    .filter(|l| {
+                        !l.trim_start().starts_with("memory")
+                            && !l.contains("server-memory")
+                            && !l.contains("mcp_servers")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             };
-            assert_eq!(strip(&orig_text), strip(&final_text), "mcp_servers 段外文本必须逐行一致");
+            assert_eq!(
+                strip(&orig_text),
+                strip(&final_text),
+                "mcp_servers 段外文本必须逐行一致"
+            );
             let _ = std::fs::remove_dir_all(&t);
         } else {
             println!("[hermes] 真实 config.yaml 不存在,跳过");
@@ -1026,14 +1060,31 @@ mod real_b {
 
         // ── trae:真实写入(原文件不存在)→ 形状 → 卸载零残留 ──
         let mcp = h.join(".trae").join("mcp.json");
-        assert!(!mcp.exists(), "前提:~/.trae/mcp.json 不存在(存在则本测试不应运行)");
+        assert!(
+            !mcp.exists(),
+            "前提:~/.trae/mcp.json 不存在(存在则本测试不应运行)"
+        );
         let store = crate::agents::eco::cursor::JsonStore::at("trae", &mcp);
         let codex_data = h.join(".codex");
         let spec = preset_spec(find_preset("playwright").unwrap(), None).unwrap();
-        install(&store, &codex_data, &codex_data.join("config-backups"), "playwright", &spec).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        install(
+            &store,
+            &codex_data,
+            &codex_data.join("config-backups"),
+            "playwright",
+            &spec,
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
         assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx");
-        uninstall(&store, &codex_data, &codex_data.join("config-backups"), "playwright").unwrap();
+        uninstall(
+            &store,
+            &codex_data,
+            &codex_data.join("config-backups"),
+            "playwright",
+        )
+        .unwrap();
         let _ = std::fs::remove_file(&mcp);
         assert!(!mcp.exists(), "TRAE 零残留(只删 mcp.json,.trae 目录保留)");
         println!("[B 段真机] 五平台全链通过");
@@ -1098,13 +1149,39 @@ mod real_c {
         // 真实文件快速窗口:install→验证→uninstall 还原
         let real_store = crate::agents::eco::cursor::JsonStore::at("claude", &cj_real);
         let orig2 = std::fs::read(&cj_real).unwrap();
-        crate::agents::eco::install(&real_store, &h.join(".codex"), &h.join(".codex").join("config-backups"), "fetch", &spec).unwrap();
-        let doc3: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
+        crate::agents::eco::install(
+            &real_store,
+            &h.join(".codex"),
+            &h.join(".codex").join("config-backups"),
+            "fetch",
+            &spec,
+        )
+        .unwrap();
+        let doc3: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
         assert_eq!(doc3["mcpServers"]["fetch"]["command"], "uvx");
-        crate::agents::eco::uninstall(&real_store, &h.join(".codex"), &h.join(".codex").join("config-backups"), "fetch").unwrap();
-        let doc4: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
-        let mcp_now = doc4.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len()).unwrap_or(0);
-        let mcp_was = serde_json::from_slice::<serde_json::Value>(&orig2).ok().and_then(|d| d.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len())).unwrap_or(0);
+        crate::agents::eco::uninstall(
+            &real_store,
+            &h.join(".codex"),
+            &h.join(".codex").join("config-backups"),
+            "fetch",
+        )
+        .unwrap();
+        let doc4: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cj_real).unwrap()).unwrap();
+        let mcp_now = doc4
+            .get("mcpServers")
+            .and_then(|m| m.as_object())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mcp_was = serde_json::from_slice::<serde_json::Value>(&orig2)
+            .ok()
+            .and_then(|d| {
+                d.get("mcpServers")
+                    .and_then(|m| m.as_object())
+                    .map(|m| m.len())
+            })
+            .unwrap_or(0);
         assert_eq!(mcp_now, mcp_was, "uninstall 后 mcpServers 条目数还原");
         println!("[claude-code] 真实窗口过(原 {} 条 → 还原)", mcp_was);
 
@@ -1114,8 +1191,15 @@ mod real_c {
             let t2 = std::env::temp_dir().join(format!("2xapi-eco-c-wb-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&t2);
             std::fs::create_dir_all(t2.join(".workbuddy")).unwrap();
-            std::fs::write(t2.join(".workbuddy").join(".mcp.json"), std::fs::read(&wm_real).unwrap()).unwrap();
-            let wstore = crate::agents::eco::cursor::JsonStore::at("workbuddy", &t2.join(".workbuddy").join(".mcp.json"));
+            std::fs::write(
+                t2.join(".workbuddy").join(".mcp.json"),
+                std::fs::read(&wm_real).unwrap(),
+            )
+            .unwrap();
+            let wstore = crate::agents::eco::cursor::JsonStore::at(
+                "workbuddy",
+                &t2.join(".workbuddy").join(".mcp.json"),
+            );
             let wbefore = wstore.read().unwrap();
             let mspec = crate::agents::eco::preset_spec(
                 crate::agents::eco::find_preset("memory").unwrap(),

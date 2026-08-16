@@ -120,6 +120,9 @@ async fn dispatch_anthropic_for(
 
     // ── R1 加速装配(与 dispatch 同源):命中线 → 线 client 首选,直连兜底 ──
     let line = accel_plan(state, &provider.base_url, &provider.api_key);
+    // per-Key 凭证确保段(2026-08-17 后端开发部补接,与 codex/gemini 同体系):
+    // 凭证缺失/超 12h 同步签发;已降级直接直连
+    let line = ensure_line_cred(state, line, &provider.base_url, &provider.api_key).await;
     let direct_client = match build_client(&provider) {
         Ok(c) => c,
         Err(e) => {

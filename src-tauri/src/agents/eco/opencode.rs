@@ -15,7 +15,10 @@ pub struct OpencodeStore {
 impl OpencodeStore {
     pub fn new(oc_home: &Path) -> Self {
         Self {
-            path: oc_home.join(".config").join("opencode").join("opencode.json"),
+            path: oc_home
+                .join(".config")
+                .join("opencode")
+                .join("opencode.json"),
         }
     }
 
@@ -23,14 +26,23 @@ impl OpencodeStore {
         if !self.path.exists() {
             return Ok(Map::new());
         }
-        let raw = std::fs::read_to_string(&self.path)
-            .map_err(|e| (500, "E_IO".to_string(), format!("读取 opencode.json 失败: {e}")))?;
+        let raw = std::fs::read_to_string(&self.path).map_err(|e| {
+            (
+                500,
+                "E_IO".to_string(),
+                format!("读取 opencode.json 失败: {e}"),
+            )
+        })?;
         // 容忍 jsonc 尾注释/尾逗号:剥 // 行注释再 parse(cc-switch opencode_config 同款口径)
         let cleaned: String = raw
             .lines()
             .map(|l| {
                 let t = l.trim_start();
-                if t.starts_with("//") { "" } else { l }
+                if t.starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -39,17 +51,30 @@ impl OpencodeStore {
                 (
                     500,
                     "E_PARSE".to_string(),
-                    "opencode.json 不是合法 JSON,已拒绝写入(避免破坏手动配置);请先修复该文件".to_string(),
+                    "opencode.json 不是合法 JSON,已拒绝写入(避免破坏手动配置);请先修复该文件"
+                        .to_string(),
                 )
             })?
             .as_object()
             .cloned()
-            .ok_or_else(|| (500, "E_PARSE".to_string(), "opencode.json 顶层必须是对象".to_string()))
+            .ok_or_else(|| {
+                (
+                    500,
+                    "E_PARSE".to_string(),
+                    "opencode.json 顶层必须是对象".to_string(),
+                )
+            })
     }
 
     fn write_doc(&self, doc: &Map<String, Value>) -> Result<(), super::OpError> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| (500, "E_IO".to_string(), format!("创建 opencode 目录失败: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                (
+                    500,
+                    "E_IO".to_string(),
+                    format!("创建 opencode 目录失败: {e}"),
+                )
+            })?;
         }
         let text = serde_json::to_string_pretty(&Value::Object(doc.clone()))
             .map_err(|e| (500, "E_IO".to_string(), format!("JSON 编码失败: {e}")))?;
@@ -82,7 +107,10 @@ fn spec_to_entry(spec: &Value) -> Value {
 
 /// opencode 条目 → 通用 spec(command 数组拆首元素)。
 fn entry_to_spec(entry: &Value) -> Value {
-    let typ = entry.get("type").and_then(|v| v.as_str()).unwrap_or("local");
+    let typ = entry
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("local");
     if typ == "remote" {
         return entry.clone(); // remote 只读展示,summary 走 url
     }
@@ -97,7 +125,11 @@ fn entry_to_spec(entry: &Value) -> Value {
     } else if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
         m.insert("command".into(), json!(cmd));
     }
-    if let Some(env) = entry.get("environment").or_else(|| entry.get("env")).and_then(|v| v.as_object()) {
+    if let Some(env) = entry
+        .get("environment")
+        .or_else(|| entry.get("env"))
+        .and_then(|v| v.as_object())
+    {
         m.insert("env".into(), Value::Object(env.clone()));
     }
     if m.is_empty() {
@@ -159,10 +191,15 @@ mod tests {
         let root = root("roundtrip");
         let s = OpencodeStore::new(&root);
         let mut m = BTreeMap::new();
-        m.insert("fetch".to_string(), json!({ "command": "uvx", "args": ["mcp-server-fetch"], "env": { "K": "v" } }));
+        m.insert(
+            "fetch".to_string(),
+            json!({ "command": "uvx", "args": ["mcp-server-fetch"], "env": { "K": "v" } }),
+        );
         s.write(&m).unwrap();
-        let raw: Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join(".config/opencode/opencode.json")).unwrap()).unwrap();
+        let raw: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
         let entry = &raw["mcp"]["fetch"];
         assert_eq!(entry["type"], "local");
         assert_eq!(entry["command"][0], "uvx");
@@ -180,7 +217,11 @@ mod tests {
         let root = root("jsonc");
         let path = root.join(".config/opencode/opencode.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "{\n  // 用户注释\n  \"theme\": \"dark\",\n  \"mcp\": {}\n}").unwrap();
+        std::fs::write(
+            &path,
+            "{\n  // 用户注释\n  \"theme\": \"dark\",\n  \"mcp\": {}\n}",
+        )
+        .unwrap();
         let s = OpencodeStore::new(&root);
         let mut m = BTreeMap::new();
         m.insert("a".to_string(), json!({ "command": "x" }));
@@ -198,8 +239,10 @@ mod tests {
         m.insert("a".to_string(), json!({ "command": "x" }));
         s.write(&m).unwrap();
         s.write(&BTreeMap::new()).unwrap();
-        let doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join(".config/opencode/opencode.json")).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
         assert!(doc.get("mcp").is_none());
     }
 }
