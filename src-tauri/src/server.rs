@@ -1851,6 +1851,14 @@ fn eco_store_for(
             "grokbuild",
             &s.grok_home.join("config.toml"),
         ))),
+        // OpenClaw:openclaw.json 的 mcp.servers 嵌套段(补齐,2026-08-17 CLI 隔离 HOME 实证);
+        // enabled:false=原生停用,与 Codex 同走 native_enabled 通路
+        Some("openclaw") => Ok(Box::new(eco::cursor::JsonStore::nested(
+            "openclaw",
+            &s.oclaw_home.join("openclaw.json"),
+            &["mcp", "servers"],
+            true,
+        ))),
         Some("opencode") => Ok(Box::new(eco::opencode::OpencodeStore::new(&s.oc_home))),
         Some("hermes") => Ok(Box::new(eco::hermes::HermesStore::new(&s.hermes_home))),
         _ => Err((
@@ -2726,7 +2734,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["data"]["presets"].as_array().unwrap().len(), 8);
-        assert_eq!(v["data"]["agents"].as_array().unwrap().len(), 9);
+        assert_eq!(v["data"]["agents"].as_array().unwrap().len(), 10);
     }
 
     /// 生态管理 B 段 e2e:五平台 install→形状+零触碰→uninstall;装时填参 400。
@@ -2957,22 +2965,69 @@ mod tests {
             .unwrap();
         assert_eq!(fetch["enabled"], Value::Bool(false), "list 应报停用(原生)");
 
-        // 技能已裁撤(总部修订):openclaw 无 MCP 载体 → 404;skills 路由不存在
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/desktop/openclaw/eco")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        // openclaw MCP 补齐(mcp.servers 载体,技能裁撤批的 404 已反转):CLI 同款文档全链
+        let oj = root.join("oclaw").join("openclaw.json");
+        std::fs::create_dir_all(root.join("oclaw")).unwrap();
+        std::fs::write(
+            &oj,
+            r#"{"commands":{"restart":true},"mcp":{"servers":{"probe-x":{"command":"npx","args":["hello-server"]}}},"meta":{"lastTouchedVersion":"2026.7.1-2"}}"#,
+        )
+        .unwrap();
+        let resp = post(
+            "/api/desktop/openclaw/eco".into(),
+            r#"{"op":"install","name":"memory","spec":{"command":"npx","args":["-y","server-memory"]}}"#
+                .into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "openclaw install");
+        let v = body_json(resp).await;
+        let servers = v["data"]["servers"].as_array().unwrap();
+        let manual = servers.iter().find(|s| s["id"] == "probe-x").unwrap();
+        assert_eq!(manual["source"], "manual", "CLI 已有条目标手动");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&oj).unwrap()).unwrap();
+        assert_eq!(doc["mcp"]["servers"]["memory"]["command"], "npx", "嵌套段形状");
+        assert_eq!(doc["mcp"]["servers"]["probe-x"]["args"][0], "hello-server");
+        assert_eq!(doc["commands"]["restart"], true, "其他顶层键保留");
+
+        // disable → enabled:false 原位落盘(原生停用,与 Codex 同款);条目不移除
+        let resp = post(
+            "/api/desktop/openclaw/eco".into(),
+            r#"{"op":"disable","name":"memory"}"#.into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let mem = v["data"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "memory")
             .unwrap();
+        assert_eq!(mem["enabled"], Value::Bool(false), "list 应报停用(原生)");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&oj).unwrap()).unwrap();
         assert_eq!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "openclaw 无 MCP 载体应 404"
+            doc["mcp"]["servers"]["memory"]["enabled"],
+            Value::Bool(false),
+            "enabled:false 原位落盘"
         );
+
+        // enable → enabled:true;uninstall → 条目移除,probe-x 与其他键原样
+        let resp = post(
+            "/api/desktop/openclaw/eco".into(),
+            r#"{"op":"enable","name":"memory"}"#.into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = post(
+            "/api/desktop/openclaw/eco".into(),
+            r#"{"op":"uninstall","name":"memory"}"#.into(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&oj).unwrap()).unwrap();
+        assert!(doc["mcp"]["servers"].get("memory").is_none());
+        assert_eq!(doc["mcp"]["servers"]["probe-x"]["args"][0], "hello-server");
+        assert_eq!(doc["commands"]["restart"], true);
         let resp = app
             .clone()
             .oneshot(

@@ -16,8 +16,11 @@ use std::path::{Path, PathBuf};
 pub struct JsonStore {
     id: &'static str,
     path: PathBuf,
-    /// MCP 条目所在顶层键名(cursor/trae/claude-desktop 均为 mcpServers;opencode=mcp,另有转换,独立实现)
-    section: &'static str,
+    /// MCP 条目所在键路径:单层=[mcpServers](cursor/trae/claude-desktop/workbuddy/claude);
+    /// 嵌套=[mcp,servers](openclaw)。
+    sections: &'static [&'static str],
+    /// 平台条目是否原生支持 enabled 停用字段(openclaw 实证 true,同 Codex;其余 JSON 平台无)。
+    native_enabled: bool,
 }
 
 impl JsonStore {
@@ -25,12 +28,23 @@ impl JsonStore {
         Self::at("cursor", &cursor_home.join(".cursor").join("mcp.json"))
     }
 
-    /// 通用构造(段名默认 mcpServers)。
+    /// 通用构造(段名默认 mcpServers,无原生 enabled)。
     pub fn at(id: &'static str, path: &Path) -> Self {
+        Self::nested(id, path, &["mcpServers"], false)
+    }
+
+    /// 嵌套段构造(openclaw: mcp.servers)。
+    pub fn nested(
+        id: &'static str,
+        path: &Path,
+        sections: &'static [&'static str],
+        native_enabled: bool,
+    ) -> Self {
         Self {
             id,
             path: path.to_path_buf(),
-            section: "mcpServers",
+            sections,
+            native_enabled,
         }
     }
 
@@ -85,10 +99,18 @@ impl EcoStore for JsonStore {
         self.id
     }
 
+    fn native_enabled(&self) -> bool {
+        self.native_enabled
+    }
+
     fn read(&self) -> Result<BTreeMap<String, Value>, super::OpError> {
         let doc = self.read_doc()?;
+        let mut node = Value::Object(doc);
+        for k in self.sections {
+            node = node.get(*k).cloned().unwrap_or(Value::Null);
+        }
         let mut out = BTreeMap::new();
-        if let Some(servers) = doc.get(self.section).and_then(|v| v.as_object()) {
+        if let Some(servers) = node.as_object() {
             for (k, v) in servers {
                 out.insert(k.clone(), v.clone());
             }
@@ -99,14 +121,16 @@ impl EcoStore for JsonStore {
     fn write(&self, servers: &BTreeMap<String, Value>) -> Result<(), super::OpError> {
         let mut doc = self.read_doc()?;
         if servers.is_empty() {
-            doc.remove(self.section);
-        } else {
-            let mut m = serde_json::Map::new();
-            for (k, v) in servers {
-                m.insert(k.clone(), v.clone());
+            if remove_nested(&mut doc, self.sections) {
+                self.write_doc(&doc)?;
             }
-            doc.insert(self.section.to_string(), Value::Object(m));
+            return Ok(());
         }
+        let mut m = serde_json::Map::new();
+        for (k, v) in servers {
+            m.insert(k.clone(), v.clone());
+        }
+        set_nested(&mut doc, self.sections, Value::Object(m));
         self.write_doc(&doc)
     }
 
@@ -114,6 +138,40 @@ impl EcoStore for JsonStore {
         crate::config::backup_file(&self.path, backup_dir, "eco-apply", "pre-eco")
             .map_err(|e| (500, "E_IO".to_string(), e))
     }
+}
+
+/// 沿键路径写值:中间层缺失或非对象时覆盖为对象(openclaw: mcp.servers)。
+fn set_nested(obj: &mut serde_json::Map<String, Value>, keys: &[&str], v: Value) {
+    let (head, rest) = keys.split_first().expect("键路径非空");
+    if rest.is_empty() {
+        obj.insert(head.to_string(), v);
+        return;
+    }
+    let entry = obj
+        .entry(head.to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(serde_json::Map::new());
+    }
+    set_nested(entry.as_object_mut().unwrap(), rest, v);
+}
+
+/// 沿键路径删末层键;父层因此变空则连带删除(零残留,与单层段语义一致)。
+fn remove_nested(obj: &mut serde_json::Map<String, Value>, keys: &[&str]) -> bool {
+    let Some((head, rest)) = keys.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return obj.remove(*head).is_some();
+    }
+    let Some(child) = obj.get_mut(*head).and_then(|v| v.as_object_mut()) else {
+        return false;
+    };
+    let removed = remove_nested(child, rest);
+    if removed && child.is_empty() {
+        obj.remove(*head);
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -209,5 +267,66 @@ mod tests {
             std::fs::read_dir(&bk).unwrap().count() >= 1,
             "备份目录应有快照"
         );
+    }
+
+    /// openclaw 形状(2026-08-17 CLI 隔离 HOME 实证:`openclaw mcp add` 落盘
+    /// mcp.servers.<name>={command,args,env?,enabled?},enabled:false=原生停用,无键=启用;
+    /// 同文档并存 commands/messages/agents/cron/meta 等其他顶层键)。
+    fn openclaw_doc() -> &'static str {
+        r#"{
+  "commands": { "native": "auto", "restart": true },
+  "mcp": {
+    "servers": {
+      "probe-x": { "command": "npx", "args": ["hello-server"] }
+    }
+  },
+  "messages": { "ackReactionScope": "group-mentions" },
+  "meta": { "lastTouchedVersion": "2026.7.1-2" }
+}"#
+    }
+
+    #[test]
+    fn nested_read_write_preserves_other_keys() {
+        let root = root("openclaw");
+        let dir = root.join(".openclaw");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("openclaw.json");
+        std::fs::write(&path, openclaw_doc()).unwrap();
+        let s = JsonStore::nested("openclaw", &path, &["mcp", "servers"], true);
+        assert!(s.native_enabled(), "openclaw 原生 enabled(实证 enabled:false)");
+
+        let mut before = s.read().unwrap();
+        assert_eq!(before.keys().collect::<Vec<_>>(), vec!["probe-x"]);
+        // 写入 Console 条目:已有 probe-x 与 mcp 外其他键零变化
+        before.insert(
+            "memory".to_string(),
+            json!({ "command": "npx", "args": ["-y", "server-memory"] }),
+        );
+        s.write(&before).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["mcp"]["servers"]["probe-x"]["args"][0], "hello-server");
+        assert_eq!(doc["mcp"]["servers"]["memory"]["command"], "npx");
+        assert_eq!(doc["commands"]["restart"], true, "其他顶层键保留");
+        assert_eq!(doc["meta"]["lastTouchedVersion"], "2026.7.1-2");
+
+        // 清空:mcp 段整体移除(零残留),其他顶层键保留
+        s.write(&BTreeMap::new()).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(doc.get("mcp").is_none(), "mcp 空应连带移除");
+        assert!(doc.get("commands").is_some());
+        assert!(s.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nested_write_creates_missing_intermediates() {
+        let root = root("openclaw-new");
+        let path = root.join(".openclaw/openclaw.json");
+        let s = JsonStore::nested("openclaw", &path, &["mcp", "servers"], true);
+        assert!(s.read().unwrap().is_empty(), "文件不存在读为空");
+        let mut m = BTreeMap::new();
+        m.insert("a".to_string(), json!({ "command": "x" }));
+        s.write(&m).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["mcp"]["servers"]["a"]["command"], "x", "中间层自动创建");
     }
 }
