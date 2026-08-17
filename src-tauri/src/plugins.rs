@@ -138,6 +138,10 @@ pub fn routes() -> Router<Arc<crate::server::AppState>> {
             "/api/plugin-market/sources/:id",
             axum::routing::delete(handle_market_source_remove),
         )
+        .route(
+            "/api/plugin-market/sources/:id/plugins",
+            get(handle_source_plugins),
+        )
         .route("/api/plugin-market/install", post(handle_market_install))
 }
 
@@ -593,6 +597,33 @@ async fn handle_market_list(State(s): State<Arc<crate::server::AppState>>) -> Re
         StatusCode::OK,
         &json!({ "sources": sources, "official": official_market() }),
     )
+}
+
+/// 按源拉插件清单(遗留④闭环):官方源→内置清单;第三方源→实时拉取校验(M5 同口径)。
+async fn handle_source_plugins(
+    State(s): State<Arc<crate::server::AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if id == OFFICIAL_SOURCE {
+        return raw_json(
+            StatusCode::OK,
+            &json!({ "source_id": OFFICIAL_SOURCE, "plugins": official_market()["plugins"] }),
+        );
+    }
+    let Some(url) = load_sources(&s.codex_home)
+        .into_iter()
+        .find(|x| x["id"] == id.as_str())
+        .and_then(|x| x["url"].as_str().map(String::from))
+    else {
+        return err_env(StatusCode::NOT_FOUND, "E_NO_SOURCE", "源不存在,请先添加");
+    };
+    match fetch_market(&url).await {
+        Ok(m) => raw_json(
+            StatusCode::OK,
+            &json!({ "source_id": id, "plugins": m["plugins"] }),
+        ),
+        Err(e) => err_env(StatusCode::BAD_GATEWAY, "E_SOURCE_FETCH", &e),
+    }
 }
 
 async fn handle_market_source_add(

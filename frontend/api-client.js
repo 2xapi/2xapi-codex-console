@@ -105,6 +105,7 @@
   plugRemove: (id) => rawJson("DELETE", "/api/plugins/" + encodeURIComponent(id)),
   plugSrcAdd: (id, name, url) => rawJson("POST", "/api/plugin-market/sources", { id, name, url }),
   plugSrcDel: (id) => rawJson("DELETE", "/api/plugin-market/sources/" + encodeURIComponent(id)),
+  plugSrcList: (id) => rawJson("GET", "/api/plugin-market/sources/" + encodeURIComponent(id) + "/plugins"),
     desktopHost: async (providerId, way) => {
       const resp = await fetch("/api/desktop/host", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",

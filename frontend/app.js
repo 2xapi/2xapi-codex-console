@@ -942,7 +942,7 @@ function doEcoInstall(presetId, params) {
 /* ── 插件与能力市场(多模态引擎部 二期):官方能力条目 + http 插件 + 第三方源管理 ──
  * 后端契约(raw_json 形态):GET /api/plugins{plugins}+GET /api/plugin-market{sources,official};
  * 调用入口 POST /api/plugins/:id/invoke(M3 契约,错误 200 包错误带 human)。 */
-var PLUG_STATE = { market: null, installed: null, loading: false, srcForm: false, busy: null };
+var PLUG_STATE = { market: null, installed: null, loading: false, srcForm: false, busy: null, browse: null };
 function loadPlug() {
   PLUG_STATE.loading = true;
   var m = api.plugMarket().then(function (v) { PLUG_STATE.market = v; })
@@ -1018,7 +1018,9 @@ function plugSectionHtml() {
   var srcs = (mk.sources || []).filter(function (x) { return !x.builtin; });
   var srcRows = srcs.map(function (x) {
     return '<tr><td><b>' + esc(x.id) + '</b></td><td class="eco-summary">' + esc(x.name || "") + '</td>'
-      + '<td style="white-space:nowrap"><button class="btn ghost" data-a="plug-src-del" data-id="' + esc(x.id) + '">移除</button></td></tr>';
+      + '<td style="white-space:nowrap">'
+      + '<button class="btn ghost" data-a="plug-src-browse" data-id="' + esc(x.id) + '" data-name="' + esc(x.name || x.id) + '">浏览</button> '
+      + '<button class="btn ghost" data-a="plug-src-del" data-id="' + esc(x.id) + '">移除</button></td></tr>';
   }).join("");
   var srcForm = PLUG_STATE.srcForm
     ? '<div class="grid2" style="margin-top:8px">'
@@ -1033,6 +1035,26 @@ function plugSectionHtml() {
     + '<div class="sub" style="margin:4px 0 10px">仅 http(s) 静态 JSON 清单(M5 定案);schema 不识别整源拒收,清单只读不自动执行。</div>'
     + (srcRows ? '<table class="mtable"><tbody>' + srcRows + '</tbody></table>' : '<div class="sub" style="margin-bottom:8px">还没有第三方源。</div>')
     + srcForm + '</section>';
+  /* 浏览某源的插件清单 */
+  var br = PLUG_STATE.browse;
+  if (br) {
+    html += '<section class="card" style="margin-top:12px"><h2>源 ' + esc(br.name) + ' · 插件清单</h2>';
+    if (br.error) html += '<div style="padding:10px 12px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.4);border-radius:8px;font-size:11.5px;color:#FFBAB4">' + esc(br.error) + '</div>';
+    else if (br.loading) html += '<div class="sub" style="padding:14px 0;text-align:center">加载中…</div>';
+    else {
+      var brCards = (br.plugins || []).map(function (p) {
+        var inst = plugInstalled(p.id);
+        return '<div class="eco-card"><div class="ic">🔌</div><div style="min-width:0">'
+          + '<b>' + esc(p.name || p.id) + '</b><span class="d">' + esc(p.short_desc || p.desc || "") + '</span></div>'
+          + (inst ? '<span class="sub" style="font-size:10px;flex:none">已安装</span>'
+            : '<button class="eco-install" data-a="plug-install" data-src="' + esc(br.sourceId) + '" data-id="' + esc(p.id) + '">安装</button>')
+          + '</div>';
+      }).join("");
+      html += '<div class="eco-grid">' + (brCards || '<span class="sub">该源无插件条目</span>') + '</div>'
+        + '<div class="btn-row" style="margin-top:10px"><button class="btn ghost" data-a="plug-src-browse-close">收起</button></div>';
+    }
+    html += '</section>';
+  }
   return html;
 }
 
@@ -1809,6 +1831,16 @@ document.addEventListener("click", function (ev) {
         .finally(function () { PLUG_STATE.busy = null; loadPlug(); });
       break;
     }
+    case "plug-src-browse":
+      PLUG_STATE.browse = { sourceId: t.dataset.id, name: t.dataset.name || t.dataset.id, loading: true };
+      render();
+      api.plugSrcList(t.dataset.id).then(function (v) {
+        PLUG_STATE.browse.plugins = (v && v.plugins) || [];
+        PLUG_STATE.browse.error = null;
+      }).catch(function (e) { PLUG_STATE.browse.error = e.message || "拉取失败"; })
+        .finally(function () { PLUG_STATE.browse.loading = false; render(); });
+      break;
+    case "plug-src-browse-close": PLUG_STATE.browse = null; render(); break;
     case "plug-src-del":
       PLUG_STATE.busy = t.dataset.id;
       api.plugSrcDel(t.dataset.id).then(function () { showToast("源已移除", "ok"); })
