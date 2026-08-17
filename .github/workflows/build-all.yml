@@ -67,6 +67,12 @@ jobs:
         run: cargo tauri build ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
         working-directory: src-tauri
 
+      - name: dmg 改名(tauri 原生 arm64 构建也产 _x64 名,防与 Intel 产物同名互相覆盖)
+        if: runner.os == 'macOS' && matrix.target == ''
+        run: |
+          cd src-tauri/target/release/bundle/dmg
+          for f in *.dmg; do [ -e "$f" ] || continue; mv "$f" "${f%.dmg}_aarch64.dmg"; done
+
       - name: 上传安装包
         uses: actions/upload-artifact@v4
         with:
