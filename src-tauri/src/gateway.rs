@@ -26,6 +26,94 @@ pub async fn proxy_responses(State(s): State<Arc<AppState>>, req: Request<Body>)
     dispatch(&s, req, "responses", "codex").await
 }
 
+/// 文生图入口(C 段,`/v1/images/generations` 双形态):codex active 供应商直通上游
+/// /v1/images/generations(侦察实测 2xa 支持,b64 形态)。成功(200 且 data 有图)即
+/// `mark_dim(image_out=yes)` 单维实证标记——免探测成本,失败不标(参数错≠能力无)。
+pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    let provider = match crate::providers::get_active(&s.providers_path) {
+        Some(p) => p,
+        None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择供应商"),
+    };
+    if provider.access_mode == AccessMode::Official {
+        return err_resp(StatusCode::BAD_REQUEST, "Official 模式不走网关");
+    }
+    // Key 池(一期):多 Key 轮询
+    let provider = crate::keypool::apply(&s.keypool, provider);
+    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
+    };
+    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or_default();
+    let base = provider.base_url.trim_end_matches('/');
+    let target = if base.ends_with("/v1") {
+        format!("{base}/images/generations")
+    } else {
+        format!("{base}/v1/images/generations")
+    };
+    let client = match build_client(&provider) {
+        Ok(c) => c,
+        Err(e) => {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("build client: {e}"),
+            )
+        }
+    };
+    let resp = client
+        .post(&target)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", provider.api_key),
+        )
+        .body(body_bytes.to_vec())
+        .send()
+        .await;
+    let upstream = match resp {
+        Ok(r) => r,
+        Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("上游不可达: {e}")),
+    };
+    // 成功判定+单维实证标记(200 且 data[0] 有 b64_json/url → image_out=yes)
+    let status = upstream.status();
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("读响应失败: {e}")),
+    };
+    if status.is_success() {
+        let has_image = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("data").and_then(|d| d.as_array()).map(|a| {
+                    !a.is_empty()
+                        && a.iter()
+                            .any(|x| x.get("b64_json").is_some() || x.get("url").is_some())
+                })
+            })
+            .unwrap_or(false);
+        if has_image && !model.is_empty() {
+            crate::capprobe::mark_dim(
+                &s.codex_home,
+                &provider.id,
+                &model,
+                "image_out",
+                crate::capprobe::Tri::Yes,
+            );
+        }
+    } else {
+        s.keypool.mark_failure(&provider.id, &provider.api_key);
+    }
+    // 原样透传(状态码+body+Content-Type)
+    let mut resp = Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    resp = resp.header(axum::http::header::CONTENT_TYPE, "application/json");
+    match resp.body(Body::from(bytes.to_vec())) {
+        Ok(r) => r,
+        Err(_) => err_resp(StatusCode::BAD_GATEWAY, "build response body"),
+    }
+}
+
 pub async fn proxy_chat(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     dispatch(&s, req, "chat/completions", "codex").await
 }
@@ -1449,7 +1537,23 @@ mod tests {
                     }
                 }),
             )
-            .route("/", get(|| async { (StatusCode::OK, "UP_OK") }));
+            .route("/", get(|| async { (StatusCode::OK, "UP_OK") }))
+            // 其余 POST 路径(chat/images 探测用)固定回 resp_body 并记 Authorization
+            .fallback(post({
+                let seen_fallback = seen.clone();
+                move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                    let seen = seen_fallback;
+                    async move {
+                        let auth = h
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from)
+                            .unwrap_or_default();
+                        seen.lock().unwrap().push(auth);
+                        (StatusCode::OK, resp_body)
+                    }
+                }
+            }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2221,6 +2325,68 @@ mod tests {
             "应收到真实回复,stdout:\n{stdout}\nstderr:\n{stderr}"
         );
         eprintln!("[E2E] 全链走通:gemini CLI → 网关(Gemini→Chat 转换)→ 2xa 真实上游");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C 段文生图:200+data 透传并实证标 image_out;上游不可达 502 不标。
+    #[tokio::test]
+    async fn images_passthrough_marks_image_out() {
+        let (base, seen) = mock_upstream(r#"{"created":1,"data":[{"b64_json":"aGk="}]}"#).await;
+        let (state, providers_path, root) = make_state("img-ok");
+        let pid = add_provider(&providers_path, &base, "sk-img");
+        let resp = proxy_images(
+            State(Arc::new(state.clone())),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-test","prompt":"a cat"}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["data"][0]["b64_json"], "aGk=", "响应原样透传");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            seen.lock().unwrap().first().cloned(),
+            Some("Bearer sk-img".into())
+        );
+        // 单维实证:首次成功即标 image_out=yes(caps 缺则建)
+        assert_eq!(
+            crate::capprobe::tri_of(&state.codex_home, &pid, "gpt-test", "image_out"),
+            crate::capprobe::Tri::Yes
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn images_unreachable_502_no_mark() {
+        let (state, providers_path, root) = make_state("img-dead");
+        let pid = add_provider(&providers_path, "http://127.0.0.1:9", "sk-img2");
+        let resp = proxy_images(
+            State(Arc::new(state.clone())),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-test","prompt":"x"}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            crate::capprobe::tri_of(&state.codex_home, &pid, "gpt-test", "image_out"),
+            crate::capprobe::Tri::Unknown,
+            "失败不标(参数错≠能力无)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

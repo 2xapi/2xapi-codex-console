@@ -293,7 +293,10 @@ mod tests {
         let path = dir.join("openclaw.json");
         std::fs::write(&path, openclaw_doc()).unwrap();
         let s = JsonStore::nested("openclaw", &path, &["mcp", "servers"], true);
-        assert!(s.native_enabled(), "openclaw 原生 enabled(实证 enabled:false)");
+        assert!(
+            s.native_enabled(),
+            "openclaw 原生 enabled(实证 enabled:false)"
+        );
 
         let mut before = s.read().unwrap();
         assert_eq!(before.keys().collect::<Vec<_>>(), vec!["probe-x"]);

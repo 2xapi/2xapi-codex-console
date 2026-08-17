@@ -773,7 +773,11 @@ mod tests {
     fn supported_table_and_summary() {
         assert_eq!(supported("Codex"), Some("codex"));
         assert_eq!(supported("cursor"), Some("cursor"));
-        assert_eq!(supported("openclaw"), Some("openclaw"), "补齐:mcp.servers 载体");
+        assert_eq!(
+            supported("openclaw"),
+            Some("openclaw"),
+            "补齐:mcp.servers 载体"
+        );
         assert_eq!(supported("gemini"), None, "gemini 无 MCP 载体,B 段未入编");
         assert_eq!(
             spec_summary(&json!({ "command": "npx", "args": ["a", "b"] })),
@@ -1116,14 +1120,30 @@ mod real_openclaw {
         let cli = "openclaw";
         let out = std::process::Command::new(cli)
             .env("HOME", &home)
-            .args(["mcp", "add", "probe-x", "--command", "npx", "--arg", "hello-server", "--no-probe"])
+            .args([
+                "mcp",
+                "add",
+                "probe-x",
+                "--command",
+                "npx",
+                "--arg",
+                "hello-server",
+                "--no-probe",
+            ])
             .output()
             .expect("openclaw CLI 应在 PATH");
-        assert!(out.status.success(), "CLI 生成真实形状失败: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "CLI 生成真实形状失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let cfg = home.join(".openclaw/openclaw.json");
         let orig = std::fs::read_to_string(&cfg).unwrap();
         let orig_doc: Value = serde_json::from_str(&orig).unwrap();
-        assert_eq!(orig_doc["mcp"]["servers"]["probe-x"]["command"], "npx", "CLI 落盘形状前提");
+        assert_eq!(
+            orig_doc["mcp"]["servers"]["probe-x"]["command"], "npx",
+            "CLI 落盘形状前提"
+        );
 
         // 产品 store 全链(同一文件;codex_home/backup 指隔离目录)
         let store = JsonStore::nested("openclaw", &cfg, &["mcp", "servers"], true);
@@ -1146,15 +1166,26 @@ mod real_openclaw {
             .args(["mcp", "show", "memory"])
             .output()
             .unwrap();
-        let shown = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert!(shown.contains("memory"), "CLI mcp show 应见 memory: {shown}");
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            shown.contains("memory"),
+            "CLI mcp show 应见 memory: {shown}"
+        );
 
         disable(&store, &home, &home.join("backups"), "memory").unwrap();
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(doc["mcp"]["servers"]["memory"]["enabled"], Value::Bool(false));
+        assert_eq!(
+            doc["mcp"]["servers"]["memory"]["enabled"],
+            Value::Bool(false)
+        );
 
         uninstall(&store, &home, &home.join("backups"), "memory").unwrap();
-        let final_doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let final_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(final_doc["mcp"]["servers"].get("memory").is_none());
         assert_eq!(final_doc["mcp"]["servers"]["probe-x"]["command"], "npx");
         let _ = std::fs::remove_dir_all(&home);

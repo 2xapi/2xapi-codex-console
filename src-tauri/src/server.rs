@@ -82,7 +82,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/responses", post(crate::gateway::proxy_responses))
         .route("/responses", post(crate::gateway::proxy_responses))
         .route("/v1/chat/completions", post(crate::gateway::proxy_chat))
+        .route("/v1/images/generations", post(crate::gateway::proxy_images))
         .route("/chat/completions", post(crate::gateway::proxy_chat))
+        .route("/images/generations", post(crate::gateway::proxy_images))
         .route("/v1/models", get(crate::gateway::proxy_models))
         .route("/models", get(crate::gateway::proxy_models))
         // --- 网关代理 /anthropic/*（Claude 接入；Claude Code 以 /anthropic 为 base 会请求 /anthropic/v1/messages）---
@@ -2985,7 +2987,10 @@ mod tests {
         let manual = servers.iter().find(|s| s["id"] == "probe-x").unwrap();
         assert_eq!(manual["source"], "manual", "CLI 已有条目标手动");
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&oj).unwrap()).unwrap();
-        assert_eq!(doc["mcp"]["servers"]["memory"]["command"], "npx", "嵌套段形状");
+        assert_eq!(
+            doc["mcp"]["servers"]["memory"]["command"], "npx",
+            "嵌套段形状"
+        );
         assert_eq!(doc["mcp"]["servers"]["probe-x"]["args"][0], "hello-server");
         assert_eq!(doc["commands"]["restart"], true, "其他顶层键保留");
 

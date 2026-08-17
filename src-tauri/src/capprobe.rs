@@ -151,6 +151,26 @@ pub fn tri_of(codex_home: &Path, provider_id: &str, model: &str, dim: &str) -> T
         .unwrap_or(Tri::Unknown)
 }
 
+/// 单维实证标记(C 段图出:首次成功调用即标 yes,免探测成本;失败不标——参数错≠能力无)。
+/// manual 条目不覆盖(与 store_probe 同保护);caps 缺则建(未探测过的模型可直接标单维)。
+pub fn mark_dim(codex_home: &Path, provider_id: &str, model: &str, dim: &str, tri: Tri) {
+    let mut all = load_all(codex_home);
+    let entry = all
+        .entry(tag_key(provider_id, model))
+        .or_insert_with(|| json!({ "source": "auto" }));
+    if entry.get("source").and_then(|s| s.as_str()) == Some("manual") {
+        return;
+    }
+    if let Some(obj) = entry.as_object_mut() {
+        let caps = obj.entry("caps").or_insert_with(|| json!({}));
+        if let Some(c) = caps.as_object_mut() {
+            c.insert(dim.to_string(), json!(tri.as_str()));
+        }
+        obj.insert("updated_at".into(), json!(chrono::Utc::now().timestamp()));
+    }
+    save_all(codex_home, &all);
+}
+
 /// 读全部标签(GET /api/capability-tags 响应体)。
 pub fn all_json(codex_home: &Path) -> Value {
     json!({ "tags": load_all(codex_home) })
@@ -426,6 +446,30 @@ mod tests {
     fn deny_words_and_keys() {
         assert!(IMAGE_DENY_WORDS.contains(&"no image attached"));
         assert_eq!(tag_key("a", "b"), "a::b");
+    }
+    #[test]
+    fn mark_dim_creates_caps_and_respects_manual() {
+        let home = std::env::temp_dir().join(format!("2xapi-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        // 未探测过的模型:直接标单维,caps 缺则建
+        mark_dim(&home, "p", "m", "image_out", Tri::Yes);
+        assert_eq!(tri_of(&home, "p", "m", "image_out"), Tri::Yes);
+        assert_eq!(
+            tri_of(&home, "p", "m", "image_in"),
+            Tri::Unknown,
+            "其余维不受影响"
+        );
+        // manual 条目不覆盖
+        let mut all = load_all(&home);
+        all.insert(
+            tag_key("p", "m"),
+            json!({"source": "manual", "caps": {"image_out": "no"}}),
+        );
+        save_all(&home, &all);
+        mark_dim(&home, "p", "m", "image_out", Tri::Yes);
+        assert_eq!(tri_of(&home, "p", "m", "image_out"), Tri::No, "manual 优先");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

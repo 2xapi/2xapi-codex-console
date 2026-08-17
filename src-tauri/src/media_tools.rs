@@ -431,7 +431,17 @@ pub async fn image_generate(s: &AppState, body: &Value) -> Response {
         }
     };
     match store_image_out(&client, s, &v, "image-generate").await {
-        Ok(urls) => ok_data(json!({ "media_urls": urls, "mime": "image/png" })),
+        Ok(urls) => {
+            // 首次成功即实证标 image_out(与网关 /v1/images/generations 入口同标记)
+            crate::capprobe::mark_dim(
+                &s.codex_home,
+                &p.id,
+                &model,
+                "image_out",
+                crate::capprobe::Tri::Yes,
+            );
+            ok_data(json!({ "media_urls": urls, "mime": "image/png" }))
+        }
         Err(r) => *r,
     }
 }
@@ -534,7 +544,16 @@ pub async fn image_edit(s: &AppState, body: &Value) -> Response {
         }
     };
     match store_image_out(&client, s, &v, "image-edit").await {
-        Ok(urls) => ok_data(json!({ "media_url": urls[0], "mime": "image/png" })),
+        Ok(urls) => {
+            crate::capprobe::mark_dim(
+                &s.codex_home,
+                &p.id,
+                &model,
+                "image_out",
+                crate::capprobe::Tri::Yes,
+            );
+            ok_data(json!({ "media_url": urls[0], "mime": "image/png" }))
+        }
         Err(r) => *r,
     }
 }
