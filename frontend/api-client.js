@@ -55,6 +55,10 @@
     activateOfficial: () => request("POST", "/api/providers/activate-official"),
     previewConfig: (provider) => request("POST", "/api/providers/preview-config", { body: provider }),
     diagnose: (id) => request("POST", "/api/providers/diagnose", { body: { id } }),
+    // 超融合 A 线一期:能力探测/标签/注册表
+    probeCapabilities: (id, body) => request("POST", "/api/providers/" + encodeURIComponent(id) + "/probe-capabilities", { body }),
+    capabilityTags: () => request("GET", "/api/capability-tags"),
+    capabilitySet: (body) => request("POST", "/api/capability-tags", { body }),
     fetchModels: (body) => request("POST", "/api/providers/fetch-models", { body }),
     fetchBalance: (id) => request("POST", "/api/providers/fetch-balance", { body: { id } }),
     // ── 健康（不走信封，04 §2）──

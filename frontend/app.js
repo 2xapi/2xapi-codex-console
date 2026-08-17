@@ -173,8 +173,64 @@ async function refreshSession() {
     } catch (e) { /* 下次刷新再试 */ }
   }
 }
+/* 超融合 A 线一期:能力标签(供应商×模型粒度;manual 覆盖不冲) */
+var CAP_TAGS = null;
+function refreshCapTags() {
+  return api.capabilityTags().then(function (v) { CAP_TAGS = (v && v.tags) || {}; })
+    .catch(function () { CAP_TAGS = {}; });
+}
+function capsEntry(p) {
+  return (CAP_TAGS && CAP_TAGS[p.id + "::" + (p.model || "")]) || null;
+}
+function capsSectionHtml(p) {
+  var e = capsEntry(p);
+  var dims = [["text", "文本"], ["tools", "工具"], ["reasoning", "推理"], ["image_in", "识图"]];
+  var chips = "";
+  dims.forEach(function (d) {
+    var val = e && e.caps ? (e.caps[d[0]] || "unknown") : "unknown";
+    var cls = val === "yes" ? "tag on" : "tag";
+    var lb = d[1] + (val === "yes" ? " ✓" : val === "no" ? " ✗" : " ?");
+    chips += '<span class="' + cls + '">' + lb + '</span>';
+  });
+  var manualTag = e && e.source === "manual" ? ' <span class="tag">手动</span>' : '';
+  var selects = dims.map(function (d) {
+    return '<span style="display:inline-flex;align-items:center;gap:3px;margin-right:8px">' + d[1]
+      + '<select data-a="cap-set" data-id="' + esc(p.id) + '" data-model="' + esc(p.model || "") + '" data-dim="' + d[0] + '">'
+      + '<option value="">auto</option><option value="on">on</option><option value="off">off</option>'
+      + '</select></span>';
+  }).join("");
+  return '<div style="margin:10px 0 0;padding:10px 12px;background:rgba(120,160,255,.05);border:1px solid rgba(120,160,255,.22);border-radius:9px">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">'
+    + '<span style="font-size:11.5px;color:#A8C0F0">能力(模型 ' + esc(p.model || "未设置") + ')' + manualTag + ' ' + chips + '</span>'
+    + '<button class="btn ghost" data-a="cap-probe" data-id="' + esc(p.id) + '"' + (state.busy === "cap-probe" ? " disabled" : "") + '>⚡ 探测能力</button></div>'
+    + '<div style="margin-top:6px;font-size:10.5px;color:var(--muted)">覆盖:' + selects + '<span>auto=按探测;on/off=手动兜底(探测不冲);重探强制回 auto</span></div>'
+    + '</div>';
+}
+function doCapProbe(id) {
+  state.busy = "cap-probe"; render();
+  api.probeCapabilities(id, { force: true }).then(function () {
+    return refreshCapTags();
+  }).then(function () {
+    showToast("能力探测完成", "ok");
+  }).catch(function (e2) {
+    showToast(e2.message || "探测失败", "error");
+  }).finally(function () {
+    state.busy = null; render();
+  });
+}
+function doCapSet(id, model, dim, val) {
+  if (!val) return; // auto 空值=不清除选择,由重探恢复
+  api.capabilitySet({ providerId: id, model: model, dim: dim, val: val }).then(function () {
+    return refreshCapTags();
+  }).then(function () {
+    showToast(dim + " 已覆盖为 " + val, "ok");
+  }).catch(function (e) {
+    showToast(e.message || "覆盖失败", "error");
+  }).finally(function () { render(); });
+}
+
 async function refreshAll() {
-  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel(), refreshClaudeState()]);
+  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel(), refreshClaudeState(), refreshCapTags()]);
 }
 
 /* ── 渲染 ── */
@@ -439,6 +495,7 @@ function providerDetailCard(p) {
     + '<div><div class="k">默认模型</div><div class="v mono">' + esc(p.model || "—") + '</div></div>'
     + '</div>'
     + '<div class="btn-row">' + btns + '</div></section>';
+  html += capsSectionHtml(p);
   if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
   return html;
 }
@@ -1617,6 +1674,7 @@ document.addEventListener("click", function (ev) {
       if (state.view === "eco") loadEco();
       break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
+    case "cap-probe": doCapProbe(t.dataset.id); break;
     case "eco-agent":
       if (ECO_STATE.agent !== t.dataset.g) { ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; loadEco(); }
       break;
@@ -1821,6 +1879,12 @@ document.addEventListener("change", function (ev) {
       showToast(on ? "已开启启动前自动修复" : "已关闭启动前自动修复", "ok");
     }).catch(function (e) { showToast(e.message, "error"); });
     return;
+  }
+});
+document.addEventListener("change", function (ev) {
+  var t = ev.target;
+  if (t && t.dataset && t.dataset.a === "cap-set") {
+    doCapSet(t.dataset.id, t.dataset.model, t.dataset.dim, t.value);
   }
 });
 document.addEventListener("input", function (ev) {

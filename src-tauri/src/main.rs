@@ -13,6 +13,9 @@ mod config;
 mod desktop;
 mod diagnose;
 mod gateway;
+mod capprobe;
+mod keypool;
+mod registry;
 mod gateway_conv;
 mod gateway_gemini_conv;
 mod grok_config;
@@ -69,6 +72,7 @@ fn main() {
         std::sync::Arc::new(std::sync::RwLock::new(nodecreds::load_store(&codex_home)));
 
     let state = server::AppState {
+        keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
         config_path: config_path.clone(),
         backup_dir: backup_dir.clone(),
         providers_path: providers_path.clone(),

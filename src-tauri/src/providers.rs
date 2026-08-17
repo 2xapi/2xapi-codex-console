@@ -121,6 +121,10 @@ pub struct Provider {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    /// Key 资源池(超融合 A 线一期):多 Key 轮询+故障切换;空=单 Key 模式(行为不变)。
+    /// api_key 恒为「主 Key」(池首),旧文件无该字段 → 空,读侧回退 api_key。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
     #[serde(default)]
     pub access_mode: AccessMode,
     #[serde(default)]
@@ -293,6 +297,7 @@ pub fn input_to_provider(input: ProviderInput) -> Provider {
         notes: input.notes,
         base_url: input.base_url,
         api_key: input.api_key,
+        keys: vec![],
         access_mode: input.access_mode,
         wire_api: input.wire_api,
         user_agent: input.user_agent,
@@ -416,6 +421,7 @@ pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<Validat
         notes: input.notes,
         base_url: input.base_url,
         api_key: input.api_key,
+        keys: vec![],
         access_mode: input.access_mode,
         wire_api: input.wire_api,
         user_agent: input.user_agent,
@@ -787,6 +793,7 @@ mod tests {
             notes: Some("n".into()),
             base_url: "https://up.test".into(),
             api_key: "sk-secret".into(),
+            keys: vec![],
             access_mode: AccessMode::Mixed,
             wire_api: WireApi::ChatCompletions,
             user_agent: Some("ua".into()),

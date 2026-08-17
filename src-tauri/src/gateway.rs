@@ -110,6 +110,8 @@ async fn dispatch_anthropic_for(
     agent: &str,
 ) -> Response<Body> {
     let provider = match crate::providers::get_provider_for_agent(&state.providers_path, agent) {
+        // Key 资源池(A 线一期):见 dispatch 注释
+        Some(p) => crate::keypool::apply(&state.keypool, p),
         Some(p) => p,
         None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择 Claude 供应商"),
     };
@@ -295,7 +297,8 @@ async fn dispatch_gemini(
     };
 
     let provider = match crate::providers::get_provider_for_agent(&state.providers_path, "gemini") {
-        Some(p) => p,
+        // Key 资源池(A 线一期):见 dispatch 注释
+        Some(p) => crate::keypool::apply(&state.keypool, p),
         None => {
             return gemini_err(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -598,6 +601,8 @@ async fn dispatch(
             )
         }
     };
+    // Key 资源池(A 线一期):多 Key 轮询选一替换 api_key;单 Key 原样返回(行为零变化)
+    let provider = crate::keypool::apply(&state.keypool, provider);
     // Official 不应经网关（01-D1）；防御性拒绝
     if provider.access_mode == AccessMode::Official {
         return err_resp(StatusCode::BAD_REQUEST, "Official 模式不走网关");
@@ -738,13 +743,22 @@ async fn dispatch(
     .await
     {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => {
+            // Key 池打点:发送层失败(含超时)冷却当前 Key(单 Key 无池,打点为 no-op)
+            state.keypool.mark_failure(&provider.id, &provider.api_key);
+            return resp;
+        }
     };
-    eprintln!(
-        "[GW] ← upstream {} conv={:?}",
-        upstream.status(),
-        conv_stream
-    );
+    eprintln!("[GW] ← upstream {} conv={:?}", upstream.status(), conv_stream);
+    // Key 池打点:429/5xx 冷却,2xx 清冷却(单 Key 无池,打点为 no-op)
+    {
+        let st = upstream.status().as_u16();
+        if st == 429 || st >= 500 {
+            state.keypool.mark_failure(&provider.id, &provider.api_key);
+        } else if st < 400 {
+            state.keypool.mark_success(&provider.id);
+        }
+    }
 
     // 协议转换响应（FR-5.2/5.3）
     if let Some(stream_flag) = conv_stream {
@@ -1339,6 +1353,7 @@ mod tests {
             cd_home: root.join("cdsupport"),
             cursor_home: root.join("cursorhome"),
             trae_home: root.join("traehome"),
+            keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(crate::server::AccelCfg::default())),
@@ -1505,6 +1520,7 @@ mod tests {
                 name: "T".into(),
                 base_url: format!("http://{}", addr),
                 api_key: "sk".into(),
+                keys: vec![],
                 model: "m".into(),
                 timeout_secs: Some(1),
                 sub2api_multiplier: 1.0,
@@ -2711,6 +2727,7 @@ mod tests {
             cd_home: s.cd_home.clone(),
             cursor_home: s.cursor_home.clone(),
             trae_home: s.trae_home.clone(),
+            keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
             launcher: s.launcher.clone(),
             health: s.health.clone(),
             accel: s.accel.clone(),
@@ -3550,6 +3567,7 @@ mod verify_wb_path {
             health: Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: Arc::new(Mutex::new(crate::server::AccelCfg::default())),
             nodecreds: Arc::new(std::sync::RwLock::new(crate::nodecreds::Store::empty())),
+            keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
         };
         let app2 = crate::server::build_router(state);
         use tower::ServiceExt;

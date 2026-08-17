@@ -608,6 +608,7 @@ mod tests {
             notes: None,
             base_url: "https://2xa.cc.cd".into(),
             api_key: "sk-test".into(),
+            keys: vec![],
             access_mode: AccessMode::default(),
             wire_api: WireApi::default(),
             user_agent: None,

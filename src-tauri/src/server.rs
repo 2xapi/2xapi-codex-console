@@ -66,6 +66,8 @@ pub struct AppState {
     pub accel: std::sync::Arc<std::sync::Mutex<AccelCfg>>,
     /// 每账号节点凭证表(星图 任务 B;启动时 load_store 装配,签发/降级时更新并落盘)。
     pub nodecreds: std::sync::Arc<std::sync::RwLock<crate::nodecreds::Store>>,
+    /// Key 资源池(超融合 A 线一期):多 Key 轮询+冷却切换;内存态,单 Key 恒直返。
+    pub keypool: std::sync::Arc<crate::keypool::KeyPool>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -237,6 +239,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/accel/test-node", post(handle_accel_test_node))
         // --- 每账号节点凭证(星图 任务 B:usage 刷新)---
         .route("/api/accel/refresh-cred", post(handle_accel_refresh_cred))
+        // --- 超融合 A 线一期:能力探测(前四维)+标签+注册表 ---
+        .route("/api/providers/:id/probe-capabilities", post(handle_probe_capabilities))
+        .route("/api/capability-tags", get(handle_capability_tags).post(handle_capability_tags_set))
+        .route("/api/fusion-registry", get(handle_fusion_registry))
         .route("/api/config/snapshot", post(handle_config_snapshot))
         .route("/api/config/restore", post(handle_config_restore))
         // --- 媒体服务(超融合 A 线二期 B 段·开发组·媒体服务):原件暂存+URL 回传;
@@ -1630,6 +1636,69 @@ async fn handle_agent_start(
     }
 }
 
+// ── 超融合 A 线一期:能力探测/标签/注册表 ────────────────────
+
+// POST /api/providers/:id/probe-capabilities {model?, force?} —— 前四维探测+落标签
+async fn handle_probe_capabilities(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let data = crate::providers::load(&s.providers_path);
+    let Some(provider) = data.providers.iter().find(|p| p.id == id) else {
+        return err_env(StatusCode::NOT_FOUND, "E_NOT_FOUND", "供应商不存在", None);
+    };
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|m| !m.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| provider.model.clone());
+    if model.is_empty() {
+        return err_env(StatusCode::BAD_REQUEST, "E_NO_MODEL", "该供应商未配置默认模型,探测需指定 model", None);
+    }
+    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let levels = provider.reasoning_levels.clone().unwrap_or_default();
+    let caps = crate::capprobe::probe_caps(&provider.base_url, &provider.api_key, &model, &levels).await;
+    let entry = if force {
+        crate::capprobe::store_probe_force(&s.codex_home, &provider.id, &model, &caps)
+    } else {
+        crate::capprobe::store_probe(&s.codex_home, &provider.id, &model, &caps)
+    };
+    // 能力注册表同步登记(model 条目,标签作为 meta)
+    let mut meta = serde_json::Map::new();
+    if let Some(c) = entry.get("caps") {
+        meta.insert("caps".into(), c.clone());
+    }
+    crate::registry::upsert_model(&s.codex_home, &provider.id, &model, meta);
+    ok_env(json!({ "providerId": provider.id, "model": model, "entry": entry }))
+}
+
+// GET /api/capability-tags —— 全部标签;POST {providerId, model, dim, val} —— 手动覆盖(on/off/auto)
+async fn handle_capability_tags(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(crate::capprobe::all_json(&s.codex_home))
+}
+
+async fn handle_capability_tags_set(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let get = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let (pid, model, dim, val) = (get("providerId"), get("model"), get("dim"), get("val"));
+    if pid.is_empty() || model.is_empty() {
+        return err_env(StatusCode::BAD_REQUEST, "E_BAD_REQUEST", "需要 providerId 与 model", None);
+    }
+    match crate::capprobe::set_manual(&s.codex_home, &pid, &model, &dim, &val) {
+        Ok(entry) => ok_env(json!({ "entry": entry })),
+        Err(e) => err_env(StatusCode::BAD_REQUEST, "E_BAD_OVERRIDE", &e, None),
+    }
+}
+
+// GET /api/fusion-registry —— 能力注册表(一期骨架,二期消费)
+async fn handle_fusion_registry(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(crate::registry::list_json(&s.codex_home))
+}
+
 // ── Codex 启动器（M7，直连版）──────────────────────────────
 
 // POST /api/launcher/preflight { providerId } | { baseUrl, apiKey } —— 测试连接(阶段 2,任务书 §三)
@@ -1882,6 +1951,7 @@ mod tests {
             nodecreds: std::sync::Arc::new(
                 std::sync::RwLock::new(crate::nodecreds::Store::empty()),
             ),
+            keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
         }
     }
 
@@ -2373,6 +2443,7 @@ mod tests {
             nodecreds: std::sync::Arc::new(
                 std::sync::RwLock::new(crate::nodecreds::Store::empty()),
             ),
+            keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
         };
         (state, root)
     }

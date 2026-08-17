@@ -561,6 +561,7 @@ mod tests {
             name: "Pure".into(),
             base_url: "https://up.example.com".into(),
             api_key: "sk-pure-secret".into(),
+            keys: vec![],
             access_mode: AccessMode::PureApi,
             model: "gpt-pure".into(),
             ..Default::default()
@@ -573,6 +574,7 @@ mod tests {
             name: format!("{mode:?}"),
             base_url: "https://up.example.com".into(),
             api_key: "sk-secret".into(),
+            keys: vec![],
             access_mode: mode,
             model: "gpt-x".into(),
             ..Default::default()
