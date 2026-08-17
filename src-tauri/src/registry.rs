@@ -31,6 +31,12 @@ pub struct Entry {
     pub model: Option<String>,
     pub enabled: bool,
     pub meta: Map<String, Value>,
+    /// v3 用户配置(配置页保存):{models:[{id,api,note}](优先级), failover:bool, values:{k:v}}
+    pub config: Map<String, Value>,
+    /// v3 来源:local|paste|remote|official(旧档读取按 builtin 推导)
+    pub source: String,
+    /// v3 最近变更(安装/配置/启停/更新),unix 秒
+    pub updated_at: String,
 }
 
 fn registry_path(codex_home: &Path) -> PathBuf {
@@ -63,6 +69,31 @@ fn load(codex_home: &Path) -> Vec<Entry> {
                             .and_then(|m| m.as_object())
                             .cloned()
                             .unwrap_or_default(),
+                        config: e
+                            .get("config")
+                            .and_then(|c| c.as_object())
+                            .cloned()
+                            .unwrap_or_default(),
+                        source: e
+                            .get("source")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                let builtin = e["meta"]
+                                    .get("builtin")
+                                    .and_then(|b| b.as_bool())
+                                    .unwrap_or(false);
+                                if builtin {
+                                    "official".into()
+                                } else {
+                                    "remote".into()
+                                }
+                            }),
+                        updated_at: e
+                            .get("updated_at")
+                            .and_then(|u| u.as_str())
+                            .map(String::from)
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()
@@ -81,6 +112,7 @@ fn save(codex_home: &Path, entries: &[Entry]) {
             "id": e.id, "kind": e.kind.as_str(),
             "provider_id": e.provider_id, "model": e.model,
             "enabled": e.enabled, "meta": e.meta,
+            "config": e.config, "source": e.source, "updated_at": e.updated_at,
         })).collect::<Vec<_>>(),
     });
     let tmp = path.with_extension("json.tmp");
@@ -108,12 +140,16 @@ pub fn upsert_model(codex_home: &Path, provider_id: &str, model: &str, meta: Map
             model: Some(model.to_string()),
             enabled: true,
             meta,
+            config: Map::new(),
+            source: String::new(),
+            updated_at: now(),
         });
     }
     save(codex_home, &entries);
 }
 
-/// upsert(plugin 条目):meta=manifest 全量;同 id 覆盖(重装/更新)。
+/// upsert(plugin 条目):meta=manifest 全量;同 id 覆盖(重装/更新,保留用户 config)。
+/// 新条目带默认配置(config def 种子化 + manifest models + failover 默认开)与 source。
 pub fn upsert_plugin(codex_home: &Path, manifest: &Map<String, Value>) {
     let id = manifest
         .get("id")
@@ -139,12 +175,47 @@ pub fn upsert_plugin(codex_home: &Path, manifest: &Map<String, Value>) {
     } else {
         Kind::Plugin
     };
+    let source = manifest
+        .get("source")
+        .and_then(|v| v.as_str())
+        .filter(|s| matches!(*s, "local" | "paste" | "remote" | "official"))
+        .map(String::from)
+        .unwrap_or_else(|| {
+            if manifest
+                .get("builtin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                "official".into()
+            } else if manifest.get("source_id").and_then(|v| v.as_str()) == Some("local") {
+                "local".into()
+            } else {
+                "remote".into()
+            }
+        });
     if let Some(e) = entries
         .iter_mut()
         .find(|e| e.id == global && e.kind == kind)
     {
         e.meta = manifest.clone();
+        e.updated_at = now();
     } else {
+        // 默认配置:manifest config 的 def 种子化 + models 声明 + failover 默认开
+        let mut values = Map::new();
+        if let Some(arr) = manifest.get("config").and_then(|c| c.as_array()) {
+            for c in arr {
+                if let (Some(k), Some(def)) = (c.get("k").and_then(|v| v.as_str()), c.get("def")) {
+                    values.insert(k.to_string(), def.clone());
+                }
+            }
+        }
+        let mut config = Map::new();
+        config.insert(
+            "models".into(),
+            manifest.get("models").cloned().unwrap_or_else(|| json!([])),
+        );
+        config.insert("failover".into(), json!(true));
+        config.insert("values".into(), json!(values));
         entries.push(Entry {
             id: global,
             kind,
@@ -152,6 +223,9 @@ pub fn upsert_plugin(codex_home: &Path, manifest: &Map<String, Value>) {
             model: None,
             enabled: true,
             meta: manifest.clone(),
+            config,
+            source,
+            updated_at: now(),
         });
     }
     save(codex_home, &entries);
@@ -173,8 +247,29 @@ pub fn set_enabled(codex_home: &Path, id: &str, enabled: bool) {
     let mut entries = load(codex_home);
     if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
         e.enabled = enabled;
+        e.updated_at = now();
     }
     save(codex_home, &entries);
+}
+
+/// v3:保存插件用户配置(models 优先级/故障转移开关/配置项值);id 不存在返回 false。
+pub fn set_config(codex_home: &Path, id: &str, config: Map<String, Value>) -> bool {
+    let mut entries = load(codex_home);
+    let Some(e) = entries.iter_mut().find(|e| e.id == id) else {
+        return false;
+    };
+    e.config = config;
+    e.updated_at = now();
+    save(codex_home, &entries);
+    true
+}
+
+/// unix 秒时间戳(updated_at 用)。
+pub fn now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
 }
 
 pub fn list_json(codex_home: &Path) -> Value {
@@ -184,6 +279,7 @@ pub fn list_json(codex_home: &Path) -> Value {
             "id": e.id, "kind": e.kind.as_str(),
             "provider_id": e.provider_id, "model": e.model,
             "enabled": e.enabled, "meta": e.meta,
+            "config": e.config, "source": e.source, "updated_at": e.updated_at,
         })).collect::<Vec<_>>(),
     })
 }

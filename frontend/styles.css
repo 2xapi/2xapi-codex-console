@@ -11,7 +11,7 @@ html, body { margin: 0; height: 100%; overflow: hidden; }
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: -apple-system, "PingFang SC", "MiSans", "Noto Sans SC", sans-serif;
   --c-gw: #45A6FF; --c-direct: #E5A13B; --c-accel: #9B7BF5; --c-official: #4CB782;
-  --c-claude: #D97757; --c-err: #E2584E;
+  --c-claude: #D97757; --c-err: #E2584E; --c-plug: #9B7BF5;
   --nav-w: 60px; --rail-w: 216px;
 }
 * { box-sizing: border-box; }
@@ -57,6 +57,8 @@ button { font-family: inherit; }
 /* ── 顶栏 ── */
 .topbar { display: flex; align-items: center; gap: 8px; padding: 7px 14px; background: var(--panel); border-bottom: 1px solid var(--hair); }
 .brand { font-weight: 600; font-size: 13px; }
+.topbar .brand-logo { width: 22px; height: 22px; border-radius: 6px; overflow: hidden; flex: none; display: flex; align-items: center; justify-content: center; }
+.topbar .brand-logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .spacer { flex: 1; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border: 1px solid var(--hair); border-radius: 999px; background: var(--raised); font: 11px var(--mono); color: var(--muted); }
 .chip .led { width: 6px; height: 6px; border-radius: 50%; background: var(--c-official); }
@@ -208,3 +210,14 @@ button { font-family: inherit; }
 .eco-install { flex: none; font-size: 10px; color: var(--c-gw); white-space: nowrap; background: none; border: none; cursor: pointer; }
 .eco-install:hover { text-decoration: underline; }
 .eco-summary { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+
+/* ── 插件与能力市场(演示 v3 定稿样式):图标按钮 / switch 启停 / 浮层 tooltip ── */
+.plug-ic { width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--hair); background: transparent; color: var(--muted); font-size: 14px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+.plug-ic:hover { background: rgba(80,160,255,.12); color: var(--text); }
+.plug-ic.on { background: rgba(61,126,255,.14); border-color: var(--c-gw); color: var(--c-gw); }
+.switch { position: relative; width: 40px; height: 22px; border-radius: 999px; background: #2a3450; border: 1px solid #3a4560; cursor: pointer; transition: background .15s, border-color .15s; flex: none; display: inline-block; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #98A4BC; transition: transform .15s, background .15s; }
+.switch.on { background: rgba(80,200,130,.22); border-color: rgba(80,200,130,.5); }
+.switch.on::after { transform: translateX(18px); background: #5BC98A; }
+.tt { position: fixed; transform: translate(-50%, -100%); background: #0c1220; border: 1px solid #2a3450; color: #E8ECF4; font-size: 11px; padding: 5px 10px; border-radius: 7px; pointer-events: none; z-index: 999; white-space: nowrap; box-shadow: 0 4px 14px rgba(0,0,0,.35); display: none; }
+.tt::after { content: ""; position: absolute; left: 50%; bottom: -5px; transform: translateX(-50%); border: 5px solid transparent; border-top-color: #2a3450; }

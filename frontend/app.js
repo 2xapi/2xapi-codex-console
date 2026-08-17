@@ -235,7 +235,7 @@ async function refreshAll() {
 
 /* ── 渲染 ── */
 function renderNav() {
-  var noRail = state.view === "history" || state.view === "eco";
+  var noRail = state.view === "history" || state.view === "eco" || state.view === "plug";
   document.getElementById("frame").classList.toggle("no-rail", noRail);
   document.querySelectorAll(".nav-btn.agent").forEach(function (b) {
     b.classList.toggle("on", b.dataset.g === state.agent);
@@ -244,6 +244,8 @@ function renderNav() {
   if (hb) hb.classList.toggle("on", state.view === "history");
   var eb = document.getElementById("nv-eco");
   if (eb) eb.classList.toggle("on", state.view === "eco");
+  var pb = document.getElementById("nv-plug");
+  if (pb) pb.classList.toggle("on", state.view === "plug");
   /* 网关 chip:地址 + 存活灯 */
   var gw = (state.dstate && state.dstate.gateway) || null;
   var chip = document.getElementById("gwChip");
@@ -313,6 +315,7 @@ function renderContent() {
   var c = document.getElementById("content"); if (!c) return;
   if (state.view === "history") c.innerHTML = historyHtml();
   else if (state.view === "eco") c.innerHTML = ecoCenterHtml();
+  else if (state.view === "plug") c.innerHTML = plugCenterHtml();
   else c.innerHTML = (state.agent === "claude") ? claudeDashHtml()
     : (state.agent === "hermes") ? hermesDashHtml()
     : GW_AGENTS[state.agent] ? genericDashHtml(state.agent)
@@ -903,7 +906,6 @@ function ecoCenterHtml() {
   html += '<section class="card" style="margin-top:12px"><h2>MCP 预设市场</h2>'
     + '<div class="sub" style="margin:4px 0 10px">一键安装到当前平台(' + esc((cur && cur.name) || ECO_STATE.agent) + ');预设提炼自 cc-switch 与常用清单。</div>'
     + '<div class="eco-grid">' + (cards || '<span class="sub">暂无预设</span>') + '</div></section>';
-  html += plugSectionHtml();
   return html;
 }
 function doEcoOp(op, name) {
@@ -1056,6 +1058,590 @@ function plugSectionHtml() {
     }
     html += '</section>';
   }
+  return html;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   插件与能力市场 v3(演示定稿)· ai-gateway 路由插件
+   ──────────────────────────────────────────────────────────────
+   · 插件 = 多媒体能力路由:调用上游模型能力(识图/文生图/图编辑/ASR/TTS)
+     或本机工具(ffmpeg 抽帧);配置自己的端点即可用(自备端点,不依赖内置上游)
+   · 市场 / 文档页(独立) / 配置页(独立) / 插件自带 UI 界面 / switch 启停 / 更新 / 卸载
+   · 故障转移:多备用模型,主模型失败自动切换
+   · 数据接真 API(GET /api/plugin-market + /api/plugins + /api/plugins/:id,
+     契约见《插件市场-开发文档-v3》§四);batch A 未合入时按契约形状检测失败
+     → 回退内置 PLUG2_FALLBACK(演示数据),保证可独立验证
+   ══════════════════════════════════════════════════════════════════ */
+var PLUG2 = { tab: "market", q: "", cat: "all", detail: null, dt: "doc", ui: null,
+  mode: "mock", loading: false, busy: null,
+  data: [], installed: {}, enabled: {}, updates: {},
+  local: [], mySources: [], srcForm: false, cfgModels: null, cfgVals: null, cfgFailover: undefined };
+var PLUG2_FALLBACK = [
+  { id: "image-describe", name: "识图 · 图片转文字", author: "官方", version: "2.0.1", cap: "识图", icon: "🖼️", ui: true,
+    mount: "media_parse",
+    desc: "上传/引用一张图片,调用上游 chat 模型带图识别,输出文字描述。",
+    power: "调用上游 chat 通道(图片以 image_url 注入),模型默认取供应商当前默认,可指定",
+    input: ["图片(暂存 URL 或本机路径)", "识别指令(可选)"], output: ["文字描述(文本)"],
+    tags: ["识图", "图片 → 文字"], status: "ready",
+    scenes: [
+      { title: "给非多模态模型装上「眼睛」", desc: "DeepSeek、GLM 等纯文本模型不能直接接收图片。本插件先把图片转成文字描述,再喂给模型——模型即可回答图片相关问题(截图理解、图表解读、商品图描述、验证码识别),原本非多模态的模型经此链路即获得识图能力。" },
+      { title: "多模态链路中转站", desc: "视频抽帧产物、设计稿、文档截图等,先经识图转成文字,再进入对话/总结/文档流程,全链路统一走文字通道,任何模型都能参与。" },
+      { title: "批量图片描述", desc: "媒体暂存里的一批图片,逐一转成文字描述,用于内容归档、检索、无障碍阅读。" },
+    ],
+    config: [
+      { k: "model", label: "识别模型", type: "select", def: "跟随供应商默认", options: ["跟随供应商默认", "gpt-5.6", "claude-fable-5"], hint: "能力探测 image_in=Yes 的模型" },
+      { k: "lang", label: "输出语言", type: "select", def: "中文", options: ["中文", "English"] },
+    ],
+    md: "# 识图 · 图片转文字\n\n> ai-gateway 路由插件 · 官方 · 挂载点 media_parse\n\n## 功能简介\n\n上传/引用一张图片,调用上游 chat 模型带图识别,输出文字描述。\n\n## 应用场景\n\n### 给非多模态模型装上「眼睛」\n\nDeepSeek、GLM 等纯文本模型不能直接接收图片。本插件先把图片转成文字描述,再喂给模型——模型即可回答图片相关问题(截图理解、图表解读、商品图描述、验证码识别),原本非多模态的模型经此链路即获得识图能力。\n\n### 多模态链路中转站\n\n视频抽帧产物、设计稿、文档截图等,先经识图转成文字,再进入对话/总结/文档流程,全链路统一走文字通道,任何模型都能参与。\n\n### 批量图片描述\n\n媒体暂存里的一批图片,逐一转成文字描述,用于内容归档、检索、无障碍阅读。\n\n## 调用的模型能力\n\n调用上游 chat 通道(图片以 image_url 注入),模型默认取供应商当前默认,可指定。支持多模型故障转移:主模型失败自动切换备用模型。\n\n## 使用说明\n\n1. 在「供应商」里配置好支持识图的模型(能力面板可探测 image_in)\n2. 安装本插件,选择识别模型\n3. 调用入口:POST /api/plugins/:id/invoke,传入 media_url(网关暂存或本机路径)\n4. 输出文字描述,可继续喂给对话/文档流程",
+    docs: "1) 在「供应商」里配置好支持识图的模型(能力面板可探测 image_in)\n2) 安装本插件,选择识别模型\n3) 调用入口:POST /api/plugins/:id/invoke,传入 media_url(网关暂存或本机路径)\n4) 输出文字描述,可继续喂给对话/文档流程" },
+  { id: "image-generate", name: "文生图 · 文字生成图片", author: "官方", version: "2.0.0", cap: "文生图", icon: "🎨", ui: true,
+    mount: "tool_exec",
+    desc: "输入一句话描述,调用上游 /v1/images/generations 生成图片,产物自动存入媒体暂存。",
+    power: "调用上游 /v1/images/generations(gpt-image 系模型),产物 b64_json/url 双形态入暂存",
+    input: ["文字描述", "尺寸(可选)"], output: ["图片(暂存 URL)"],
+    tags: ["文生图", "文字 → 图片"], status: "ready",
+    scenes: [
+      { title: "文案配图", desc: "写文章、推文、文档时,一句话生成配图,不用再找图库。" },
+      { title: "设计素材", desc: "快速生成示意图、插画、概念图,给设计/汇报提供视觉参考。" },
+      { title: "创意发散", desc: "同一描述生成多张方案,辅助头脑风暴与方案比选。" },
+    ],
+    config: [
+      { k: "model", label: "生成模型", type: "select", def: "gpt-image-1", options: ["gpt-image-1"] },
+      { k: "size", label: "默认尺寸", type: "select", def: "1024×1024", options: ["1024×1024", "512×512"] },
+      { k: "n", label: "一次生成张数", type: "number", def: 1 },
+    ],
+    md: "# 文生图 · 文字生成图片\n\n> ai-gateway 路由插件 · 官方 · 挂载点 tool_exec\n\n## 功能简介\n\n输入一句话描述,调用上游 /v1/images/generations 生成图片,产物自动存入媒体暂存。\n\n## 应用场景\n\n### 文案配图\n\n写文章、推文、文档时,一句话生成配图,不用再找图库。\n\n### 设计素材\n\n快速生成示意图、插画、概念图,给设计/汇报提供视觉参考。\n\n### 创意发散\n\n同一描述生成多张方案,辅助头脑风暴与方案比选。\n\n## 调用的模型能力\n\n调用上游 /v1/images/generations(gpt-image 系模型),产物 b64_json/url 双形态入暂存。支持多模型故障转移。\n\n## 使用说明\n\n1. 需上游 Key 组开通图生成权限(未开通时调用返回人话提示)\n2. 生成产物自动入媒体暂存,返回管内 URL\n3. 可继续喂给识图/对话流程",
+    docs: "1) 需上游 Key 组开通图生成权限(未开通时调用返回人话提示)\n2) 生成产物自动入媒体暂存,返回管内 URL\n3) 可继续喂给识图/对话流程" },
+  { id: "image-edit", name: "图编辑 · 图片指令修改", author: "官方", version: "1.1.0", cap: "图编辑", icon: "✂️", ui: true,
+    mount: "tool_exec",
+    desc: "原图 + 修改指令,调用上游 /v1/images/edits 生成新图,产物入暂存。",
+    power: "调用上游 /v1/images/edits(multipart 原图 + 指令),新图入媒体暂存",
+    input: ["原图(暂存 URL)", "修改指令"], output: ["新图(暂存 URL)"],
+    tags: ["图编辑"], status: "ready",
+    scenes: [
+      { title: "图片修改", desc: "对现有图片按指令修改:换风格、改元素、扩场景,产物入暂存继续处理。" },
+      { title: "多轮迭代", desc: "生成不满意?给原图加新指令再改,配合文生图形成「生成→修改→定稿」闭环。" },
+    ],
+    config: [
+      { k: "model", label: "编辑模型", type: "select", def: "gpt-image-1", options: ["gpt-image-1"] },
+    ],
+    md: "# 图编辑 · 图片指令修改\n\n> ai-gateway 路由插件 · 官方 · 挂载点 tool_exec\n\n## 功能简介\n\n原图 + 修改指令,调用上游 /v1/images/edits 生成新图,产物入暂存。\n\n## 应用场景\n\n### 图片修改\n\n对现有图片按指令修改:换风格、改元素、扩场景,产物入暂存继续处理。\n\n### 多轮迭代\n\n生成不满意?给原图加新指令再改,配合文生图形成「生成→修改→定稿」闭环。\n\n## 调用的模型能力\n\n调用上游 /v1/images/edits(multipart 原图 + 指令),新图入媒体暂存。支持多模型故障转移。\n\n## 使用说明\n\n1. 需上游 Key 组开通图生成权限\n2. 原图从网关暂存或本机路径读取\n3. 产物入暂存,可继续处理",
+    docs: "1) 需上游 Key 组开通图生成权限\n2) 原图从网关暂存或本机路径读取\n3) 产物入暂存,可继续处理" },
+  { id: "ffmpeg-frame-extract", name: "视频抽帧 · 视频转图片", author: "官方", version: "1.0.0", cap: "抽帧", icon: "🎞️", ui: true,
+    mount: "media_parse",
+    desc: "按时间点从视频抽出一帧 JPEG,喂给识图类模型(路由插件示例:本机 ffmpeg 实现)。",
+    power: "调用本机 ffmpeg(-ss 定点抽帧),产物 JPEG 入媒体暂存,可喂识图管线",
+    input: ["视频(暂存 URL 或本机路径)", "时间点 t", "缩放 scale(可选)"], output: ["JPEG 图片(b64 / 暂存 URL)"],
+    tags: ["视频 → 图片", "喂识图"], status: "ready",
+    scenes: [
+      { title: "让模型「看懂视频」", desc: "视频不能直接喂给模型——先按时间点抽帧成图,再经识图插件转成文字描述,模型即可回答视频内容问题(视频问答、内容摘要、监控画面分析)。" },
+      { title: "素材提取", desc: "从视频取关键帧做封面、缩略图、归档样本。" },
+    ],
+    config: [
+      { k: "ffmpegPath", label: "ffmpeg 路径", type: "text", def: "ffmpeg", hint: "留空用 PATH 中的 ffmpeg" },
+      { k: "defaultT", label: "默认时间点(秒)", type: "number", def: 0 },
+    ],
+    md: "# 视频抽帧 · 视频转图片\n\n> ai-gateway 路由插件 · 官方 · 挂载点 media_parse\n\n## 功能简介\n\n按时间点从视频抽出一帧 JPEG,喂给识图类模型(路由插件示例:本机 ffmpeg 实现)。\n\n## 应用场景\n\n### 让模型「看懂视频」\n\n视频不能直接喂给模型——先按时间点抽帧成图,再经识图插件转成文字描述,模型即可回答视频内容问题(视频问答、内容摘要、监控画面分析)。\n\n### 素材提取\n\n从视频取关键帧做封面、缩略图、归档样本。\n\n## 调用的模型能力\n\n调用本机 ffmpeg(-ss 定点抽帧),产物 JPEG 入媒体暂存,可喂识图管线。\n\n## 使用说明\n\n1. 本机需安装 ffmpeg(缺失时调用返回人话 E_MEDIA_FFMPEG)\n2. 输入限网关暂存(hex 校验防路径穿越)或本机绝对路径\n3. 抽帧产物可立即喂给识图插件做画面理解",
+    docs: "1) 本机需安装 ffmpeg(缺失时调用返回人话 E_MEDIA_FFMPEG)\n2) 输入限网关暂存(hex 校验防路径穿越)或本机绝对路径\n3) 抽帧产物可立即喂给识图插件做画面理解" },
+  { id: "asr-speech", name: "语音识别 · 音频转文字", author: "官方", version: "1.1.0", cap: "ASR", icon: "🎙️", ui: true,
+    mount: "media_parse",
+    desc: "上传一段音频,识别为文字。配置你自己的 ASR 服务端点即可使用(Whisper 形态,兼容 OpenAI / Azure / 中转站等)。",
+    power: "调用配置的 ASR 端点 POST /v1/audio/transcriptions(Whisper 形态);支持多端点故障转移",
+    input: ["音频(暂存 URL)"], output: ["文字(转录)"],
+    tags: ["音频 → 文字"], status: "ready",
+    scenes: [
+      { title: "语音转文字", desc: "会议录音、语音消息、采访素材转成文字,进入对话/总结/记录流程。配置你自己的 ASR 端点即可用。" },
+    ],
+    config: [
+      { k: "apiBase", label: "ASR API 地址", type: "text", def: "https://api.openai.com/v1", hint: "任意提供 ASR 的服务(OpenAI Whisper / Azure 语音 / 中转站)" },
+      { k: "apiKey", label: "API Key", type: "password", req: true, hint: "你的服务商 Key" },
+      { k: "model", label: "识别模型", type: "select", def: "whisper-1", options: ["whisper-1", "whisper-large-v3", "其他"] },
+    ],
+    md: "# 语音识别 · 音频转文字\n\n> ai-gateway 路由插件 · 官方 · 挂载点 media_parse\n\n## 功能简介\n\n上传一段音频,识别为文字。配置你自己的 ASR 服务端点即可使用(Whisper 形态,兼容 OpenAI / Azure / 各类中转站)。\n\n## 应用场景\n\n### 语音转文字\n\n会议录音、语音消息、采访素材转成文字,进入对话/总结/记录流程。\n\n## 调用的模型能力\n\n调用配置的 ASR 端点 POST /v1/audio/transcriptions(Whisper 形态);支持多端点故障转移,主端点失败自动切换备用。\n\n## 使用说明\n\n1. 配置你自己的 ASR 服务端点(API 地址 + Key + 模型)\n2. 安装后即可识别音频为文字\n3. 可配置多个备用端点,主端点失败自动切换(故障转移)\n4. 产物文字可继续喂给对话/总结流程",
+    docs: "1) 配置你自己的 ASR 服务端点(API 地址 + Key + 模型)\n2) 安装后即可识别音频为文字\n3) 可配置多个备用端点,主端点失败自动切换(故障转移)\n4) 产物文字可继续喂给对话/总结流程" },
+  { id: "tts-speech", name: "语音合成 · 文字转语音", author: "官方", version: "1.1.0", cap: "TTS", icon: "🔊", ui: true,
+    mount: "tool_exec",
+    desc: "输入文字,合成为语音。配置你自己的 TTS 服务端点即可使用,支持多音色。",
+    power: "调用配置的 TTS 端点 POST /v1/audio/speech;支持多端点故障转移",
+    input: ["文字"], output: ["音频(暂存 URL)"],
+    tags: ["文字 → 音频"], status: "ready",
+    scenes: [
+      { title: "文字转语音", desc: "文章、消息、通知转成语音播放,朗读与播报场景。配置你自己的 TTS 端点即可用。" },
+    ],
+    config: [
+      { k: "apiBase", label: "TTS API 地址", type: "text", def: "https://api.openai.com/v1", hint: "任意提供 TTS 的服务(OpenAI / Azure / 中转站)" },
+      { k: "apiKey", label: "API Key", type: "password", req: true, hint: "你的服务商 Key" },
+      { k: "voice", label: "默认音色", type: "select", def: "alloy", options: ["alloy", "echo", "fable", "onyx", "nova", "shimmer"] },
+    ],
+    md: "# 语音合成 · 文字转语音\n\n> ai-gateway 路由插件 · 官方 · 挂载点 tool_exec\n\n## 功能简介\n\n输入文字,合成为语音。配置你自己的 TTS 服务端点即可使用,支持多音色。\n\n## 应用场景\n\n### 文字转语音\n\n文章、消息、通知转成语音播放,朗读与播报场景。\n\n## 调用的模型能力\n\n调用配置的 TTS 端点 POST /v1/audio/speech;支持多端点故障转移,主端点失败自动切换备用。\n\n## 使用说明\n\n1. 配置你自己的 TTS 服务端点(API 地址 + Key + 音色)\n2. 安装后即可文字转语音\n3. 可配置多个备用端点,主端点失败自动切换(故障转移)\n4. 产物音频入暂存,可播放/下载",
+    docs: "1) 配置你自己的 TTS 服务端点(API 地址 + Key + 音色)\n2) 安装后即可文字转语音\n3) 可配置多个备用端点,主端点失败自动切换(故障转移)\n4) 产物音频入暂存,可播放/下载" },
+];
+
+
+function plug2ById(id) { return PLUG2.data.filter(function (x) { return x.id === id; })[0]; }
+function plug2Installed(id) { return !!PLUG2.installed[id]; }
+function plug2IconById(id) {
+  var ICONS = { "image-describe": "🖼️", "image-generate": "🎨", "image-edit": "✂️", "ffmpeg-frame-extract": "🎞️", "asr-speech": "🎙️", "tts-speech": "🔊" };
+  return ICONS[id] || "🔌";
+}
+/* 条目归一:后端驼峰契约字段 → 前端统一形状(缺失字段兜默认) */
+function plug2NormEntry(p) {
+  p = p || {};
+  return {
+    id: p.id, name: p.name || p.id || "", author: p.author || "官方", version: p.version || "1.0.0",
+    cap: p.cap || "", icon: p.icon || plug2IconById(p.id),
+    mount: p.mount || "", desc: p.desc || p.short_desc || "", power: p.power || "",
+    input: p.input || {}, output: p.output || {},
+    tags: p.tags || [], scenes: p.scenes || [], config: p.config || [], models: p.models || [],
+    md: p.md || "", docs: p.docs || "", ui: !!p.ui, status: p.status || ""
+  };
+}
+/* 市场契约形状检查:batch A 新字段(cap/tags/md)缺失 = 后端未就绪 → 回退演示数据 */
+function plug2NormMarket(mk) {
+  var arr = (mk && mk.official && mk.official.plugins) || [];
+  if (!arr.length) return null;
+  var f = arr[0];
+  if (!f || (f.cap === undefined && f.tags === undefined && f.md === undefined)) return null;
+  return arr.map(plug2NormEntry).filter(function (x) { return !!x.id; });
+}
+/* 输入→输出计数:后端为 {required,properties} 对象,演示数据为数组,兼容两种 */
+function plug2InOut(p) {
+  var inLen = (p.input && p.input.length !== undefined) ? p.input.length : ((p.input && p.input.required) || []).length;
+  var outLen = (p.output && p.output.length !== undefined) ? p.output.length : (p.output && p.output.properties ? Object.keys(p.output.properties).length : 0);
+  return inLen + " → " + outLen;
+}
+function plug2SemverGt(a, b) {
+  var pa = String(a || "").split(".").map(Number), pb = String(b || "").split(".").map(Number);
+  for (var k = 0; k < 3; k++) { var x = pa[k] || 0, y = pb[k] || 0; if (x !== y) return x > y; }
+  return false;
+}
+/* 模型与故障转移表数据:manifest models 优先,缺省按能力生成主/备用(演示形态) */
+function plug2Models(p) {
+  if (p.models && p.models.length) return p.models.map(function (m) {
+    return { model: m.id || "", ep: (m.api || "").replace(/^https?:\/\//, ""), note: m.note || "" };
+  });
+  var cap = p.cap || "";
+  return [
+    { model: cap === "识图" ? "gpt-5.6" : (cap === "文生图" || cap === "图编辑" ? "gpt-image-1" : (cap === "ASR" ? "whisper-1" : (cap === "TTS" ? "tts-1" : "deepseek-chat"))), ep: "2xa.cc.cd /v1", note: cap === "ASR" || cap === "TTS" ? "你的主端点" : "多模态,直接识别" },
+    { model: cap === "识图" ? "deepseek-chat" : (cap === "文生图" ? "dall-e-3" : (cap === "ASR" ? "whisper-large-v3" : (cap === "TTS" ? "tts-1-hd" : "glm-5"))), ep: "api.deepseek.com /v1", note: cap === "识图" ? "纯文本,经本插件文字链路识别" : "备用通道" },
+    { model: "glm-5-flash", ep: "bigmodel.cn /v1", note: "低成本兜底" },
+  ];
+}
+/* 配置页状态:models 行 / 参数值 / 故障转移开关(仅 UI 态,保存时组包提交) */
+function plug2CfgState(p) {
+  if (!PLUG2.cfgModels || PLUG2.cfgModels.id !== p.id) {
+    PLUG2.cfgModels = { id: p.id, rows: plug2Models(p) };
+    PLUG2.cfgVals = {};
+    (p.config || []).forEach(function (c) {
+      PLUG2.cfgVals[c.k] = (c.def !== undefined && c.def !== null) ? c.def : ((c.options && c.options.length) ? c.options[0] : "");
+    });
+    PLUG2.cfgFailover = true;
+  }
+  return PLUG2.cfgModels;
+}
+/* 数据加载:市场 + 已安装;市场契约不满足 → PLUG2_FALLBACK 兜底(mock 模式) */
+function plug2Load() {
+  PLUG2.loading = true;
+  if (state.view === "plug") render();
+  var m = api.plugMarket().then(plug2NormMarket).catch(function () { return null; });
+  var i = api.plugList().then(function (v) {
+    var arr = (v && v.plugins) || [];
+    var inst = {}, en = {}, list = [];
+    arr.forEach(function (x) { inst[x.id] = 1; en[x.id] = !!x.enabled; list.push(x); });
+    return { inst: inst, en: en, list: list };
+  }).catch(function () { return null; });
+  return Promise.all([m, i]).then(function (r) {
+    var mk = r[0], ii = r[1];
+    if (!mk) {
+      PLUG2.mode = "mock";
+      PLUG2.data = PLUG2_FALLBACK;
+      PLUG2.installed = { "ffmpeg-frame-extract": 1 };
+      PLUG2.enabled = { "ffmpeg-frame-extract": true };
+      PLUG2.updates = { "image-describe": "2.1.0", "ffmpeg-frame-extract": "1.1.0" };
+    } else {
+      PLUG2.mode = "api";
+      PLUG2.data = mk;
+      PLUG2.installed = (ii && ii.inst) || {};
+      PLUG2.enabled = (ii && ii.en) || {};
+      PLUG2.updates = {};
+      if (ii) {
+        ii.list.forEach(function (x) {
+          var p = plug2ById(x.id);
+          var instV = x.version || (x.meta && x.meta.version) || null;
+          if (p) {
+            /* 可更新 = 市场版本 > 已装版本 */
+            if (instV && plug2SemverGt(p.version, instV)) PLUG2.updates[x.id] = p.version;
+          } else {
+            /* 本地/第三方已装条目不在市场数据里 → 补进列表 */
+            var mt = x.meta || {};
+            PLUG2.data.push(plug2NormEntry({ id: x.id, name: mt.name, version: instV, short_desc: mt.short_desc, desc: mt.desc, mount: mt.mount }));
+          }
+        });
+      }
+    }
+    PLUG2.loading = false;
+    if (state.view === "plug") render();
+  });
+}
+function plug2OpenDetail(id, dt) {
+  PLUG2.tab = "detail"; PLUG2.detail = id; PLUG2.dt = dt;
+  PLUG2.cfgModels = null; PLUG2.cfgVals = null; PLUG2.cfgFailover = undefined;
+  render();
+  if (PLUG2.mode !== "api") return;
+  api.plugDetail(id).then(function (v) {
+    var e = (v && v.id) ? v : ((v && v.plugin) || null);
+    if (!e) return;
+    var i = PLUG2.data.findIndex(function (x) { return x.id === id; });
+    if (i < 0) PLUG2.data.push(plug2NormEntry(e));
+    else PLUG2.data[i] = plug2NormEntry(e);
+    if (state.view === "plug" && PLUG2.tab === "detail" && PLUG2.detail === id) render();
+  }).catch(function () { /* 详情失败维持市场数据 */ });
+}
+/* 保存配置:参数值 + models 优先级 + 故障转移开关 → PUT /api/plugins/:id/config */
+function plug2SaveCfg(id) {
+  var rows = (PLUG2.cfgModels && PLUG2.cfgModels.rows) || [];
+  var models = rows.map(function (r) {
+    var api = String(r.ep || "");
+    if (api && api.indexOf("://") < 0) api = "https://" + api;
+    return { id: r.model, api: api, note: r.note };
+  }).filter(function (m) { return m.id; });
+  var body = { config: PLUG2.cfgVals || {}, models: models, failover: PLUG2.cfgFailover !== false };
+  if (PLUG2.mode !== "api") { showToast("配置已保存,立即生效", "ok"); render(); return; }
+  PLUG2.busy = id;
+  api.plugConfig(id, body).then(function () { showToast("配置已保存,立即生效", "ok"); })
+    .catch(function (e) { showToast(e.message || "保存失败", "error"); })
+    .finally(function () { PLUG2.busy = null; render(); });
+}
+/* 本地 manifest 文件:校验 → 上架 → 立即安装(来源 local) */
+function plug2LocalFile(inp) {
+  var f = inp.files && inp.files[0];
+  if (!f) return;
+  var rd = new FileReader();
+  rd.onload = function () {
+    var m;
+    try { m = JSON.parse(rd.result); } catch (e) { showToast("manifest JSON 解析失败:" + e.message, "error"); return; }
+    if (!m || !m.id || !m.name) { showToast("manifest 校验失败:缺 id/name", "error"); return; }
+    if (PLUG2.mode !== "api") {
+      PLUG2.local.push({ id: m.id, name: m.name, src: "本地", detail: f.name + " · " + (m.desc || m.short_desc || "") });
+      showToast("✓ 本地插件「" + m.name + "」校验通过,已上架(演示)", "ok");
+      render();
+      return;
+    }
+    PLUG2.busy = m.id;
+    api.plugLocal(m).then(function (v) {
+      var rid = (v && v.id) ? v.id : ("local." + m.id);
+      showToast("✓ 本地插件「" + m.name + "」校验通过,已上架", "ok");
+      api.plugInstallId(rid).then(function () { showToast("已安装「" + m.name + "」", "ok"); })
+        .catch(function () { /* 上架成功即可,安装失败不阻断 */ });
+    }).catch(function (e) { showToast("校验失败:" + (e.message || "未知错误"), "error"); })
+      .finally(function () { PLUG2.busy = null; plug2Load(); });
+  };
+  rd.readAsText(f);
+  inp.value = "";
+}
+
+/* 迷你 markdown 渲染(# / ## / ### / - / 1. / 引用 > / 代码块)——插件文档展示用 */
+function md2html(md) {
+  var lines = String(md || "").split("\n");
+  var html = "", inCode = false;
+  lines.forEach(function (ln) {
+    var t = ln.trim();
+    if (t.indexOf("```") === 0) {
+      if (inCode) { html += "</pre>"; inCode = false; } else { html += '<pre class="mono" style="font-size:11px;line-height:1.7;background:var(--raised);border:1px solid var(--hair);border-radius:8px;padding:9px 11px;overflow-x:auto;white-space:pre-wrap">'; inCode = true; }
+      return;
+    }
+    if (inCode) { html += esc(ln) + "\n"; return; }
+    if (/^### /.test(t)) { html += '<h4 style="font-size:12.5px;margin:12px 0 5px;color:#cdd6e6">' + esc(t.slice(4)) + '</h4>'; return; }
+    if (/^## /.test(t)) { html += '<h3 style="font-size:13px;margin:16px 0 6px;color:#9CB4DE;border-left:3px solid #3d5a8a;padding-left:8px">' + esc(t.slice(3)) + '</h3>'; return; }
+    if (/^# /.test(t)) { html += '<h2 style="font-size:15px;margin:0 0 4px">' + esc(t.slice(2)) + '</h2>'; return; }
+    if (/^> /.test(t)) { html += '<div class="sub" style="font-size:11px;margin:2px 0 10px">' + esc(t.slice(2)) + '</div>'; return; }
+    if (/^\d+\. /.test(t)) { html += '<div style="font-size:12px;line-height:1.9;padding-left:2px">' + esc(t) + '</div>'; return; }
+    if (t.indexOf("- ") === 0) { html += '<div style="font-size:12px;line-height:1.9;padding-left:2px">· ' + esc(t.slice(2)) + '</div>'; return; }
+    if (t === "") { html += '<div style="height:5px"></div>'; return; }
+    html += '<p style="font-size:12px;line-height:1.9;margin:0">' + esc(t) + '</p>';
+  });
+  if (inCode) html += "</pre>";
+  return html;
+}
+
+function plugCenterHtml() {
+  if (PLUG2.ui) return plug2UiHtml(plug2ById(PLUG2.ui));
+  if (PLUG2.loading && !PLUG2.data.length) {
+    return '<section class="card"><h2>🧩 插件与能力市场</h2>'
+      + '<div class="sub" style="padding:20px 0;text-align:center">加载中…</div></section>';
+  }
+  if (PLUG2.tab === "detail" && PLUG2.detail) return plug2DetailHtml(plug2ById(PLUG2.detail));
+  var tabs = [["market", "🛒 插件市场"], ["installed", "📦 已安装"], ["design", "🧩 我的设计"]];
+  var html = '<section class="card"><h2>🧩 插件与能力市场</h2>'
+    + (PLUG2.mode === "mock"
+      ? '<div class="sub" style="margin:2px 0 8px">⚠ 后端插件 API 未就绪(batch A 未合入),当前展示内置演示数据;后端就绪后自动切换真实数据。</div>'
+      : '')
+    + '<div style="margin:2px 0 12px;padding:12px 14px;background:linear-gradient(135deg,rgba(61,126,255,.08),rgba(123,92,255,.06));border:1px solid rgba(123,92,255,.3);border-radius:12px">'
+    + '<b style="font-size:13px">ai-gateway 路由插件 · 给大模型赋能</b>'
+    + '<div class="sub" style="margin:5px 0 0;line-height:1.8">我们的网关是模型路由中心,插件是给模型赋能的路由插件:</div>'
+    + '<div class="sub" style="margin:3px 0 0;line-height:1.9">'
+    + '① <b>能力补全</b>:识图、文生图、图编辑、视频抽帧、语音——让纯文本模型也能看图、让任何模型都能产出图片与视频理解;<br>'
+    + '② <b>故障转移</b>:每个能力可配置多个备用模型,主模型调用失败自动切换下一个,服务不断;<br>'
+    + '③ <b>开放生态</b>:manifest 声明即插件(挂载点 / 输入输出 / 配置项),任何人都能设计发布,别人一键安装;<br>'
+    + '④ <b>自备端点</b>:ASR / TTS 等能力配置你自己的服务端点即可使用(不依赖内置上游,谁有大模型谁配置)。</div></div>'
+    + '<div class="eco-tabs" style="margin-bottom:12px">'
+    + tabs.map(function (t) { return '<button class="eco-tab ' + (PLUG2.tab === t[0] ? "on" : "") + '" data-a="plug2-tab" data-t="' + t[0] + '">' + t[1] + '</button>'; }).join("")
+    + '</div>'
+    + (PLUG2.tab === "market" ? plug2MarketHtml() : PLUG2.tab === "installed" ? plug2InstalledHtml() : plug2DesignHtml())
+    + '</section>';
+  return html;
+}
+
+/* ── 市场页:搜索 / 分类 / 列表(行 = 图标+名称+作者·版本·挂载点 | 能力 | 输入→输出 | 标签 | 状态 | 操作)── */
+function plug2MarketHtml() {
+  var cats = ["all", "识图", "文生图", "图编辑", "抽帧", "语音"];
+  var list = PLUG2.data.filter(function (p) {
+    if (PLUG2.cat !== "all" && p.cap !== PLUG2.cat) return false;
+    if (PLUG2.q && (p.name + p.desc + (p.tags || []).join(" ")).toLowerCase().indexOf(PLUG2.q.toLowerCase()) < 0) return false;
+    return true;
+  });
+  var html = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'
+    + '<input data-a="plug2-search" placeholder="搜索插件(识图 / 生图 / 抽帧…)" value="' + esc(PLUG2.q) + '" style="flex:1;min-width:180px;background:var(--raised);border:1px solid var(--hair);border-radius:8px;color:var(--text);padding:8px 12px;font-size:12px">'
+    + cats.map(function (c) { return '<button class="eco-tab ' + (PLUG2.cat === c ? "on" : "") + '" data-a="plug2-cat" data-v="' + c + '">' + (c === "all" ? "全部" : c) + '</button>'; }).join("")
+    + '</div>';
+  if (!list.length) return html + '<div class="sub" style="padding:30px 0;text-align:center">没有匹配的插件;换个关键词,或到「我的设计」自己做一个。</div>';
+  html += '<table class="mtable"><thead><tr><th style="width:36%">插件</th><th style="width:10%">能力</th><th style="width:12%">输入 → 输出</th><th>标签</th><th style="width:11%">状态</th><th style="width:12%">操作</th></tr></thead><tbody>'
+    + list.map(plug2Row).join("") + '</tbody></table>';
+  return html;
+}
+function plug2Row(p) {
+  var kindTag = p.cap ? '<span class="tag on" style="border-color:var(--c-gw);color:var(--c-gw)">' + esc(p.cap) + '</span>' : '<span class="tag">工具</span>';
+  var inst = plug2Installed(p.id);
+  var st = (inst ? '<span class="tag" style="border-color:var(--c-official);color:var(--c-official)">● 已启用</span>' : '<span class="tag">未安装</span>');
+  return '<tr style="cursor:pointer" data-a="plug2-open" data-id="' + esc(p.id) + '">'
+    + '<td><div style="display:flex;align-items:center;gap:9px">'
+    + '<span style="width:30px;height:30px;border-radius:8px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:15px;flex:none">' + p.icon + '</span>'
+    + '<div style="min-width:0"><b style="font-size:12.5px">' + esc(p.name) + '</b>'
+    + '<span class="sub" style="font-size:10px;display:block">' + esc(p.author) + ' · v' + esc(p.version) + ' · 挂载 ' + esc(p.mount) + '</span></div></div></td>'
+    + '<td>' + kindTag + '</td>'
+    + '<td>' + plug2InOut(p) + '</td>'
+    + '<td>' + (p.tags || []).map(function (t) { return '<span class="tag">' + esc(t) + '</span>'; }).join("") + '</td>'
+    + '<td>' + st + '</td>'
+    + '<td style="white-space:nowrap">'
+    + (inst
+      ? '<button class="btn sm ghost" data-a="plug2-open" data-id="' + esc(p.id) + '" style="color:var(--c-official)">配置</button>'
+      : '<button class="btn sm primary" data-a="plug2-install" data-id="' + esc(p.id) + '">安装</button>')
+    + '</td></tr>';
+}
+
+/* ── 详情:横幅 + 文档页(独立) / 配置页(独立) ── */
+function plug2DetailHtml(p) {
+  if (!p) return '<div class="sub">插件不存在</div>';
+  var inst = plug2Installed(p.id);
+  var on = !!PLUG2.enabled[p.id];
+  var hasUpdate = !!PLUG2.updates[p.id];
+  var html = '<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px">'
+    + '<button class="btn ghost" data-a="plug2-back">← 返回</button>'
+    + '<span class="sub" style="margin:0">插件详情</span></div>'
+    + '<section class="card" style="background:linear-gradient(135deg,rgba(61,126,255,.07),rgba(123,92,255,.05))">'
+    + '<div style="display:flex;gap:14px;align-items:flex-start">'
+    + '<span style="width:52px;height:52px;border-radius:13px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:26px;flex:none">' + p.icon + '</span>'
+    + '<div style="flex:1;min-width:0"><h2 style="margin:0 0 3px;font-size:16px">' + esc(p.name) + '</h2>'
+    + '<div class="sub" style="margin:0 0 6px">' + esc(p.author) + ' · v' + esc(p.version) + (hasUpdate ? ' · <span class="tag on" style="border-color:#E8A84A;color:#E8A84A">可更新 → v' + esc(PLUG2.updates[p.id]) + '</span>' : '') + '</div>'
+    + '<div style="display:flex;gap:4px;flex-wrap:wrap">' + (p.tags || []).map(function (t) { return '<span class="tag">' + esc(t) + '</span>'; }).join("")
+    + (p.cap ? '<span class="tag on" style="border-color:var(--c-gw);color:var(--c-gw)">' + esc(p.cap) + '</span>' : '') + '</div></div>'
+    + (!inst
+      ? '<button class="btn primary" data-a="plug2-install" data-id="' + esc(p.id) + '" style="flex:none">安装</button>'
+      : '<div style="display:flex;gap:6px;flex:none">'
+        + (p.ui ? '<button class="plug-ic" data-tip="打开插件界面" data-a="plug2-ui" data-id="' + esc(p.id) + '">🖥️</button>' : '')
+        + '<button class="plug-ic ' + (PLUG2.dt === "doc" ? "on" : "") + '" data-tip="文档" data-a="plug2-doc" data-id="' + esc(p.id) + '">📖</button>'
+        + '<button class="plug-ic ' + (PLUG2.dt === "cfg" ? "on" : "") + '" data-tip="配置" data-a="plug2-open" data-id="' + esc(p.id) + '">⚙️</button></div>')
+    + '</div></section>';
+  if (PLUG2.dt === "cfg" && inst) {
+    /* 配置页(独立):模型与故障转移 + 参数 + 启停/更新/卸载 */
+    var cs = plug2CfgState(p);
+    html += '<section class="card" style="margin-top:12px"><h2>模型与故障转移</h2>'
+      + '<div style="display:flex;align-items:center;gap:8px;margin:8px 0">'
+      + '<input type="checkbox" data-pk="failover"' + (PLUG2.cfgFailover !== false ? " checked" : "") + ' style="accent-color:var(--c-gw)"><span style="font-size:12px">启用故障转移</span>'
+      + '<span class="sub" style="font-size:10.5px;margin:0">主模型失败(超时/限流/配额/接口错误)自动切换下一个备用模型,服务不断</span></div>'
+      + '<table class="mtable"><thead><tr><th style="width:9%">优先级</th><th>模型</th><th style="width:20%">API 端点</th><th style="width:30%">说明</th><th style="width:12%">操作</th></tr></thead><tbody>'
+      + cs.rows.map(function (r, i) {
+        return '<tr><td><span class="tag ' + (i === 0 ? 'on" style="border-color:var(--c-gw);color:var(--c-gw)' : '"') + '>' + (i === 0 ? "主" : "备用 " + i) + '</span></td>'
+          + '<td><input class="mono" data-pk="m-' + i + '-model" value="' + esc(r.model) + '" placeholder="模型 id" style="width:100%;background:transparent;border:1px solid var(--hair);border-radius:6px;padding:2px 6px;font-size:11px"></td>'
+          + '<td><input class="mono" data-pk="m-' + i + '-ep" value="' + esc(r.ep) + '" placeholder="api.deepseek.com /v1" style="width:100%;background:transparent;border:1px solid var(--hair);border-radius:6px;padding:2px 6px;font-size:10.5px"></td>'
+          + '<td><input class="mono" data-pk="m-' + i + '-note" value="' + esc(r.note) + '" placeholder="说明(可选)" style="width:100%;background:transparent;border:1px solid var(--hair);border-radius:6px;padding:2px 6px;font-size:10.5px"></td>'
+          + '<td style="white-space:nowrap">' + (i ? '<button class="btn sm ghost" data-a="plug2-mup" data-i="' + i + '">上移</button> ' : '') + '<button class="btn sm ghost" data-a="plug2-mdel" data-i="' + i + '">移除</button></td></tr>';
+      }).join("")
+      + '</tbody></table>'
+      + '<div class="btn-row" style="margin-top:8px"><button class="btn ghost" data-a="plug2-madd">＋ 添加备用模型</button></div></section>';
+    if ((p.config || []).length) {
+      html += '<section class="card" style="margin-top:12px"><h2>参数配置</h2>'
+        + '<div class="grid2" style="margin-top:6px">'
+        + (p.config || []).map(function (c) {
+          var v = (PLUG2.cfgVals && PLUG2.cfgVals[c.k] !== undefined) ? PLUG2.cfgVals[c.k] : "";
+          var ctrl = "";
+          if (c.type === "password") ctrl = '<input class="mono" type="password" data-pk="c-' + esc(c.k) + '" placeholder="••••••••" value="' + esc(String(v)) + '" style="width:100%">';
+          else if (c.type === "select") ctrl = '<select class="mono" data-pk="c-' + esc(c.k) + '" style="width:100%;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);padding:6px 9px">' + (c.options || []).map(function (o) { return '<option' + (String(o) === String(v) ? " selected" : "") + '>' + esc(o) + '</option>'; }).join("") + '</select>';
+          else if (c.type === "number") ctrl = '<input class="mono" type="number" data-pk="c-' + esc(c.k) + '" value="' + esc(String(v)) + '" style="width:100%">';
+          else if (c.type === "toggle") ctrl = '<input type="checkbox" data-pk="c-' + esc(c.k) + '"' + (v ? " checked" : "") + ' style="accent-color:var(--c-gw)">';
+          else ctrl = '<input class="mono" data-pk="c-' + esc(c.k) + '" value="' + esc(String(v)) + '" style="width:100%">';
+          return '<div class="f" style="grid-column:1/-1"><label>' + esc(c.label) + (c.req ? ' <span style="color:var(--c-err)">*</span>' : '') + '</label>' + ctrl
+            + (c.hint ? '<span class="sub" style="font-size:10px">' + esc(c.hint) + '</span>' : '') + '</div>';
+        }).join("")
+        + '</div>'
+        + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-save">保存配置</button></div></section>';
+    }
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-top:14px">'
+      + '<span class="switch ' + (on ? "on" : "") + '" data-a="plug2-toggle" data-id="' + esc(p.id) + '" data-tip="' + (on ? "已打开 · 点击停止" : "已关闭 · 点击启用") + '"></span>'
+      + (hasUpdate ? '<button class="btn primary" data-a="plug2-update" data-id="' + esc(p.id) + '">更新到 v' + esc(PLUG2.updates[p.id]) + '</button>' : '')
+      + '<button class="btn ghost" data-a="plug2-uninstall" data-id="' + esc(p.id) + '">卸载</button></div>';
+  } else {
+    /* 文档页(独立):markdown 渲染 + 未安装时安装按钮 */
+    html += '<section class="card" style="margin-top:12px">' + md2html(p.md || (p.docs || "")) + '</section>';
+    if (!inst) {
+      html += '<div class="btn-row" style="margin-top:12px"><button class="btn primary" data-a="plug2-install" data-id="' + esc(p.id) + '">安装</button></div>';
+    }
+  }
+  return html;
+}
+
+/* ── 已安装(AstrBot 风格:行 + switch + 图标按钮,同排)── */
+function plug2InstalledHtml() {
+  var rows = PLUG2.data.filter(function (p) { return plug2Installed(p.id); });
+  if (!rows.length) return '<div class="sub" style="padding:26px 0;text-align:center">还没有安装插件;到「插件市场」挑一个媒体能力插件装上,配置后即可使用。</div>';
+  return rows.map(function (p) {
+    var on = !!PLUG2.enabled[p.id];
+    var hasUpdate = !!PLUG2.updates[p.id];
+    return '<div style="display:flex;align-items:center;gap:12px;background:var(--raised);border:1px solid var(--hair);border-radius:12px;padding:12px 14px;margin-bottom:8px">'
+      + '<span style="width:36px;height:36px;border-radius:9px;background:#1d2640;display:flex;align-items:center;justify-content:center;font-size:18px;flex:none">' + p.icon + '</span>'
+      + '<div style="flex:1;min-width:0">'
+      + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+      + '<b style="font-size:13px">' + esc(p.name) + '</b>'
+      + '<span class="tag" style="font-size:10px">v' + esc(p.version) + '</span>'
+      + (p.cap ? '<span class="tag on" style="border-color:var(--c-gw);color:var(--c-gw);font-size:10px">' + esc(p.cap) + '</span>' : '')
+      + (hasUpdate ? '<span class="tag" style="border-color:#E8A84A;color:#E8A84A;font-size:10px">可更新 v' + esc(PLUG2.updates[p.id]) + '</span>' : '')
+      + '</div>'
+      + '<div class="sub" style="font-size:11px;margin-top:3px;line-height:1.6">' + esc(p.desc) + '</div></div>'
+      + '<div style="display:flex;align-items:center;gap:5px;flex:none">'
+      + '<span class="switch ' + (on ? "on" : "") + '" data-a="plug2-toggle" data-id="' + esc(p.id) + '" data-tip="' + (on ? "已打开 · 点击停止" : "已关闭 · 点击启用") + '"></span>'
+      + (p.ui ? '<button class="plug-ic" data-tip="打开插件界面" data-a="plug2-ui" data-id="' + esc(p.id) + '">🖥️</button>' : '')
+      + '<button class="plug-ic" data-tip="配置" data-a="plug2-open" data-id="' + esc(p.id) + '">⚙️</button>'
+      + '<button class="plug-ic" data-tip="文档" data-a="plug2-doc" data-id="' + esc(p.id) + '">📖</button>'
+      + (hasUpdate ? '<button class="plug-ic" style="border-color:#E8A84A;color:#E8A84A" data-tip="更新到 v' + esc(PLUG2.updates[p.id]) + '" data-a="plug2-update" data-id="' + esc(p.id) + '">⟳</button>' : '')
+      + '<button class="plug-ic" style="color:var(--c-err)" data-tip="卸载" data-a="plug2-uninstall" data-id="' + esc(p.id) + '">🗑</button></div>'
+      + '</div>';
+  }).join("");
+}
+
+/* ── 插件自带 UI 界面(每个插件自己的操作台)── */
+function plug2UiHtml(p) {
+  if (!p) return '<div class="sub">插件不存在</div>';
+  var html = '<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px">'
+    + '<button class="btn ghost" data-a="plug2-ui-back">← 返回</button>'
+    + '<span class="sub" style="margin:0">' + esc(p.name) + ' · 界面</span></div>'
+    + '<section class="card">'
+    + '<div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">'
+    + '<span style="width:38px;height:38px;border-radius:10px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:19px">' + p.icon + '</span>'
+    + '<div><h2 style="font-size:14px;margin:0">' + esc(p.name) + '</h2>'
+    + '<span class="sub" style="font-size:11px">插件自带操作界面 · 直接使用本插件能力</span></div></div>';
+  if (p.cap === "识图") {
+    html += '<div class="f"><label>图片(网关暂存 URL 或本机路径)</label><input class="mono" data-pk="ui-img" placeholder="http://127.0.0.1:8787/media/ab12….jpg 或 /path/to/image.png" value="http://127.0.0.1:8787/media/demo-64x64.png" style="width:100%"></div>'
+      + '<div class="f" style="margin-top:8px"><label>识别指令(可选)</label><input class="mono" data-pk="ui-q" placeholder="描述这张图片的内容" value="描述这张图片的内容" style="width:100%"></div>'
+      + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 识别</button></div>'
+      + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
+      + '<div class="sub" style="font-size:10px;margin-bottom:6px">识别结果</div>'
+      + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">识别使用主模型 gpt-5.6(多模态直接识别);失败自动切换备用 deepseek-chat(文字链路)。</div></div>';
+  } else if (p.cap === "文生图") {
+    html += '<div class="f"><label>画面描述</label><input class="mono" data-pk="ui-q" placeholder="一只在星空下奔跑的机械狐狸…" value="一只在星空下奔跑的机械狐狸,赛博朋克风格" style="width:100%"></div>'
+      + '<div class="grid2" style="margin-top:8px"><div class="f"><label>尺寸</label><select class="mono" style="width:100%;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);padding:6px 9px"><option selected>1024×1024</option><option>512×512</option></select></div>'
+      + '<div class="f"><label>张数</label><input class="mono" type="number" value="1" style="width:100%"></div></div>'
+      + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 生成</button></div>'
+      + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
+      + '<div class="sub" style="font-size:10px;margin-bottom:6px">生成结果(产物自动入媒体暂存)</div>'
+      + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">生成使用 gpt-image-1;产物返回管内 URL,可继续喂识图/对话流程。</div></div>';
+  } else if (p.cap === "图编辑") {
+    html += '<div class="f"><label>原图(暂存 URL)</label><input class="mono" data-pk="ui-img" placeholder="http://127.0.0.1:8787/media/….jpg" style="width:100%"></div>'
+      + '<div class="f" style="margin-top:8px"><label>修改指令</label><input class="mono" data-pk="ui-q" placeholder="把背景换成海边日落" value="把背景换成海边日落" style="width:100%"></div>'
+      + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 编辑</button></div>'
+      + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
+      + '<div class="sub" style="font-size:10px;margin-bottom:6px">编辑结果(新图入暂存)</div>'
+      + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">编辑使用 gpt-image-1;新图入媒体暂存,可继续处理。</div></div>';
+  } else if (p.cap === "抽帧") {
+    html += '<div class="f"><label>视频(暂存 URL 或本机路径)</label><input class="mono" data-pk="ui-video" placeholder="http://127.0.0.1:8787/media/….mp4 或 /path/to/video.mp4" value="http://127.0.0.1:8787/media/demo.mp4" style="width:100%"></div>'
+      + '<div class="grid2" style="margin-top:8px"><div class="f"><label>时间点 t(秒)</label><input class="mono" type="number" value="0.5" style="width:100%"></div>'
+      + '<div class="f"><label>缩放(宽)</label><input class="mono" type="number" value="480" style="width:100%"></div></div>'
+      + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 抽帧</button></div>'
+      + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
+      + '<div class="sub" style="font-size:10px;margin-bottom:6px">抽帧结果(JPEG 入暂存)</div>'
+      + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">抽帧使用本机 ffmpeg;产物 JPEG 可立即喂给识图插件做画面理解。</div></div>';
+  } else if (p.cap === "ASR") {
+    html += '<div class="f"><label>音频(暂存 URL)</label><input class="mono" data-pk="ui-audio" placeholder="http://127.0.0.1:8787/media/….mp3" value="http://127.0.0.1:8787/media/demo.mp3" style="width:100%"></div>'
+      + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 识别</button></div>'
+      + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
+      + '<div class="sub" style="font-size:10px;margin-bottom:6px">转录结果</div>'
+      + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">识别使用你配置的 ASR 端点(whisper-1);失败自动切换备用端点。</div></div>';
+  } else if (p.cap === "TTS") {
+    html += '<div class="f"><label>要合成的文字</label><input class="mono" data-pk="ui-text" placeholder="你好,欢迎使用 ai-gateway" value="你好,欢迎使用 ai-gateway" style="width:100%"></div>'
+      + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 合成</button></div>'
+      + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
+      + '<div class="sub" style="font-size:10px;margin-bottom:6px">合成结果(音频入暂存)</div>'
+      + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">合成使用你配置的 TTS 端点;产物音频入暂存,可播放/下载。</div></div>';
+  }
+  html += '</section>';
+  return html;
+}
+
+/* ── 我的设计(开放生态:任何人设计插件)── */
+function plug2DesignHtml() {
+  var mine = PLUG2.local.concat(PLUG2.mySources);
+  var html = '<div class="sub" style="line-height:1.9">插件由 AI 或其他工具设计生成(一份 manifest:挂载点 / 输入输出 / 配置项 / 模型),<b>通过本地添加 / 粘贴 / 远程清单接入</b>——我们提供开放可拓展的插件市场能力,不内置生成器。上架后别人可安装使用。</div>'
+    /* 三种接入方式 */
+    + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:12px">'
+    /* ① 本地文件 */
+    + '<div style="background:var(--raised);border:1px solid var(--hair);border-radius:12px;padding:12px 13px">'
+    + '<b style="font-size:12.5px">📁 本地添加(推荐)</b>'
+    + '<div class="sub" style="font-size:10.5px;margin:4px 0 8px;line-height:1.7">选择本机的 manifest JSON 文件(或插件目录),校验通过即本地上架,立即安装使用。不依赖任何服务器。</div>'
+    + '<input type="file" accept=".json" data-a="plug2-local-file" style="font-size:11px;color:var(--muted)">'
+    + '<div class="sub" style="font-size:10px;margin-top:6px">支持:manifest.json / 打包 zip / 插件目录</div></div>'
+    /* ② 粘贴 manifest */
+    + '<div style="background:var(--raised);border:1px solid var(--hair);border-radius:12px;padding:12px 13px">'
+    + '<b style="font-size:12.5px">📋 粘贴 manifest</b>'
+    + '<div class="sub" style="font-size:10.5px;margin:4px 0 8px;line-height:1.7">用 AI 或工具设计好的 manifest JSON,直接粘贴校验添加。</div>'
+    + '<textarea class="mono" data-pk="d-json" rows="4" placeholder="{ &quot;id&quot;: &quot;my-plugin&quot;, &quot;mount&quot;: &quot;media_parse&quot;, &quot;models&quot;: [...], &quot;config&quot;: [...] }" style="width:100%;background:#10182a;border:1px solid var(--hair);border-radius:8px;color:var(--text);font-size:10.5px"></textarea>'
+    + '<div class="btn-row" style="margin-top:8px"><button class="btn primary" data-a="plug2-src-do">校验并添加</button></div></div>'
+    /* ③ 远程清单 */
+    + '<div style="background:var(--raised);border:1px solid var(--hair);border-radius:12px;padding:12px 13px">'
+    + '<b style="font-size:12.5px">🌐 远程清单</b>'
+    + '<div class="sub" style="font-size:10.5px;margin:4px 0 8px;line-height:1.7">填第三方插件市场地址(http(s) 静态 JSON),拉取校验后上架。</div>'
+    + (PLUG2.srcForm
+      ? '<input class="mono" data-pk="r-id" placeholder="源 id(如 my-market)" style="width:100%;background:#10182a;border:1px solid var(--hair);border-radius:8px;color:var(--text);padding:7px 11px;font-size:11.5px;margin-bottom:6px">'
+        + '<input class="mono" data-pk="r-name" placeholder="名称(如 我的市场)" style="width:100%;background:#10182a;border:1px solid var(--hair);border-radius:8px;color:var(--text);padding:7px 11px;font-size:11.5px;margin-bottom:6px">'
+        + '<input class="mono" data-pk="r-url" placeholder="https://example.com/plugins.json" style="width:100%;background:#10182a;border:1px solid var(--hair);border-radius:8px;color:var(--text);padding:8px 11px;font-size:11.5px">'
+        + '<div class="btn-row" style="margin-top:8px"><button class="btn primary" data-a="plug2-src-do">校验并添加</button><button class="btn ghost" data-a="plug2-src-toggle">取消</button></div>'
+      : '<button class="btn ghost" data-a="plug2-src-toggle">＋ 添加远程源</button>')
+    + '</div></div>';
+  /* 我的插件/源列表 */
+  if (mine.length) {
+    html += '<table class="mtable" style="margin-top:14px"><thead><tr><th>我的插件 / 源</th><th style="width:12%">来源</th><th style="width:12%">状态</th><th style="width:18%">操作</th></tr></thead><tbody>'
+      + mine.map(function (m, i) {
+        return '<tr><td><b>' + esc(m.name) + '</b><br><span class="sub" style="font-size:10px">' + esc(m.detail || m.url || "") + '</span></td>'
+          + '<td><span class="tag">' + esc(m.src || "远程") + '</span></td>'
+          + '<td><span class="tag on" style="border-color:var(--c-official);color:var(--c-official)">已上架</span></td>'
+          + '<td><button class="btn ghost" data-a="plug2-src-use" data-id="' + esc(m.id) + '">安装</button> <button class="btn ghost" data-a="plug2-local-del" data-i="' + i + '">移除</button></td></tr>';
+      }).join("")
+      + '</tbody></table>';
+  } else {
+    html += '<div class="sub" style="margin-top:14px">还没有自己设计的插件;用「本地添加」或「粘贴 manifest」做一个吧。</div>';
+  }
+  /* manifest 示例(全功能开放) */
+  html += '<section class="card" style="margin-top:14px;background:rgba(80,200,130,.04);border-color:rgba(80,200,130,.25)"><h2 style="font-size:12.5px">📄 manifest 示例(全功能开放:挂载点 / 输入输出 / 配置项 / 模型故障转移 / 文档)</h2>'
+    + '<pre class="mono" style="font-size:10.5px;line-height:1.7;color:#9FE3BC;white-space:pre-wrap;margin-top:6px">' + esc(JSON.stringify({
+      id: "my-describer", name: "我的识图增强", version: "1.0.0", author: "你",
+      mount: "media_parse",
+      input: { required: ["media_url"], properties: { media_url: "string", prompt: "string" } },
+      output: { properties: { text: "string" } },
+      models: [
+        { id: "gpt-5.6", api: "https://2xa.cc.cd/v1", note: "主模型:多模态直接识别" },
+        { id: "deepseek-chat", api: "https://api.deepseek.com/v1", note: "备用:纯文本,经文字链路识别" }
+      ],
+      config: [{ k: "lang", label: "输出语言", type: "select", options: ["中文"] }],
+      docs: "使用说明…"
+    }, null, 2)) + '</pre></section>';
   return html;
 }
 
@@ -1861,6 +2447,7 @@ document.addEventListener("click", function (ev) {
         else loadClaudeSessions(true);
       }
       if (state.view === "eco") loadEco();
+      if (state.view === "plug") plug2Load();
       break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
     case "cap-probe": doCapProbe(t.dataset.id); break;
@@ -1915,6 +2502,156 @@ document.addEventListener("click", function (ev) {
         .catch(function (e) { showToast(e.message || "移除失败", "error"); })
         .finally(function () { PLUG_STATE.busy = null; loadPlug(); });
       break;
+    case "plug2-tab": PLUG2.tab = t.dataset.t; PLUG2.detail = null; PLUG2.cfgModels = null; render(); break;
+    case "plug2-cat": PLUG2.cat = t.dataset.v; render(); break;
+    case "plug2-dt": PLUG2.dt = t.dataset.t; render(); break;
+    case "plug2-open": plug2OpenDetail(t.dataset.id, "cfg"); break;
+    case "plug2-doc": plug2OpenDetail(t.dataset.id, "doc"); break;
+    case "plug2-back": PLUG2.detail = null; PLUG2.cfgModels = null; render(); break;
+    case "plug2-install": {
+      var id2 = t.dataset.id;
+      var done = function () {
+        PLUG2.installed[id2] = 1; PLUG2.enabled[id2] = true;
+        PLUG2.tab = "installed"; PLUG2.detail = null;
+        showToast("已安装:点「配置」填写 API / Key / 模型后即可使用", "ok");
+      };
+      if (PLUG2.mode !== "api") { done(); render(); break; }
+      PLUG2.busy = id2;
+      api.plugInstallId(id2).then(done).catch(function (e) { showToast(e.message || "安装失败", "error"); })
+        .finally(function () { PLUG2.busy = null; render(); });
+      break;
+    }
+    case "plug2-save": plug2SaveCfg(t.dataset.id || PLUG2.detail); break;
+    case "plug2-update": {
+      var id4 = t.dataset.id;
+      var upd = PLUG2.updates[id4];
+      var done = function () {
+        delete PLUG2.updates[id4];
+        var p4 = plug2ById(id4);
+        if (p4) p4.version = upd || p4.version;
+        showToast("已更新到最新版", "ok");
+      };
+      if (PLUG2.mode !== "api") { done(); render(); break; }
+      PLUG2.busy = id4;
+      api.plugUpdate(id4).then(done).catch(function (e) { showToast(e.message || "更新失败", "error"); })
+        .finally(function () { PLUG2.busy = null; render(); });
+      break;
+    }
+    case "plug2-toggle": {
+      var id3 = t.dataset.id;
+      var next = !PLUG2.enabled[id3];
+      if (PLUG2.mode !== "api") { PLUG2.enabled[id3] = next; showToast(next ? "已启用" : "已停止", "ok"); render(); break; }
+      PLUG2.busy = id3;
+      api.plugToggle(id3, next).then(function () {
+        PLUG2.enabled[id3] = next;
+        showToast(next ? "已启用" : "已停止", "ok");
+      }).catch(function (e) { showToast(e.message || "操作失败", "error"); })
+        .finally(function () { PLUG2.busy = null; render(); });
+      break;
+    }
+    case "plug2-uninstall": {
+      var id5 = t.dataset.id;
+      var done = function () {
+        delete PLUG2.installed[id5]; delete PLUG2.enabled[id5]; PLUG2.detail = null;
+        showToast("已卸载", "ok");
+      };
+      if (PLUG2.mode !== "api") { done(); render(); break; }
+      PLUG2.busy = id5;
+      api.plugRemove(id5).then(done).catch(function (e) { showToast(e.message || "卸载失败", "error"); })
+        .finally(function () { PLUG2.busy = null; render(); });
+      break;
+    }
+    case "plug2-ui": PLUG2.ui = t.dataset.id; render(); break;
+    case "plug2-ui-back": PLUG2.ui = null; render(); break;
+    case "plug2-ui-run": {
+      var uir = document.getElementById("uiResult");
+      if (uir) { uir.innerHTML = "处理中…"; setTimeout(function () { uir.innerHTML = "✓ 完成(演示):结果已返回并存入媒体暂存,可继续喂给下游流程。"; }, 1200); }
+      break;
+    }
+    case "plug2-mup": {
+      var st = PLUG2.cfgModels; if (!st) break;
+      var i6 = +t.dataset.i;
+      if (i6 > 0 && i6 < st.rows.length) { var tmp = st.rows[i6 - 1]; st.rows[i6 - 1] = st.rows[i6]; st.rows[i6] = tmp; render(); }
+      break;
+    }
+    case "plug2-mdel": {
+      var st2 = PLUG2.cfgModels; if (!st2) break;
+      var i7 = +t.dataset.i;
+      if (i7 >= 0 && i7 < st2.rows.length) st2.rows.splice(i7, 1);
+      render();
+      break;
+    }
+    case "plug2-madd": {
+      var st3 = PLUG2.cfgModels; if (!st3) break;
+      st3.rows.push({ model: "", ep: "", note: "" });
+      render();
+      break;
+    }
+    case "plug2-src-toggle": PLUG2.srcForm = !PLUG2.srcForm; render(); break;
+    case "plug2-src-do": {
+      var pk = {};
+      document.querySelectorAll("[data-pk]").forEach(function (inp) { pk[inp.dataset.pk] = inp.value.trim(); });
+      if (pk["d-json"]) {
+        /* 粘贴 manifest */
+        var m;
+        try { m = JSON.parse(pk["d-json"]); } catch (e) { showToast("manifest JSON 解析失败:" + e.message, "error"); break; }
+        if (!m || !m.id || !m.name) { showToast("manifest 校验失败:缺 id/name", "error"); break; }
+        if (PLUG2.mode !== "api") {
+          PLUG2.local.push({ id: m.id, name: m.name, src: "AI", detail: m.desc || m.short_desc || "" });
+          PLUG2.srcForm = false;
+          showToast("✓ manifest 校验通过,已上架到「我的源」(演示)", "ok");
+          render();
+        } else {
+          PLUG2.busy = "paste";
+          api.plugLocal(m).then(function () {
+            showToast("✓ manifest 校验通过,已上架到「我的源」", "ok");
+            PLUG2.srcForm = false;
+          }).catch(function (e) { showToast(e.message || "校验失败", "error"); })
+            .finally(function () { PLUG2.busy = null; plug2Load(); });
+        }
+      } else if (pk["r-id"] && pk["r-name"] && pk["r-url"]) {
+        /* 远程清单 */
+        if (PLUG2.mode !== "api") {
+          PLUG2.mySources.push({ id: pk["r-id"], name: pk["r-name"], url: pk["r-url"] });
+          PLUG2.srcForm = false;
+          showToast("远程源已添加(演示)", "ok");
+          render();
+        } else {
+          PLUG2.busy = "src";
+          api.plugSrcAdd(pk["r-id"], pk["r-name"], pk["r-url"]).then(function () {
+            showToast("第三方源已添加", "ok");
+            PLUG2.srcForm = false;
+          }).catch(function (e) { showToast(e.message || "添加失败", "error"); })
+            .finally(function () { PLUG2.busy = null; plug2Load(); });
+        }
+      } else {
+        showToast("请粘贴 manifest,或填写远程源 id / 名称 / 地址", "error");
+      }
+      break;
+    }
+    case "plug2-src-use": {
+      var id6 = t.dataset.id;
+      var done = function () {
+        PLUG2.installed[id6] = 1; PLUG2.enabled[id6] = true;
+        showToast("已安装", "ok");
+      };
+      if (PLUG2.mode !== "api") { done(); showToast("已安装(演示)", "ok"); render(); break; }
+      PLUG2.busy = id6;
+      api.plugInstallId(id6).then(done).catch(function (e) { showToast(e.message || "安装失败", "error"); })
+        .finally(function () { PLUG2.busy = null; render(); });
+      break;
+    }
+    case "plug2-local-del": {
+      var i9 = +t.dataset.i;
+      var mine = PLUG2.local.concat(PLUG2.mySources);
+      var it = mine[i9];
+      if (it) {
+        var li = PLUG2.local.indexOf(it);
+        if (li >= 0) PLUG2.local.splice(li, 1); else { var si = PLUG2.mySources.indexOf(it); if (si >= 0) PLUG2.mySources.splice(si, 1); }
+      }
+      render();
+      break;
+    }
     case "eco-jump":
       ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; ECO_STATE.pendingInstall = null;
       state.view = "eco"; render(); loadEco();
@@ -2108,6 +2845,10 @@ document.addEventListener("change", function (ev) {
   if (t && t.dataset && t.dataset.a === "cap-set") {
     doCapSet(t.dataset.id, t.dataset.model, t.dataset.dim, t.value);
   }
+  if (t && t.dataset && t.dataset.a === "plug2-local-file") {
+    plug2LocalFile(t);
+    return;
+  }
 });
 document.addEventListener("input", function (ev) {
   if (ev.target.dataset && ev.target.dataset.a === "search") {
@@ -2115,9 +2856,50 @@ document.addEventListener("input", function (ev) {
     renderRailRows();
     return;
   }
+  if (ev.target.dataset && ev.target.dataset.a === "plug2-search") {
+    PLUG2.q = ev.target.value || "";
+    render();
+    return;
+  }
+  /* 插件配置页编辑:模型行 / 参数 / 故障转移直接落到 PLUG2 状态,保存时组包提交 */
+  if (ev.target.dataset && ev.target.dataset.pk && state.view === "plug" && PLUG2.tab === "detail") {
+    var pk = ev.target.dataset.pk;
+    if (pk === "failover") PLUG2.cfgFailover = ev.target.checked;
+    else if (pk.indexOf("m-") === 0) {
+      var parts = pk.split("-"), i = +parts[1], f = parts[2];
+      if (PLUG2.cfgModels && PLUG2.cfgModels.rows[i] && f) PLUG2.cfgModels.rows[i][f] = ev.target.value;
+    } else if (pk.indexOf("c-") === 0) {
+      if (!PLUG2.cfgVals) PLUG2.cfgVals = {};
+      PLUG2.cfgVals[pk.slice(2)] = ev.target.type === "checkbox" ? ev.target.checked : ev.target.value;
+    }
+    return;
+  }
   if (ev.target.id === "ipmNew") { state.nodeDraft = ev.target.value; return; }
   if (ev.target.dataset && ev.target.dataset.l === "email") { state.loginEmail = ev.target.value; return; }
   if (ev.target.dataset && ev.target.dataset.l === "password") { state.loginPassword = ev.target.value; return; }
+});
+
+/* 自定义浮层 tooltip:悬停立即显示,替代原生 title(插件市场图标按钮用) */
+var ttEl = null;
+function ttShow(el, text) {
+  if (!ttEl) {
+    ttEl = document.createElement("div");
+    ttEl.className = "tt";
+    document.body.appendChild(ttEl);
+  }
+  ttEl.textContent = text;
+  ttEl.style.display = "block";
+  var r = el.getBoundingClientRect();
+  ttEl.style.left = Math.round(r.left + r.width / 2) + "px";
+  ttEl.style.top = Math.round(r.top - 8) + "px";
+}
+function ttHide() { if (ttEl) ttEl.style.display = "none"; }
+document.addEventListener("mouseover", function (e) {
+  var el = e.target && e.target.closest ? e.target.closest("[data-tip]") : null;
+  if (el) ttShow(el, el.getAttribute("data-tip"));
+});
+document.addEventListener("mouseout", function (e) {
+  if (e.target && e.target.closest && e.target.closest("[data-tip]")) ttHide();
 });
 
 /* ── 启动 ── */

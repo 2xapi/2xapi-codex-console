@@ -109,6 +109,12 @@
   plugSrcAdd: (id, name, url) => rawJson("POST", "/api/plugin-market/sources", { id, name, url }),
   plugSrcDel: (id) => rawJson("DELETE", "/api/plugin-market/sources/" + encodeURIComponent(id)),
   plugSrcList: (id) => rawJson("GET", "/api/plugin-market/sources/" + encodeURIComponent(id) + "/plugins"),
+  // ── 插件市场 v3(插件市场开发文档 §四):详情/本地添加/配置/启停/更新/安装 ──
+  plugDetail: (id) => rawJson("GET", "/api/plugins/" + encodeURIComponent(id)),
+  plugLocal: (manifest) => rawJson("POST", "/api/plugins/local", manifest),
+  plugConfig: (id, body) => rawJson("PUT", "/api/plugins/" + encodeURIComponent(id) + "/config", body),
+  plugUpdate: (id) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/update"),
+  plugInstallId: (id) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/install"),
     desktopHost: async (providerId, way) => {
       const resp = await fetch("/api/desktop/host", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
