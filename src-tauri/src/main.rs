@@ -17,6 +17,7 @@ mod gateway_conv;
 mod gateway_gemini_conv;
 mod grok_config;
 mod history;
+mod media;
 #[path = "launcher/mod.rs"]
 mod launcher;
 mod nodecreds;

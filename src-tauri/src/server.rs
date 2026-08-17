@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use rust_embed::RustEmbed;
@@ -239,6 +239,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/accel/refresh-cred", post(handle_accel_refresh_cred))
         .route("/api/config/snapshot", post(handle_config_snapshot))
         .route("/api/config/restore", post(handle_config_restore))
+        // --- 媒体服务(超融合 A 线二期 B 段·开发组·媒体服务):原件暂存+URL 回传;
+        // /media/* 不走统一信封(直接出字节),/api/media* 走 ok_env/err_env ---
+        .route("/media/:file", get(crate::media::handle_serve))
+        .route(
+            "/api/media",
+            get(crate::media::handle_list).post(crate::media::handle_upload),
+        )
+        .route("/api/media/:id", delete(crate::media::handle_delete))
         .with_state(state)
 }
 
@@ -252,12 +260,12 @@ fn err_json(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
-// 统一响应信封（04 §0）：{ok:true,data} / {ok:false,error:{code,message,fields?}}
-fn ok_env(data: Value) -> Response {
+// 统一响应信封(04 §0):{ok:true,data} / {ok:false,error:{code,message,fields?}}
+pub(crate) fn ok_env(data: Value) -> Response {
     (StatusCode::OK, Json(json!({ "ok": true, "data": data }))).into_response()
 }
 
-fn err_env(status: StatusCode, code: &str, message: &str, fields: Option<Vec<String>>) -> Response {
+pub(crate) fn err_env(status: StatusCode, code: &str, message: &str, fields: Option<Vec<String>>) -> Response {
     let mut error = json!({ "code": code, "message": message });
     if let Some(f) = fields {
         error["fields"] = json!(f);
@@ -1875,6 +1883,110 @@ mod tests {
                 std::sync::RwLock::new(crate::nodecreds::Store::empty()),
             ),
         }
+    }
+
+    /// 媒体服务路由 e2e(超融合 A 线二期 B 段):上传→GET 字节一致+Content-Type→
+    /// ext 错位 404(不暴露)→伪装 mime 415→列表→删除→GET 404。tempdir 隔离,零真实配置。
+    #[tokio::test]
+    async fn media_routes_roundtrip() {
+        let mut st = dummy_state();
+        let dir = std::env::temp_dir().join(format!(
+            "2xapi-media-e2e-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        st.codex_home = dir.clone();
+        let app = build_router(st);
+
+        // 1x1 红点 PNG(与 media.rs 单测同资产)
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let body = format!(r#"{{"mime":"image/png","data_b64":"{png_b64}","origin":"e2e"}}"#);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/media")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let raw = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["ok"], true);
+        let url = v["data"]["url"].as_str().unwrap().to_string();
+        let id = v["data"]["id"].as_str().unwrap().to_string();
+        assert!(url.starts_with("/media/") && url.ends_with(".png"), "URL 形态: {url}");
+
+        // GET 原件:200+Content-Type+PNG 魔数字节一致
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..4], &[0x89, b'P', b'N', b'G']);
+
+        // ext 错位(.jpg)→404;列表可见;伪装 mime(image/jpeg 实为 png)→415
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/media/{id}.jpg"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/media").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let raw = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["data"]["items"].as_array().unwrap().len(), 1);
+        let bad = format!(r#"{{"mime":"image/jpeg","data_b64":"{png_b64}"}}"#);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/media")
+                    .header("content-type", "application/json")
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 415);
+
+        // 删除→GET 404
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/media/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let resp = app
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A 阶段:GET /api/desktop/agents 返回 8 平台注册表(导航数据源,D3「一次全亮」)
