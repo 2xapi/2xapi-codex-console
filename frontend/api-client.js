@@ -97,6 +97,14 @@
   ecoList: (agent) => request("GET", "/api/desktop/" + agent + "/eco"),
   ecoOp: (agent, body) => request("POST", "/api/desktop/" + agent + "/eco", { body }),
   ecoPresets: () => request("GET", "/api/desktop/eco-presets"),
+  // ── 插件与能力市场(多模态引擎部 二期):raw_json 形态(非 04 信封,成功直接 {sources,…}/{plugins,…}/{ok:true}) ──
+  plugList: () => rawJson("GET", "/api/plugins"),
+  plugMarket: () => rawJson("GET", "/api/plugin-market"),
+  plugInstall: (sourceId, pluginId) => rawJson("POST", "/api/plugin-market/install", { sourceId, pluginId }),
+  plugToggle: (id, enabled) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/toggle", { enabled }),
+  plugRemove: (id) => rawJson("DELETE", "/api/plugins/" + encodeURIComponent(id)),
+  plugSrcAdd: (id, name, url) => rawJson("POST", "/api/plugin-market/sources", { id, name, url }),
+  plugSrcDel: (id) => rawJson("DELETE", "/api/plugin-market/sources/" + encodeURIComponent(id)),
     desktopHost: async (providerId, way) => {
       const resp = await fetch("/api/desktop/host", {
         method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",

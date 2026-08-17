@@ -143,11 +143,12 @@ pub fn routes() -> Router<Arc<crate::server::AppState>> {
 
 async fn handle_list(State(s): State<Arc<crate::server::AppState>>) -> Response {
     let entries = registry::list_json(&s.codex_home);
+    // plugin=http 型,tool=官方内置能力(C 段条目靠此可见);model 条目(探测登记)不混入
     let plugins: Vec<Value> = entries["entries"]
         .as_array()
         .map(|a| {
             a.iter()
-                .filter(|e| e["kind"] == "plugin")
+                .filter(|e| e["kind"] == "plugin" || e["kind"] == "tool")
                 .cloned()
                 .collect()
         })
