@@ -335,7 +335,7 @@ pub async fn handle_serve(
 }
 
 /// 标准 base64 解码(零依赖;接受带/不带 padding,拒绝非法字符与错误余数)。
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if s.len() % 4 == 1 {
         return Err("base64 长度非法".to_string());

@@ -22,6 +22,7 @@ mod keypool;
 #[path = "launcher/mod.rs"]
 mod launcher;
 mod media;
+mod media_tools;
 mod nodecreds;
 mod plugins;
 mod probe;

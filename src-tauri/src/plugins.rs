@@ -233,7 +233,7 @@ async fn handle_invoke(
             "插件已停用,请先在插件管理启用",
         );
     }
-    // 官方内置 tool:分发本机实现(注册表统一管理,走同一 invoke 入口,非特权通道)
+    // 官方内置 tool:按条目 id 分发本机实现(注册表统一管理,走同一 invoke 入口,非特权通道)
     if entry.kind == registry::Kind::Tool
         && entry
             .meta
@@ -241,7 +241,13 @@ async fn handle_invoke(
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     {
-        return builtin_frame_extract(&s.codex_home, &body).await;
+        return match entry.id.as_str() {
+            "ffmpeg-frame-extract" => builtin_frame_extract(&s.codex_home, &body).await,
+            "image-describe" => crate::media_tools::image_describe(&s, &body).await,
+            "image-generate" => crate::media_tools::image_generate(&s, &body).await,
+            "image-edit" => crate::media_tools::image_edit(&s, &body).await,
+            _ => err_env(StatusCode::NOT_FOUND, "E_NO_PLUGIN", "未知内置能力"),
+        };
     }
     invoke_plugin(&entry, &body).await
 }
@@ -379,6 +385,9 @@ pub const OFFICIAL_SOURCE: &str = "official";
 
 /// 官方源内置清单:官方内置能力(tool 条目,invoke 分发本机实现,不设 http 依赖)。
 fn official_market() -> Value {
+    // 官方内置能力条目(媒体组 C 段,2026-08-17 一手实测定案):
+    // - 图出三态:generations/edits 端点在(模型限 gpt-image 系),当前 2xa Key 组未开通权限 → desc 如实注
+    // - ASR/TTS 上游路由级 404 → 不列条目(不造假能力)
     json!({
         "schema_version": 1,
         "source": { "id": OFFICIAL_SOURCE, "name": "官方源" },
@@ -394,6 +403,42 @@ fn official_market() -> Value {
                 "input": { "required": ["media_url"], "properties": { "media_url": "string", "t": "number" } },
                 "output": { "properties": { "media_url": "string", "mime": "string" } },
                 "timeout_ms": 60000
+            },
+            {
+                "id": "image-describe",
+                "name": "识图",
+                "version": "1.0.0",
+                "mount": "media_parse",
+                "builtin": true,
+                "desc": "把图片交给上游多模态模型理解,返回文字描述;按 image_in 能力标签前置拦截,不支持识图的模型人话报错",
+                "short_desc": "图片转文字描述",
+                "input": { "required": ["media_url"], "properties": { "media_url": "string", "prompt": "string", "provider_id": "string", "model": "string" } },
+                "output": { "properties": { "text": "string", "provider_id": "string", "model": "string" } },
+                "timeout_ms": 120000
+            },
+            {
+                "id": "image-generate",
+                "name": "文生图",
+                "version": "1.0.0",
+                "mount": "media_parse",
+                "builtin": true,
+                "desc": "按文字描述生成图片(gpt-image 系)入媒体暂存,回管内 URL;上游 Key 组需开通图生成权限,未开通时人话提示",
+                "short_desc": "文字生成图片",
+                "input": { "required": ["prompt"], "properties": { "prompt": "string", "model": "string", "provider_id": "string", "size": "string", "n": "number" } },
+                "output": { "properties": { "media_urls": "string[]", "mime": "string" } },
+                "timeout_ms": 240000
+            },
+            {
+                "id": "image-edit",
+                "name": "图编辑",
+                "version": "1.0.0",
+                "mount": "media_parse",
+                "builtin": true,
+                "desc": "按编辑指令修改暂存原图(gpt-image 系),产出新图入媒体暂存;上游 Key 组需开通图生成权限",
+                "short_desc": "按指令编辑图片",
+                "input": { "required": ["media_url", "prompt"], "properties": { "media_url": "string", "prompt": "string", "model": "string", "provider_id": "string", "size": "string" } },
+                "output": { "properties": { "media_url": "string", "mime": "string" } },
+                "timeout_ms": 240000
             }
         ]
     })
