@@ -157,7 +157,7 @@ fn save_index(root: &Path, idx: &MediaIndex) -> Result<(), String> {
 
 /// 上传核心:嗅探→上限→落盘→入索引→配额逐出。返回新建条目。
 /// declared_mime 为空时以嗅探结果为准(宽松);非空且与嗅探不符 → E_MEDIA_MIME(防伪装)。
-fn store_upload(
+pub(crate) fn store_upload(
     codex_home: &Path,
     data: &[u8],
     declared_mime: &str,

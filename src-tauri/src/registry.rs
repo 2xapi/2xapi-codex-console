@@ -129,15 +129,25 @@ pub fn upsert_plugin(codex_home: &Path, manifest: &Map<String, Value>) {
         .and_then(|v| v.as_str())
         .map(|s| format!("{s}.{id}"))
         .unwrap_or(id); // 前缀命名(OpenWrt 吸收,市场源用;直接登记=无前缀
+                        // 内置能力=tool 条目(本机实现);http 型=plugin 条目
+    let kind = if manifest
+        .get("builtin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        Kind::Tool
+    } else {
+        Kind::Plugin
+    };
     if let Some(e) = entries
         .iter_mut()
-        .find(|e| e.id == global && e.kind == Kind::Plugin)
+        .find(|e| e.id == global && e.kind == kind)
     {
         e.meta = manifest.clone();
     } else {
         entries.push(Entry {
             id: global,
-            kind: Kind::Plugin,
+            kind,
             provider_id: None,
             model: None,
             enabled: true,
@@ -150,7 +160,7 @@ pub fn upsert_plugin(codex_home: &Path, manifest: &Map<String, Value>) {
 pub fn get_plugin(codex_home: &Path, id: &str) -> Option<Entry> {
     load(codex_home)
         .into_iter()
-        .find(|e| e.id == id && e.kind == Kind::Plugin)
+        .find(|e| e.id == id && (e.kind == Kind::Plugin || e.kind == Kind::Tool))
 }
 
 pub fn remove(codex_home: &Path, id: &str) {
