@@ -29,7 +29,12 @@ pub struct KeyPool {
 
 /// 供应商的有效 Key 列表:keys 非空用 keys,否则回退单 api_key(兼容迁移,不写回文件)。
 pub fn effective_keys(p: &Provider) -> Vec<String> {
-    let ks: Vec<String> = p.keys.iter().filter(|k| !k.trim().is_empty()).cloned().collect();
+    let ks: Vec<String> = p
+        .keys
+        .iter()
+        .filter(|k| !k.trim().is_empty())
+        .cloned()
+        .collect();
     if ks.is_empty() {
         vec![p.api_key.clone()]
     } else {
@@ -101,7 +106,9 @@ impl KeyPool {
     /// 标失败(429/5xx/超时):冷却该 Key(按值匹配,池内重复 key 一并冷却)。
     pub fn mark_failure(&self, provider_id: &str, key: &str) {
         let mut map = self.inner.lock().unwrap();
-        let Some(entry) = map.get_mut(provider_id) else { return };
+        let Some(entry) = map.get_mut(provider_id) else {
+            return;
+        };
         let until = Instant::now() + COOLDOWN;
         for (i, k) in entry.keys.iter().enumerate() {
             if k == key {
@@ -139,19 +146,22 @@ mod tests {
     use super::*;
 
     fn prov(id: &str, keys: &[&str]) -> Provider {
-        let mut p = Provider::default();
-        p.id = id.to_string();
-        p.api_key = keys[0].to_string();
-        p.keys = keys.iter().map(|k| k.to_string()).collect();
-        p
+        Provider {
+            id: id.to_string(),
+            api_key: keys[0].to_string(),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn single_key_passthrough() {
-        let mut p = Provider::default();
-        p.id = "x".into();
-        p.api_key = "sk-single".into();
-        p.keys = vec![];
+        let p = Provider {
+            id: "x".into(),
+            api_key: "sk-single".into(),
+            keys: vec![],
+            ..Default::default()
+        };
         let pool = KeyPool::new();
         assert_eq!(pool.pick(&p), "sk-single", "单 Key 直返");
         assert_eq!(effective_keys(&p), vec!["sk-single"], "keys 空回退 api_key");
@@ -167,7 +177,10 @@ mod tests {
         let seq: Vec<String> = (0..6).map(|_| pool.pick(&p)).collect();
         assert_eq!(seq, vec!["k1", "k2", "k3", "k1", "k2", "k3"], "轮询有序");
         let p2 = apply(&pool, prov("m", &["k1", "k2", "k3"]));
-        assert!(["k1", "k2", "k3"].contains(&p2.api_key.as_str()), "apply 替换为池内 Key");
+        assert!(
+            ["k1", "k2", "k3"].contains(&p2.api_key.as_str()),
+            "apply 替换为池内 Key"
+        );
     }
 
     #[test]

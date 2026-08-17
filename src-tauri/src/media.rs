@@ -33,17 +33,62 @@ struct MediaKind {
 }
 
 const KINDS: &[MediaKind] = &[
-    MediaKind { mime: "image/jpeg", ext: "jpg", max_bytes: 20 * MB, magic: |d| d.starts_with(&[0xFF, 0xD8, 0xFF]) },
-    MediaKind { mime: "image/png", ext: "png", max_bytes: 20 * MB, magic: |d| d.starts_with(&[0x89, b'P', b'N', b'G']) },
-    MediaKind { mime: "image/gif", ext: "gif", max_bytes: 20 * MB, magic: |d| d.starts_with(b"GIF8") },
+    MediaKind {
+        mime: "image/jpeg",
+        ext: "jpg",
+        max_bytes: 20 * MB,
+        magic: |d| d.starts_with(&[0xFF, 0xD8, 0xFF]),
+    },
+    MediaKind {
+        mime: "image/png",
+        ext: "png",
+        max_bytes: 20 * MB,
+        magic: |d| d.starts_with(&[0x89, b'P', b'N', b'G']),
+    },
+    MediaKind {
+        mime: "image/gif",
+        ext: "gif",
+        max_bytes: 20 * MB,
+        magic: |d| d.starts_with(b"GIF8"),
+    },
     // RIFF 容器双签名(WEBP/WAV)按偏移 8 分流
-    MediaKind { mime: "image/webp", ext: "webp", max_bytes: 20 * MB, magic: |d| riff_at(d, b"WEBP") },
-    MediaKind { mime: "audio/wav", ext: "wav", max_bytes: 25 * MB, magic: |d| riff_at(d, b"WAVE") },
+    MediaKind {
+        mime: "image/webp",
+        ext: "webp",
+        max_bytes: 20 * MB,
+        magic: |d| riff_at(d, b"WEBP"),
+    },
+    MediaKind {
+        mime: "audio/wav",
+        ext: "wav",
+        max_bytes: 25 * MB,
+        magic: |d| riff_at(d, b"WAVE"),
+    },
     // MPEG 音频:ID3 头或帧同步字节(0xFF Ex/Fx)
-    MediaKind { mime: "audio/mpeg", ext: "mp3", max_bytes: 25 * MB, magic: |d| d.starts_with(b"ID3") || (d.len() >= 2 && d[0] == 0xFF && d[1] & 0xE0 == 0xE0) },
-    MediaKind { mime: "video/mp4", ext: "mp4", max_bytes: 100 * MB, magic: |d| d.len() >= 12 && &d[4..8] == b"ftyp" },
-    MediaKind { mime: "video/webm", ext: "webm", max_bytes: 100 * MB, magic: |d| d.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) },
-    MediaKind { mime: "application/pdf", ext: "pdf", max_bytes: 50 * MB, magic: |d| d.starts_with(b"%PDF") },
+    MediaKind {
+        mime: "audio/mpeg",
+        ext: "mp3",
+        max_bytes: 25 * MB,
+        magic: |d| d.starts_with(b"ID3") || (d.len() >= 2 && d[0] == 0xFF && d[1] & 0xE0 == 0xE0),
+    },
+    MediaKind {
+        mime: "video/mp4",
+        ext: "mp4",
+        max_bytes: 100 * MB,
+        magic: |d| d.len() >= 12 && &d[4..8] == b"ftyp",
+    },
+    MediaKind {
+        mime: "video/webm",
+        ext: "webm",
+        max_bytes: 100 * MB,
+        magic: |d| d.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]),
+    },
+    MediaKind {
+        mime: "application/pdf",
+        ext: "pdf",
+        max_bytes: 50 * MB,
+        magic: |d| d.starts_with(b"%PDF"),
+    },
 ];
 
 /// RIFF 容器:RIFF+4 字节长度+格式签名。
@@ -119,13 +164,23 @@ fn store_upload(
     origin: &str,
 ) -> Result<MediaItem, (&'static str, String)> {
     let root = media_root(codex_home);
-    std::fs::create_dir_all(&root).map_err(|e| ("E_MEDIA_STORE", format!("创建暂存目录失败: {e}")))?;
-    let kind = sniff(data).ok_or(("E_MEDIA_MIME", "无法识别媒体类型(不在白名单或数据损坏)".to_string()))?;
+    std::fs::create_dir_all(&root)
+        .map_err(|e| ("E_MEDIA_STORE", format!("创建暂存目录失败: {e}")))?;
+    let kind = sniff(data).ok_or((
+        "E_MEDIA_MIME",
+        "无法识别媒体类型(不在白名单或数据损坏)".to_string(),
+    ))?;
     if !declared_mime.is_empty() && declared_mime != kind.mime {
-        return Err(("E_MEDIA_MIME", format!("声明的 {} 与实际内容 {} 不符", declared_mime, kind.mime)));
+        return Err((
+            "E_MEDIA_MIME",
+            format!("声明的 {} 与实际内容 {} 不符", declared_mime, kind.mime),
+        ));
     }
     if data.len() as u64 > kind.max_bytes {
-        return Err(("E_MEDIA_TOO_LARGE", format!("{} 超过上限 {} MB", kind.mime, kind.max_bytes / MB)));
+        return Err((
+            "E_MEDIA_TOO_LARGE",
+            format!("{} 超过上限 {} MB", kind.mime, kind.max_bytes / MB),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -224,12 +279,22 @@ pub async fn handle_delete(
     let root = media_root(&s.codex_home);
     let mut idx = load_index(&root);
     let Some(pos) = idx.items.iter().position(|i| i.id == id) else {
-        return crate::server::err_env(StatusCode::NOT_FOUND, "E_MEDIA_NOT_FOUND", "媒体件不存在", None);
+        return crate::server::err_env(
+            StatusCode::NOT_FOUND,
+            "E_MEDIA_NOT_FOUND",
+            "媒体件不存在",
+            None,
+        );
     };
     let item = idx.items.remove(pos);
     let _ = std::fs::remove_file(item_path(&root, &item));
     if let Err(e) = save_index(&root, &idx) {
-        return crate::server::err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_MEDIA_STORE", &e, None);
+        return crate::server::err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_MEDIA_STORE",
+            &e,
+            None,
+        );
     }
     crate::server::ok_env(json!({ "id": id, "deleted": true }))
 }
@@ -305,7 +370,10 @@ mod tests {
     use super::*;
 
     fn tmp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("2xapi-media-ut-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "2xapi-media-ut-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -335,7 +403,10 @@ mod tests {
 
     #[test]
     fn b64_decode_roundtrip_and_rejects_garbage() {
-        assert_eq!(b64_decode(RED_PNG_B64).unwrap()[..4], [0x89, b'P', b'N', b'G']);
+        assert_eq!(
+            b64_decode(RED_PNG_B64).unwrap()[..4],
+            [0x89, b'P', b'N', b'G']
+        );
         assert_eq!(b64_decode("").unwrap(), Vec::<u8>::new());
         assert_eq!(b64_decode("QQ==").unwrap(), b"A".to_vec());
         assert_eq!(b64_decode("QUI=").unwrap(), b"AB".to_vec());
@@ -397,7 +468,8 @@ mod tests {
     #[test]
     #[ignore]
     fn media_real_machine_e2e() {
-        let codex = std::path::PathBuf::from(std::env::var("HOME").expect("需要 HOME")).join(".codex");
+        let codex =
+            std::path::PathBuf::from(std::env::var("HOME").expect("需要 HOME")).join(".codex");
         let mroot = media_root(&codex);
         let existed_before = mroot.exists();
         let png = b64_decode(RED_PNG_B64).unwrap();

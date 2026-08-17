@@ -112,7 +112,6 @@ async fn dispatch_anthropic_for(
     let provider = match crate::providers::get_provider_for_agent(&state.providers_path, agent) {
         // Key 资源池(A 线一期):见 dispatch 注释
         Some(p) => crate::keypool::apply(&state.keypool, p),
-        Some(p) => p,
         None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择 Claude 供应商"),
     };
     // Official 不应经网关（01-D1）；防御性拒绝
@@ -161,6 +160,11 @@ async fn dispatch_anthropic_for(
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
+
+    // 媒体关卡(超融合二期):同 codex 通道;纯文本零路径变化
+    if let Some(resp) = media_gate(state, &provider, "", &body_bytes) {
+        return resp;
+    }
 
     let base = provider.base_url.trim_end_matches('/');
     let target = if base.ends_with("/v1") {
@@ -581,6 +585,44 @@ async fn dispatch_gemini(
 /// 语义(按 agent 过滤取供应商,见 providers::get_provider_for_agent)——
 /// 全局 active 若属其他 agent,取本 agent sort_index 最小者,不串台。
 /// hermes 接入(B 阶段):`/hermes/chat/completions` 走同一 dispatch,agent="hermes"。
+/// 媒体关卡(超融合二期,方案红线:纯文本请求零路径变化):
+/// body 无媒体标记直接放行(字节预检,纯文本零解析零开销);
+/// 含图(OpenAI image_url/input_image / Anthropic image block / input_audio)
+/// → 查 provider::model 的 image_in 探测标签:不支持 → 400 人话前置拦截
+/// (上游明确拒时上游会报,上游静默吞时这里拦下——A 段 M1/M2 定案);
+/// Unknown 放行(未探测不误伤),audio 维度一期未探测故不拦。
+fn media_gate(
+    state: &AppState,
+    provider: &crate::providers::Provider,
+    model: &str,
+    body: &[u8],
+) -> Option<Response<Body>> {
+    let has_media =
+        body.windows(5).any(|w| w == b"image") || body.windows(11).any(|w| w == b"input_audio");
+    if !has_media {
+        return None; // 纯文本:零路径变化
+    }
+    let model = if model.is_empty() {
+        &provider.model
+    } else {
+        model
+    };
+    if model.is_empty() {
+        return None;
+    }
+    if crate::capprobe::tri_of(&state.codex_home, &provider.id, model, "image_in")
+        != crate::capprobe::Tri::No
+    {
+        return None; // yes/unknown 放行
+    }
+    Some(err_resp(
+        StatusCode::BAD_REQUEST,
+        &format!(
+            "模型 {model} 不支持图片输入(能力探测:不支持)。请换支持识图的模型/供应商;若认为探测有误,可在能力面板重探或手动覆盖"
+        ),
+    ))
+}
+
 async fn dispatch(
     state: &AppState,
     req: Request<Body>,
@@ -671,6 +713,10 @@ async fn dispatch(
                 .then_some(true)
         })
         .unwrap_or(false);
+    // 媒体关卡(超融合二期):带图请求按 image_in 标签前置拦截;纯文本零路径变化
+    if let Some(resp) = media_gate(state, &provider, &req_model, &body_bytes) {
+        return resp;
+    }
     eprintln!(
         "[GW] /{} | provider={} mode={:?} wire={:?} model={} stream={} body={}B",
         suffix,
@@ -749,7 +795,11 @@ async fn dispatch(
             return resp;
         }
     };
-    eprintln!("[GW] ← upstream {} conv={:?}", upstream.status(), conv_stream);
+    eprintln!(
+        "[GW] ← upstream {} conv={:?}",
+        upstream.status(),
+        conv_stream
+    );
     // Key 池打点:429/5xx 冷却,2xx 清冷却(单 Key 无池,打点为 no-op)
     {
         let st = upstream.status().as_u16();
@@ -2171,6 +2221,42 @@ mod tests {
             "应收到真实回复,stdout:\n{stdout}\nstderr:\n{stderr}"
         );
         eprintln!("[E2E] 全链走通:gemini CLI → 网关(Gemini→Chat 转换)→ 2xa 真实上游");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 媒体关卡(超融合二期):纯文本直过/带图+不支持标签 400 人话/带图+未探测放行/带图+支持放行。
+    #[test]
+    fn media_gate_three_states() {
+        let (state, _providers_path, root) = make_state("gate");
+        let p = crate::providers::Provider {
+            id: "gp1".into(),
+            model: "m1".into(),
+            ..Default::default()
+        };
+        // ① 纯文本:无标签也放行(零路径变化)
+        assert!(media_gate(&state, &p, "", br#"{"input":"hi"}"#).is_none());
+        // ② 未探测(Unknown):带图放行(不误伤)
+        let img_body = br#"{"model":"m1","input":[{"type":"input_image","image_url":"data:image/png;base64,x"}]}"#;
+        assert!(media_gate(&state, &p, "", img_body).is_none());
+        // ③ 标签=不支持:带图 400 人话;纯文本仍放行
+        let caps = crate::capprobe::Caps {
+            text: crate::capprobe::Tri::Yes,
+            tools: crate::capprobe::Tri::Yes,
+            reasoning: crate::capprobe::Tri::Unknown,
+            image_in: crate::capprobe::Tri::No,
+        };
+        crate::capprobe::store_probe_force(&state.codex_home, "gp1", "m1", &caps);
+        let resp = media_gate(&state, &p, "", img_body).expect("带图+No 应拦");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        assert!(media_gate(&state, &p, "", b"{\"input\":\"plain text\"}").is_none());
+        // ④ 标签=支持:带图放行
+        let caps_yes = crate::capprobe::Caps {
+            image_in: crate::capprobe::Tri::Yes,
+            ..caps
+        };
+        crate::capprobe::store_probe_force(&state.codex_home, "gp1", "m1", &caps_yes);
+        assert!(media_gate(&state, &p, "", img_body).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

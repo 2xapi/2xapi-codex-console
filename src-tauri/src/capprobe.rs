@@ -12,10 +12,30 @@ use std::path::{Path, PathBuf};
 
 /// 图像输入探测的否认词表(中英,侦察报告 §三.2 固化)。
 pub const IMAGE_DENY_WORDS: &[&str] = &[
-    "没有图片", "看不到", "无法看到", "没有看到", "未看到", "无法识别", "无法查看", "请提供图片", "请上传图片",
-    "no image", "cannot see", "can't see", "could not see", "no picture", "didn't see",
-    "did not see", "unable to see", "unable to view", "not able to see", "no image attached",
-    "cannot view", "can't view", "was not attached", "attachment",
+    "没有图片",
+    "看不到",
+    "无法看到",
+    "没有看到",
+    "未看到",
+    "无法识别",
+    "无法查看",
+    "请提供图片",
+    "请上传图片",
+    "no image",
+    "cannot see",
+    "can't see",
+    "could not see",
+    "no picture",
+    "didn't see",
+    "did not see",
+    "unable to see",
+    "unable to view",
+    "not able to see",
+    "no image attached",
+    "cannot view",
+    "can't view",
+    "was not attached",
+    "attachment",
 ];
 
 /// 64x64 纯红 PNG(base64;探测载荷)。真机实证:1x1 会因上游压缩失真(红→棕),64x64 稳定答「红色」。
@@ -71,8 +91,18 @@ impl Caps {
         })
     }
     fn from_json(v: &Value) -> Self {
-        let g = |k: &str| v.get(k).and_then(|x| x.as_str()).map(Tri::from_str).unwrap_or(Tri::Unknown);
-        Self { text: g("text"), tools: g("tools"), reasoning: g("reasoning"), image_in: g("image_in") }
+        let g = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(Tri::from_str)
+                .unwrap_or(Tri::Unknown)
+        };
+        Self {
+            text: g("text"),
+            tools: g("tools"),
+            reasoning: g("reasoning"),
+            image_in: g("image_in"),
+        }
     }
 }
 
@@ -100,9 +130,25 @@ fn save_all(codex_home: &Path, tags: &Map<String, Value>) {
     }
     let body = json!({ "version": 1, "tags": tags });
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_string_pretty(&body).unwrap_or_default()).is_ok() {
+    if std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    )
+    .is_ok()
+    {
         let _ = std::fs::rename(&tmp, &path);
     }
+}
+
+/// 查单条单维标签(媒体关卡用);未探测 → Unknown(不拦,探测后自然拦截)。
+pub fn tri_of(codex_home: &Path, provider_id: &str, model: &str, dim: &str) -> Tri {
+    let tags = load_all(codex_home);
+    tags.get(&tag_key(provider_id, model))
+        .and_then(|v| v.get("caps")) // 存储形态:{source,probed_at,caps:{四维}}
+        .and_then(|c| c.get(dim))
+        .and_then(|x| x.as_str())
+        .map(Tri::from_str)
+        .unwrap_or(Tri::Unknown)
 }
 
 /// 读全部标签(GET /api/capability-tags 响应体)。
@@ -245,17 +291,26 @@ pub async fn probe_caps(
     let mut caps = Caps {
         text: Tri::Unknown,
         tools: Tri::Unknown,
-        reasoning: if reasoning_levels.is_empty() { Tri::No } else { Tri::Yes },
+        reasoning: if reasoning_levels.is_empty() {
+            Tri::No
+        } else {
+            Tri::Yes
+        },
         image_in: Tri::Unknown,
     };
     let c = client();
     let url = chat_url(base_url);
 
     // 文本:1 token 级小请求
-    if let Ok(v) = post_chat(&c, &url, api_key, json!({
-        "model": model, "max_tokens": 16, "stream": false,
-        "messages": [{ "role": "user", "content": "回复:OK" }]
-    }))
+    if let Ok(v) = post_chat(
+        &c,
+        &url,
+        api_key,
+        json!({
+            "model": model, "max_tokens": 16, "stream": false,
+            "messages": [{ "role": "user", "content": "回复:OK" }]
+        }),
+    )
     .await
     {
         if !content_text(&v).is_empty() {
@@ -321,21 +376,39 @@ mod tests {
     #[test]
     fn store_and_manual_override() {
         let r = root("store");
-        let caps = Caps { text: Tri::Yes, tools: Tri::No, reasoning: Tri::Yes, image_in: Tri::No };
+        let caps = Caps {
+            text: Tri::Yes,
+            tools: Tri::No,
+            reasoning: Tri::Yes,
+            image_in: Tri::No,
+        };
         let e = store_probe(&r, "p1", "m1", &caps);
         assert_eq!(e["source"], "auto");
         assert_eq!(e["caps"]["image_in"], "no");
         // 再次探测更新 auto 条目
-        let caps2 = Caps { text: Tri::Yes, tools: Tri::Yes, reasoning: Tri::Yes, image_in: Tri::No };
+        let caps2 = Caps {
+            text: Tri::Yes,
+            tools: Tri::Yes,
+            reasoning: Tri::Yes,
+            image_in: Tri::No,
+        };
         store_probe(&r, "p1", "m1", &caps2);
         let all = load_all(&r);
-        assert_eq!(all[&tag_key("p1", "m1")]["caps"]["tools"], "yes", "auto 探测应更新");
+        assert_eq!(
+            all[&tag_key("p1", "m1")]["caps"]["tools"],
+            "yes",
+            "auto 探测应更新"
+        );
         // 手动覆盖(on=yes 归一) → auto 不再碰(caps2.image_in=No 不应冲掉 yes)
         set_manual(&r, "p1", "m1", "image_in", "on").unwrap();
         store_probe(&r, "p1", "m1", &caps2);
         let all = load_all(&r);
         assert_eq!(all[&tag_key("p1", "m1")]["source"], "manual");
-        assert_eq!(all[&tag_key("p1", "m1")]["caps"]["image_in"], "yes", "manual 覆盖不被 auto 冲掉");
+        assert_eq!(
+            all[&tag_key("p1", "m1")]["caps"]["image_in"],
+            "yes",
+            "manual 覆盖不被 auto 冲掉"
+        );
         // force(重探按钮)回 auto
         store_probe_force(&r, "p1", "m1", &caps2);
         let all = load_all(&r);
@@ -372,7 +445,11 @@ mod real {
         let pick = |model_pat: &str| {
             data.providers
                 .iter()
-                .find(|p| p.base_url.contains("2xa") && p.model.contains(model_pat) && p.model != "gpt-image-2")
+                .find(|p| {
+                    p.base_url.contains("2xa")
+                        && p.model.contains(model_pat)
+                        && p.model != "gpt-image-2"
+                })
                 .cloned()
         };
         let Some(gpt) = pick("gpt-5.6") else {
@@ -385,7 +462,10 @@ mod real {
 
         let levels = gpt.reasoning_levels.clone().unwrap_or_default();
         let caps = probe_caps(&gpt.base_url, &gpt.api_key, &gpt.model, &levels).await;
-        println!("[gpt-5.6] text={:?} tools={:?} reasoning={:?} image_in={:?}", caps.text, caps.tools, caps.reasoning, caps.image_in);
+        println!(
+            "[gpt-5.6] text={:?} tools={:?} reasoning={:?} image_in={:?}",
+            caps.text, caps.tools, caps.reasoning, caps.image_in
+        );
         assert_eq!(caps.text, Tri::Yes, "gpt 文本应可用");
         assert_eq!(caps.image_in, Tri::Yes, "gpt-5.6 识图应支持(侦察实证)");
         let e = store_probe(&tmp, &gpt.id, &gpt.model, &caps);
@@ -396,8 +476,14 @@ mod real {
         if let Some(cl) = pick("claude-fable-5") {
             let levels = cl.reasoning_levels.clone().unwrap_or_default();
             let caps = probe_caps(&cl.base_url, &cl.api_key, &cl.model, &levels).await;
-            println!("[claude-fable-5] text={:?} tools={:?} reasoning={:?} image_in={:?}", caps.text, caps.tools, caps.reasoning, caps.image_in);
-            assert!(caps.image_in != Tri::Unknown, "内容验证应产出 yes/no 二值(unknown=判别词表缺口)");
+            println!(
+                "[claude-fable-5] text={:?} tools={:?} reasoning={:?} image_in={:?}",
+                caps.text, caps.tools, caps.reasoning, caps.image_in
+            );
+            assert!(
+                caps.image_in != Tri::Unknown,
+                "内容验证应产出 yes/no 二值(unknown=判别词表缺口)"
+            );
         }
         let _ = std::fs::remove_dir_all(&tmp);
         println!("[caps 真机] 分化结论复验通过");
@@ -425,7 +511,9 @@ mod real_debug {
             .unwrap()
             .post("https://2xa.cc.cd/v1/chat/completions")
             .header("content-type", "application/json")
-            .body(r#"{"model":"gpt-5.6","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#)
+            .body(
+                r#"{"model":"gpt-5.6","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+            )
             .send()
             .await;
         match r2 {

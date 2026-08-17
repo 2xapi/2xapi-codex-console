@@ -52,10 +52,17 @@ fn load(codex_home: &Path) -> Vec<Entry> {
                             "tool" => Kind::Tool,
                             _ => Kind::Model,
                         },
-                        provider_id: e.get("provider_id").and_then(|x| x.as_str()).map(String::from),
+                        provider_id: e
+                            .get("provider_id")
+                            .and_then(|x| x.as_str())
+                            .map(String::from),
                         model: e.get("model").and_then(|x| x.as_str()).map(String::from),
                         enabled: e.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
-                        meta: e.get("meta").and_then(|m| m.as_object()).cloned().unwrap_or_default(),
+                        meta: e
+                            .get("meta")
+                            .and_then(|m| m.as_object())
+                            .cloned()
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()
@@ -77,7 +84,12 @@ fn save(codex_home: &Path, entries: &[Entry]) {
         })).collect::<Vec<_>>(),
     });
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_string_pretty(&body).unwrap_or_default()).is_ok() {
+    if std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    )
+    .is_ok()
+    {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
@@ -97,6 +109,60 @@ pub fn upsert_model(codex_home: &Path, provider_id: &str, model: &str, meta: Map
             enabled: true,
             meta,
         });
+    }
+    save(codex_home, &entries);
+}
+
+/// upsert(plugin 条目):meta=manifest 全量;同 id 覆盖(重装/更新)。
+pub fn upsert_plugin(codex_home: &Path, manifest: &Map<String, Value>) {
+    let id = manifest
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return;
+    }
+    let mut entries = load(codex_home);
+    let global = manifest
+        .get("source_id")
+        .and_then(|v| v.as_str())
+        .map(|s| format!("{s}.{id}"))
+        .unwrap_or(id); // 前缀命名(OpenWrt 吸收,市场源用;直接登记=无前缀
+    if let Some(e) = entries
+        .iter_mut()
+        .find(|e| e.id == global && e.kind == Kind::Plugin)
+    {
+        e.meta = manifest.clone();
+    } else {
+        entries.push(Entry {
+            id: global,
+            kind: Kind::Plugin,
+            provider_id: None,
+            model: None,
+            enabled: true,
+            meta: manifest.clone(),
+        });
+    }
+    save(codex_home, &entries);
+}
+
+pub fn get_plugin(codex_home: &Path, id: &str) -> Option<Entry> {
+    load(codex_home)
+        .into_iter()
+        .find(|e| e.id == id && e.kind == Kind::Plugin)
+}
+
+pub fn remove(codex_home: &Path, id: &str) {
+    let mut entries = load(codex_home);
+    entries.retain(|e| e.id != id);
+    save(codex_home, &entries);
+}
+
+pub fn set_enabled(codex_home: &Path, id: &str, enabled: bool) {
+    let mut entries = load(codex_home);
+    if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+        e.enabled = enabled;
     }
     save(codex_home, &entries);
 }

@@ -240,8 +240,14 @@ pub fn build_router(state: AppState) -> Router {
         // --- 每账号节点凭证(星图 任务 B:usage 刷新)---
         .route("/api/accel/refresh-cred", post(handle_accel_refresh_cred))
         // --- 超融合 A 线一期:能力探测(前四维)+标签+注册表 ---
-        .route("/api/providers/:id/probe-capabilities", post(handle_probe_capabilities))
-        .route("/api/capability-tags", get(handle_capability_tags).post(handle_capability_tags_set))
+        .route(
+            "/api/providers/:id/probe-capabilities",
+            post(handle_probe_capabilities),
+        )
+        .route(
+            "/api/capability-tags",
+            get(handle_capability_tags).post(handle_capability_tags_set),
+        )
         .route("/api/fusion-registry", get(handle_fusion_registry))
         .route("/api/config/snapshot", post(handle_config_snapshot))
         .route("/api/config/restore", post(handle_config_restore))
@@ -253,6 +259,8 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::media::handle_list).post(crate::media::handle_upload),
         )
         .route("/api/media/:id", delete(crate::media::handle_delete))
+        // http 型插件(超融合二期):登记/启停/删除/invoke 代理
+        .merge(crate::plugins::routes())
         .with_state(state)
 }
 
@@ -271,7 +279,12 @@ pub(crate) fn ok_env(data: Value) -> Response {
     (StatusCode::OK, Json(json!({ "ok": true, "data": data }))).into_response()
 }
 
-pub(crate) fn err_env(status: StatusCode, code: &str, message: &str, fields: Option<Vec<String>>) -> Response {
+pub(crate) fn err_env(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    fields: Option<Vec<String>>,
+) -> Response {
     let mut error = json!({ "code": code, "message": message });
     if let Some(f) = fields {
         error["fields"] = json!(f);
@@ -1655,11 +1668,17 @@ async fn handle_probe_capabilities(
         .map(String::from)
         .unwrap_or_else(|| provider.model.clone());
     if model.is_empty() {
-        return err_env(StatusCode::BAD_REQUEST, "E_NO_MODEL", "该供应商未配置默认模型,探测需指定 model", None);
+        return err_env(
+            StatusCode::BAD_REQUEST,
+            "E_NO_MODEL",
+            "该供应商未配置默认模型,探测需指定 model",
+            None,
+        );
     }
     let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let levels = provider.reasoning_levels.clone().unwrap_or_default();
-    let caps = crate::capprobe::probe_caps(&provider.base_url, &provider.api_key, &model, &levels).await;
+    let caps =
+        crate::capprobe::probe_caps(&provider.base_url, &provider.api_key, &model, &levels).await;
     let entry = if force {
         crate::capprobe::store_probe_force(&s.codex_home, &provider.id, &model, &caps)
     } else {
@@ -1683,10 +1702,21 @@ async fn handle_capability_tags_set(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let get = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let get = |k: &str| {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
     let (pid, model, dim, val) = (get("providerId"), get("model"), get("dim"), get("val"));
     if pid.is_empty() || model.is_empty() {
-        return err_env(StatusCode::BAD_REQUEST, "E_BAD_REQUEST", "需要 providerId 与 model", None);
+        return err_env(
+            StatusCode::BAD_REQUEST,
+            "E_BAD_REQUEST",
+            "需要 providerId 与 model",
+            None,
+        );
     }
     match crate::capprobe::set_manual(&s.codex_home, &pid, &model, &dim, &val) {
         Ok(entry) => ok_env(json!({ "entry": entry })),
@@ -1960,10 +1990,8 @@ mod tests {
     #[tokio::test]
     async fn media_routes_roundtrip() {
         let mut st = dummy_state();
-        let dir = std::env::temp_dir().join(format!(
-            "2xapi-media-e2e-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("2xapi-media-e2e-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         st.codex_home = dir.clone();
         let app = build_router(st);
@@ -1984,12 +2012,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let raw = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v["ok"], true);
         let url = v["data"]["url"].as_str().unwrap().to_string();
         let id = v["data"]["id"].as_str().unwrap().to_string();
-        assert!(url.starts_with("/media/") && url.ends_with(".png"), "URL 形态: {url}");
+        assert!(
+            url.starts_with("/media/") && url.ends_with(".png"),
+            "URL 形态: {url}"
+        );
 
         // GET 原件:200+Content-Type+PNG 魔数字节一致
         let resp = app
@@ -1999,7 +2032,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&bytes[..4], &[0x89, b'P', b'N', b'G']);
 
         // ext 错位(.jpg)→404;列表可见;伪装 mime(image/jpeg 实为 png)→415
@@ -2016,11 +2051,18 @@ mod tests {
         assert_eq!(resp.status(), 404);
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri("/api/media").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/media")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        let raw = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v["data"]["items"].as_array().unwrap().len(), 1);
         let bad = format!(r#"{{"mime":"image/jpeg","data_b64":"{png_b64}"}}"#);
