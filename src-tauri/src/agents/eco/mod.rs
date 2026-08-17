@@ -6,7 +6,9 @@
 //! spec 标 enabled=false(启用时写回)——JSON/TOML/YAML 均无原生 disabled 字段,统一此策略。
 //!
 //! 支持平台独立于 agents 托管注册表(cursor/trae 无托管世界也可管理生态):
-//! A 段 = codex(config.toml)+cursor(mcp.json);B 段 = claude-desktop/grokbuild/opencode/hermes/trae。
+//! A 段 = codex(config.toml)+cursor(mcp.json);B 段 = claude-desktop/grokbuild/opencode/hermes/trae;
+//! 补齐 = openclaw(openclaw.json 的 mcp.servers 嵌套段,2026-08-17 CLI 实证:
+//! 条目 {command,args,env?,enabled?},enabled:false=原生停用,走 native_enabled 通路与 Codex 同款)。
 
 pub mod codex;
 pub mod cursor;
@@ -30,6 +32,7 @@ pub const SUPPORTED: &[&str] = &[
     "hermes",
     "trae",
     "workbuddy",
+    "openclaw",
 ];
 
 /// 平台显示名(前端平台 tab;独立于托管注册表命名,含无托管世界的 cursor/trae)。
@@ -44,6 +47,7 @@ pub fn display_name(agent: &str) -> &'static str {
         "hermes" => "Hermes",
         "trae" => "TRAE",
         "workbuddy" => "WorkBuddy",
+        "openclaw" => "OpenClaw",
         _ => "未知平台",
     }
 }
@@ -760,8 +764,8 @@ mod tests {
         assert_eq!(spec["args"][2], "/tmp/docs", "$DIR 占位应被替换");
         assert_eq!(
             v["agents"].as_array().unwrap().len(),
-            9,
-            "MCP 支持 9 平台(claude/workbuddy 在编,技能已裁撤)"
+            10,
+            "MCP 支持 10 平台(claude/workbuddy 在编,技能已裁撤;openclaw mcp.servers 补齐)"
         );
     }
 
@@ -769,6 +773,7 @@ mod tests {
     fn supported_table_and_summary() {
         assert_eq!(supported("Codex"), Some("codex"));
         assert_eq!(supported("cursor"), Some("cursor"));
+        assert_eq!(supported("openclaw"), Some("openclaw"), "补齐:mcp.servers 载体");
         assert_eq!(supported("gemini"), None, "gemini 无 MCP 载体,B 段未入编");
         assert_eq!(
             spec_summary(&json!({ "command": "npx", "args": ["a", "b"] })),
@@ -1091,6 +1096,71 @@ mod real_b {
     }
 }
 
+/// openclaw 补齐真机 e2e(#[ignore] 手动驱动;隔离 HOME 手法,真实 ~/.openclaw 零触碰):
+/// 隔离 HOME 用 CLI `openclaw mcp add` 生成真实形状文档 → 产品 store 全链(install→已有
+/// 条目零变化→disable 落盘 enabled:false→uninstall 还原)→ CLI `mcp show` 读回确认产品
+/// 写入的条目 CLI 认账。
+#[cfg(test)]
+mod real_openclaw {
+    use crate::agents::eco::cursor::JsonStore;
+    use crate::agents::eco::{disable, install, uninstall, EcoStore};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    #[test]
+    #[ignore = "真机验收:需 PATH 上有 openclaw CLI;隔离 HOME,手动驱动"]
+    fn eco_real_machine_openclaw() {
+        let home = std::env::temp_dir().join(format!("2xapi-eco-oclaw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("backups")).unwrap();
+        let cli = "openclaw";
+        let out = std::process::Command::new(cli)
+            .env("HOME", &home)
+            .args(["mcp", "add", "probe-x", "--command", "npx", "--arg", "hello-server", "--no-probe"])
+            .output()
+            .expect("openclaw CLI 应在 PATH");
+        assert!(out.status.success(), "CLI 生成真实形状失败: {}", String::from_utf8_lossy(&out.stderr));
+        let cfg = home.join(".openclaw/openclaw.json");
+        let orig = std::fs::read_to_string(&cfg).unwrap();
+        let orig_doc: Value = serde_json::from_str(&orig).unwrap();
+        assert_eq!(orig_doc["mcp"]["servers"]["probe-x"]["command"], "npx", "CLI 落盘形状前提");
+
+        // 产品 store 全链(同一文件;codex_home/backup 指隔离目录)
+        let store = JsonStore::nested("openclaw", &cfg, &["mcp", "servers"], true);
+        let before: BTreeMap<String, Value> = store.read().unwrap();
+        install(
+            &store,
+            &home,
+            &home.join("backups"),
+            "memory",
+            &serde_json::json!({ "command": "npx", "args": ["-y", "server-memory"] }),
+        )
+        .unwrap();
+        let after = store.read().unwrap();
+        for (k, v) in &before {
+            assert_eq!(after.get(k), Some(v), "CLI 已有条目 {k} 零变化");
+        }
+        // CLI 读回:产品写入的条目 CLI 认账
+        let out = std::process::Command::new(cli)
+            .env("HOME", &home)
+            .args(["mcp", "show", "memory"])
+            .output()
+            .unwrap();
+        let shown = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(shown.contains("memory"), "CLI mcp show 应见 memory: {shown}");
+
+        disable(&store, &home, &home.join("backups"), "memory").unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(doc["mcp"]["servers"]["memory"]["enabled"], Value::Bool(false));
+
+        uninstall(&store, &home, &home.join("backups"), "memory").unwrap();
+        let final_doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(final_doc["mcp"]["servers"].get("memory").is_none());
+        assert_eq!(final_doc["mcp"]["servers"]["probe-x"]["command"], "npx");
+        let _ = std::fs::remove_dir_all(&home);
+        println!("[openclaw] CLI 形状+产品全链+CLI 读回 通过(真实 ~/.openclaw 零触碰)");
+    }
+}
 /// C 段(MCP 部分)真机 e2e(#[ignore] 手动驱动;技能部分已按总部修订裁撤):
 /// - claude-code:~/.claude.json 是 Claude Code CLI 活配置(本机在写),副本上验全链
 ///   +真实文件快速窗口 install→diff mcpServers 外零变化→uninstall 还原
