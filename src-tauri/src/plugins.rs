@@ -184,6 +184,7 @@ pub fn routes() -> Router<Arc<crate::server::AppState>> {
             "/api/plugins/:id",
             get(handle_detail).delete(handle_remove),
         )
+        .route("/api/plugins/:id/install", post(handle_install))
         .route("/api/plugins/:id/toggle", post(handle_toggle))
         .route("/api/plugins/:id/config", put(handle_config))
         .route("/api/plugins/:id/update", post(handle_update))
@@ -306,6 +307,54 @@ async fn handle_local_add(
 }
 
 /// 详情:manifest 全量 + 用户配置(models 优先级/failover/config_values)+ status/source/updated_at。
+/// POST /api/plugins/:id/install —— 安装(官方/已登记条目 → registry 启用,version 以市场为准)。
+async fn handle_install(
+    State(s): State<Arc<crate::server::AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    // 已登记 → 幂等启用;version 落后市场则同步(旧条目登记过旧版)
+    if let Some(entry) = registry::get_plugin(&s.codex_home, &id) {
+        let market = official_market();
+        if let Some(m) = market["plugins"]
+            .as_array()
+            .and_then(|a| a.iter().find(|p| p["id"] == id))
+        {
+            let inst_v = entry
+                .meta
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mkt_v = m.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            if mkt_v > inst_v {
+                let mut mm = m.as_object().cloned().unwrap_or_default();
+                mm.insert("source".into(), json!("official"));
+                mm.insert("builtin".into(), json!(true));
+                registry::upsert_plugin(&s.codex_home, &mm);
+            }
+        }
+        registry::set_enabled(&s.codex_home, &id, true);
+        return raw_json(StatusCode::OK, &json!({ "ok": true, "installed": true, "id": id }));
+    }
+    // 官方市场条目 → 取市场 manifest 登记(version 以市场为准,避免登记旧版致「可更新」误标)
+    let market = official_market();
+    if let Some(m) = market["plugins"]
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["id"] == id))
+    {
+        let mut mm = m.as_object().cloned().unwrap_or_default();
+        mm.insert("source".into(), json!("official"));
+        mm.insert("builtin".into(), json!(true));
+        registry::upsert_plugin(&s.codex_home, &mm);
+        registry::set_enabled(&s.codex_home, &id, true);
+        return raw_json(StatusCode::OK, &json!({ "ok": true, "installed": true, "id": id }));
+    }
+    err_env(
+        StatusCode::NOT_FOUND,
+        "E_NO_PLUGIN",
+        "插件不存在(未上架或未登记,请先本地添加/注册)",
+    )
+}
+
 async fn handle_detail(
     State(s): State<Arc<crate::server::AppState>>,
     Path(id): Path<String>,
@@ -1338,6 +1387,32 @@ mod market_tests {
         assert_eq!(e.kind, registry::Kind::Tool, "内置能力=tool 条目");
         assert!(e.enabled);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// install handler:官方条目安装 version 以市场为准;旧版登记幂等安装同步市场版;未上架 404。
+    #[tokio::test]
+    async fn install_uses_market_version_and_syncs_stale() {
+        let root = tmp_home("install-v");
+        let s = std::sync::Arc::new(mk_state(&root));
+        let resp = handle_install(State(s.clone()), Path("image-describe".into())).await;
+        let v = body_of(resp).await;
+        assert_eq!(v["ok"], true, "{v}");
+        let e = registry::get_plugin(&s.codex_home, "image-describe").unwrap();
+        assert_eq!(e.meta["version"], "2.0.1", "version 应以市场为准");
+        assert!(e.enabled);
+
+        // 旧版登记(1.0.0)→ 幂等安装同步市场版
+        let root2 = tmp_home("install-stale");
+        let s2 = std::sync::Arc::new(mk_state(&root2));
+        let mut stale = official_market()["plugins"][0].as_object().cloned().unwrap();
+        stale.insert("version".into(), json!("1.0.0"));
+        registry::upsert_plugin(&s2.codex_home, &stale);
+        let resp2 = handle_install(State(s2.clone()), Path("ffmpeg-frame-extract".into())).await;
+        assert_eq!(body_of(resp2).await["ok"], true);
+        let e2 = registry::get_plugin(&s2.codex_home, "ffmpeg-frame-extract").unwrap();
+        assert_eq!(e2.meta["version"], "1.0.0", "市场 ffmpeg 版=1.0.0,同步后一致");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
     }
 
     /// ffmpeg 端到端(本机无 ffmpeg 时验证人话错误分支)。
