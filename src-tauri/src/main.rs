@@ -29,6 +29,7 @@ mod probe;
 mod providers;
 mod registry;
 mod sessions;
+mod usage_stats;
 
 use std::net::TcpListener;
 use tauri::{Manager, WebviewWindowBuilder};

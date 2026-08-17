@@ -261,6 +261,8 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::media::handle_list).post(crate::media::handle_upload),
         )
         .route("/api/media/:id", delete(crate::media::handle_delete))
+        // 用量仪表盘(竞品吸收项):按 provider 聚合 P50/P90/请求量/成功率
+        .route("/api/usage-stats", get(handle_usage_stats))
         // http 型插件(超融合二期):登记/启停/删除/invoke 代理
         .merge(crate::plugins::routes())
         .with_state(state)
@@ -978,6 +980,11 @@ fn usage_for_state(state: &AppState, mode: &str) -> Value {
 }
 
 // GET /api/accel/state → {mode, customNode, lines, scopeNote, usage}
+// GET /api/usage-stats → 用量仪表盘聚合(读取 usage-stats.jsonl;无数据空数组)。
+async fn handle_usage_stats(State(s): State<Arc<AppState>>) -> Response {
+    ok_json(crate::usage_stats::summary(&s.codex_home))
+}
+
 async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
     let (mode, custom_node) = {
         let cfg = s.accel.lock().unwrap();
@@ -3908,6 +3915,33 @@ mod tests {
             .await
             .unwrap();
         (resp.status(), body_json(resp).await)
+    }
+
+    /// 用量仪表盘路由:空数据 → 空 providers;落一行后聚合出该 provider。
+    #[tokio::test]
+    async fn usage_stats_route_empty_then_aggregates() {
+        let (state, root) = unique_state("usage-route");
+        let app = build_router(state.clone());
+        let v = accel_get(&app, "/api/usage-stats").await;
+        assert_eq!(v["providers"].as_array().unwrap().len(), 0);
+        crate::usage_stats::log_request(
+            &state.codex_home,
+            &crate::usage_stats::ReqLog {
+                ts: 1,
+                provider_id: "p".into(),
+                provider_name: "P".into(),
+                key_masked: "sk-…abcd".into(),
+                route: "codex".into(),
+                line: "direct".into(),
+                latency_ms: 25,
+                ok: true,
+            },
+        );
+        let v = accel_get(&app, "/api/usage-stats").await;
+        assert_eq!(v["providers"][0]["providerId"], "p");
+        assert_eq!(v["providers"][0]["count"], 1);
+        assert_eq!(v["providers"][0]["p50Ms"], 25);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

@@ -260,6 +260,7 @@ async fn dispatch_anthropic_for(
     } else {
         format!("{}/v1/messages", base)
     };
+    let _usage_started = std::time::Instant::now();
 
     // 01-D3：注入 provider.api_key（覆盖任何来源的凭证）；抽为闭包以支持换线重试(同 dispatch)
     let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
@@ -298,6 +299,24 @@ async fn dispatch_anthropic_for(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+
+    // 用量台账(仪表盘后端):落一行(尽力而为,不阻塞)
+    crate::usage_stats::log_request(
+        &state.codex_home,
+        &crate::usage_stats::ReqLog {
+            ts: chrono::Utc::now().timestamp(),
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            key_masked: crate::usage_stats::mask_key(&provider.api_key),
+            route: "anthropic".into(),
+            line: line
+                .as_ref()
+                .map(|(l, _)| l.id.clone())
+                .unwrap_or_else(|| "direct".into()),
+            latency_ms: _usage_started.elapsed().as_millis() as u64,
+            ok: upstream.status().is_success(),
+        },
+    );
 
     // 原样透传（FR-4.11）：上游状态码 + body 流式回传，不做协议转换
     let status =
@@ -464,6 +483,7 @@ async fn dispatch_gemini(
                 body_bytes.len()
             );
 
+            let _usage_started = std::time::Instant::now();
             let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
                 let mut rb = client
                     .post(&target)
@@ -496,6 +516,23 @@ async fn dispatch_gemini(
                 Ok(r) => r,
                 Err(resp) => return resp,
             };
+            // 用量台账(仪表盘后端)
+            crate::usage_stats::log_request(
+                &state.codex_home,
+                &crate::usage_stats::ReqLog {
+                    ts: chrono::Utc::now().timestamp(),
+                    provider_id: provider.id.clone(),
+                    provider_name: provider.name.clone(),
+                    key_masked: crate::usage_stats::mask_key(&provider.api_key),
+                    route: "gemini".into(),
+                    line: line
+                        .as_ref()
+                        .map(|(l, _)| l.id.clone())
+                        .unwrap_or_else(|| "direct".into()),
+                    latency_ms: _usage_started.elapsed().as_millis() as u64,
+                    ok: upstream.status().is_success(),
+                },
+            );
             let status =
                 StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut resp = Response::builder().status(status);
@@ -787,6 +824,8 @@ async fn dispatch(
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
 
+    let _usage_started = std::time::Instant::now();
+
     // ★ 请求日志(排查用)
     let req_model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
@@ -883,6 +922,23 @@ async fn dispatch(
             return resp;
         }
     };
+    // 用量台账(仪表盘后端):落一行(尽力而为,不阻塞)
+    crate::usage_stats::log_request(
+        &state.codex_home,
+        &crate::usage_stats::ReqLog {
+            ts: chrono::Utc::now().timestamp(),
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            key_masked: crate::usage_stats::mask_key(&provider.api_key),
+            route: "codex".into(),
+            line: line
+                .as_ref()
+                .map(|(l, _)| l.id.clone())
+                .unwrap_or_else(|| "direct".into()),
+            latency_ms: _usage_started.elapsed().as_millis() as u64,
+            ok: upstream.status().is_success(),
+        },
+    );
     eprintln!(
         "[GW] ← upstream {} conv={:?}",
         upstream.status(),
@@ -1569,6 +1625,29 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    /// 用量仪表盘:网关请求后落盘台账,聚合含该 provider(P50/P90 由 usage_stats 单测覆盖)。
+    #[tokio::test]
+    async fn gateway_logs_usage_stats() {
+        let (base, _seen) = mock_upstream("OK_BODY").await;
+        let (state, providers_path, root) = make_state("usage-stats");
+        add_provider(&providers_path, &base, "sk-usage");
+        let resp = proxy_responses(
+            State(Arc::new(state.clone())),
+            req_post_responses(r#"{"input":"hi"}"#).await,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let raw = std::fs::read_to_string(state.codex_home.join("usage-stats.jsonl")).unwrap();
+        assert!(
+            raw.contains("\"route\":\"codex\""),
+            "codex 通道应落台账: {raw}"
+        );
+        assert!(raw.contains("\"ok\":true"), "{raw}");
+        assert!(!raw.contains("sk-usage"), "不落明文 Key: {raw}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 01-D3 / FR-4.3：上游收到的 Authorization = Bearer {provider.api_key}（非 Codex 传来值），且 body 透传。
