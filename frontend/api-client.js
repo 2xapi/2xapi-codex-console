@@ -209,6 +209,12 @@
         usage: p.usage || { ok: false, degradedToDirect: false },
       };
     },
+    // ── 用量仪表盘(用量仪表盘后端批次):GET /api/usage-stats 非信封 {providers:[{providerId,providerName,count,p50Ms,p90Ms,okRate,lastTs,routes}]} ──
+    usageStats: async () => {
+      const p = await rawJson("GET", "/api/usage-stats");
+      return p && Array.isArray(p.providers) ? p.providers : [];
+    },
+
     // refresh-cred 契约:200 {ok:true, usage:{...}} / 4xx {error:"人话"}(非信封,顶层字段;4xx 由 rawJson 抛 error)
     accelRefreshCred: async () => {
       const p = await rawJson("POST", "/api/accel/refresh-cred", {});

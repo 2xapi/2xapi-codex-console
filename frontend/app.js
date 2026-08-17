@@ -1602,7 +1602,7 @@ async function doImport() {
 }
 
 /* ── ⚙ 设置弹窗:五分区 ── */
-var SET_TABS = [["ip", "IP 管理"], ["account", "账号"], ["general", "通用"], ["advanced", "高级"], ["about", "关于"]];
+var SET_TABS = [["ip", "IP 管理"], ["usage", "用量"], ["account", "账号"], ["general", "通用"], ["advanced", "高级"], ["about", "关于"]];
 function openSettings() {
   state.setTab = "ip";
   state.menuOpen = false;
@@ -1617,6 +1617,7 @@ function renderSettings() {
   var body = document.getElementById("setBody"); if (!body) return;
   body.innerHTML =
     state.setTab === "ip" ? setIpHtml()
+    : state.setTab === "usage" ? setUsageHtml()
     : state.setTab === "account" ? setAccountHtml()
     : state.setTab === "general" ? setGeneralHtml()
     : state.setTab === "advanced" ? setAdvancedHtml()
@@ -1712,6 +1713,42 @@ async function doIpmRefresh() {
     showToast(u && u.ok ? ("已刷新:用量 " + fmtGb(u.quotaUsedBytes) + " G / " + fmtQuotaTotalGb(u.quotaTotalBytes) + " G") : "已刷新", "ok");
   } catch (e) { showToast(e.message, "error"); }
   state.busy = null; renderSettings();
+}
+function setUsageHtml() {
+  var u = state.usage;
+  var rows;
+  if (u && u.err) rows = '<div class="sub" style="color:var(--c-err);padding:4px 0">✗ ' + esc(u.err) + '</div>';
+  else if (u && u.busy) rows = '<div class="sub" style="padding:4px 0">加载中…</div>';
+  else if (u && u.providers && u.providers.length) {
+    rows = u.providers.map(function (p) {
+      var okRate = (p.okRate != null) ? Math.round(p.okRate * 100) + "%" : "—";
+      return '<div class="hist-row" style="align-items:flex-start">'
+        + '<b style="min-width:96px">' + esc(p.providerName || p.providerId) + '</b>'
+        + '<span class="meta">' + p.count + ' 次请求</span>'
+        + '<span class="tag">P50 ' + (p.p50Ms != null ? p.p50Ms + "ms" : "—") + '</span>'
+        + '<span class="tag">P90 ' + (p.p90Ms != null ? p.p90Ms + "ms" : "—") + '</span>'
+        + '<span class="tag">成功率 ' + okRate + '</span>'
+        + (p.lastTs ? '<span class="tag">' + fmtTime(p.lastTs) + '</span>' : '')
+        + (p.routes && p.routes.length ? '<div class="sub" style="width:100%;font-family:var(--mono);font-size:11px">' + esc(p.routes.join(" · ")) + '</div>' : '')
+        + '</div>';
+    }).join("");
+  } else rows = '<div class="sub" style="padding:4px 0">暂无请求记录。使用网关转发对话后,这里会自动按供应商积累 P50/P90 延迟与成功率基准。</div>';
+  return '<h3 style="margin:2px 0 4px;font-size:13.5px">用量仪表盘 · 网关统计</h3>'
+    + '<div class="sub" style="margin-bottom:6px">每次经网关的请求自动落台账(不记录密钥);P50/P90 随使用自然累积,可作各供应商的延迟基准。</div>'
+    + '<div style="margin:6px 0 10px"><button class="btn sm" data-a="usage-refresh"' + (u && u.busy ? " disabled" : "") + '>↻ 刷新</button></div>'
+    + rows;
+}
+async function doUsageRefresh() {
+  var u = state.usage;
+  if (u && u.busy) return;
+  state.usage = { busy: true };
+  renderSettings();
+  try {
+    state.usage = { providers: await api.usageStats() };
+  } catch (e) {
+    state.usage = { err: (e && e.message) || "加载用量统计失败" };
+  }
+  renderSettings();
 }
 function setAccountHtml() {
   var email = sessionEmail();
@@ -1856,7 +1893,8 @@ document.addEventListener("click", function (ev) {
     case "user-menu": state.menuOpen = !state.menuOpen; renderTopAuth(); break;
     case "settings-open": openSettings(); break;
     case "settings-close": document.getElementById("setMask").style.display = "none"; break;
-    case "set-tab": state.setTab = t.dataset.s; renderSettings(); break;
+    case "set-tab": state.setTab = t.dataset.s; renderSettings(); if (t.dataset.s === "usage") doUsageRefresh(); break;
+    case "usage-refresh": doUsageRefresh(); break;
     case "bal-toggle":
       state.balShow = !state.balShow;
       try { localStorage.setItem("2xapi.balShow", state.balShow ? "on" : "off"); } catch (e) {}

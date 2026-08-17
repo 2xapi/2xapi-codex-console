@@ -89,6 +89,11 @@ fn load_registry(codex_home: &Path) -> Map<String, Value> {
 
 fn save_registry(codex_home: &Path, agents: &Map<String, Value>) {
     let path = registry_path(codex_home);
+    // 登记表无任何已管理条目 → 删空壳文件(完全卸载后零残留)
+    if agents.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -702,6 +707,17 @@ mod tests {
         assert_eq!(err.0, 409);
         // 不存在 → 404
         assert_eq!(uninstall(&store, &root, &root, "nope").unwrap_err().0, 404);
+    }
+
+    #[test]
+    fn uninstall_last_entry_removes_roster_file() {
+        let (root, store) = setup("roster-clean");
+        install(&store, &root, &root, "fetch", &spec()).unwrap();
+        assert!(root.join("eco-managed.json").exists());
+        let v = uninstall(&store, &root, &root, "fetch").unwrap();
+        assert_eq!(v["servers"].as_array().unwrap().len(), 0);
+        // 完全卸载后登记表空壳一并删除,零残留
+        assert!(!root.join("eco-managed.json").exists());
     }
 
     #[test]
