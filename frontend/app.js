@@ -1225,8 +1225,8 @@ function openEdit(id) {
   var isH = state.agent === "hermes";
   var defWire = isC ? "anthropic" : (isH ? "chat_completions" : "responses");
   state.edit = p
-    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, icon: p.icon || null, iconColor: p.iconColor || null, models: (p.models || []).map(normModel) }
-    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, icon: null, iconColor: null, models: [] };
+    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, icon: p.icon || null, iconColor: p.iconColor || null, ua: p.userAgent || null, models: (p.models || []).map(normModel) }
+    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, icon: null, iconColor: null, ua: null, models: [] };
   state.fieldErrors = {};
   document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + (isC ? "Claude" : (isH ? "Hermes" : "Codex"));
   document.getElementById("eName").value = state.edit.name;
@@ -1237,6 +1237,14 @@ function openEdit(id) {
   var wSel = document.getElementById("eWire");
   /* 新建一律显示「自动」(保存时落世界默认值,拉取模型探测后回写);编辑已有供应商显示当前实际协议 */
   if (wSel) wSel.value = state.edit.isNew ? "auto" : ((["responses","chat_completions","anthropic"].indexOf(state.edit.wireApi) >= 0) ? state.edit.wireApi : "auto");
+  var uaSel = document.getElementById("eUa");
+  if (uaSel) {
+    uaSel.value = state.edit.ua || "";
+    if (state.edit.ua) {
+      var uaKnown = Array.prototype.some.call(uaSel.options, function (o) { return o.value === state.edit.ua; });
+      if (!uaKnown) { var uaOpt = document.createElement("option"); uaOpt.value = state.edit.ua; uaOpt.text = "自定义"; uaSel.appendChild(uaOpt); }
+    }
+  }
   renderModelRows();
   document.getElementById("editMask").style.display = "";
 }
@@ -1278,6 +1286,7 @@ async function doSaveEdit() {
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
     wireApi: (function () { var w = document.getElementById("eWire"); var v = w ? w.value : "auto"; return v === "auto" ? state.edit.wireApi : v; })(), models: models,
     proxyUrl: "", timeoutSecs: null, notes: "", reasoning_levels: [],
+    userAgent: (document.getElementById("eUa") || { value: "" }).value || null,
     icon: state.edit.icon || null,
     iconColor: state.edit.iconColor || null,
     agent: state.agent,
@@ -1766,11 +1775,32 @@ function setAccountHtml() {
     + setRow('顶栏实时余额', '<button class="btn sm ghost" data-a="bal-toggle">' + (state.balShow ? "开" : "关") + '</button>', '余额不足 $1 时警示变色');
 }
 function setGeneralHtml() {
+  /* 惰性加载自启状态(仿 setAccountHtml 的 remembered 模式;失败不阻塞渲染) */
+  if (state.autostart === undefined) {
+    api.autostart().then(function (r) {
+      state.autostart = !!(r && r.enabled);
+      if (state.setTab === "general") renderSettings();
+    }).catch(function () { state.autostart = false; });
+  }
   return '<h3 style="margin:2px 0 4px;font-size:13.5px">通用</h3>'
-    + setRow('开机自动启动', '<span class="tag">跟随系统</span>', '后台常驻,网关保持可用(加速依赖)')
+    + setRow('开机自动启动', '<button class="btn sm ghost" data-a="autostart-toggle">' + (state.autostart ? "开" : "关") + '</button>', '登录 macOS 时后台常驻,网关保持可用;登记于 launchd 的 com.2xapi.codexconsole')
     + setRow('关闭窗口时', '<span class="tag">隐藏到托盘</span>', '点托盘图标可再次打开;托盘菜单「退出」才真正关闭')
     + setRow('界面语言', '<span class="tag">跟随系统</span>', '')
-    + '<div class="sub" style="margin-top:10px">以上项由本机 2xapi-settings.json 持久化;持久化后置,本期仅展示。</div>';
+    + '<div class="sub" style="margin-top:10px">托盘「网关开/关」可随时停用网关(内存态,重启恢复);自启开关为即时生效。</div>';
+}
+async function doAutostartToggle() {
+  var next = !state.autostart;
+  state.autostart = next;
+  renderSettings();
+  try {
+    var r = await api.setAutostart(next);
+    state.autostart = !!(r && r.enabled);
+    showToast(state.autostart ? "已开启开机自启(登录时后台常驻)" : "已关闭开机自启", "ok");
+  } catch (e) {
+    state.autostart = !next;
+    showToast(e.message || "设置失败", "error");
+  }
+  renderSettings();
 }
 function setAdvancedHtml() {
   return '<h3 style="margin:2px 0 4px;font-size:13.5px">高级</h3>'
@@ -1896,6 +1926,7 @@ document.addEventListener("click", function (ev) {
     case "settings-close": document.getElementById("setMask").style.display = "none"; break;
     case "set-tab": state.setTab = t.dataset.s; renderSettings(); if (t.dataset.s === "usage") doUsageRefresh(); break;
     case "usage-refresh": doUsageRefresh(); break;
+    case "autostart-toggle": doAutostartToggle(); break;
     case "bal-toggle":
       state.balShow = !state.balShow;
       try { localStorage.setItem("2xapi.balShow", state.balShow ? "on" : "off"); } catch (e) {}

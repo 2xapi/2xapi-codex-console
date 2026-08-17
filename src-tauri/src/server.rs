@@ -68,6 +68,8 @@ pub struct AppState {
     pub nodecreds: std::sync::Arc<std::sync::RwLock<crate::nodecreds::Store>>,
     /// Key 资源池(超融合 A 线一期):多 Key 轮询+冷却切换;内存态,单 Key 恒直返。
     pub keypool: std::sync::Arc<crate::keypool::KeyPool>,
+    /// 网关总开关(托盘「网关开/关」内存态):false 时网关代理入口统一 503「网关已由托盘关闭」。
+    pub tray_gate_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -231,6 +233,11 @@ pub fn build_router(state: AppState) -> Router {
         // --- Backups & history ---
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
+        // --- 开机自启(竞品吸收 1.1-3):launchd plist 写/删;读=文件存在 ---
+        .route(
+            "/api/autostart",
+            get(handle_autostart).post(handle_autostart_set),
+        )
         .route("/api/sessions", get(handle_sessions_list))
         .route("/api/sessions/repair", post(handle_sessions_repair))
         .route(
@@ -834,6 +841,25 @@ async fn handle_backups(State(s): State<Arc<AppState>>) -> Response {
 async fn handle_history(State(s): State<Arc<AppState>>) -> Response {
     let result = crate::history::inspect(&s.codex_home);
     ok_json(result)
+}
+
+// ── 开机自启(竞品吸收 1.1-3):launchd plist 写/删 ──────────
+
+// GET /api/autostart → { enabled }
+async fn handle_autostart() -> Response {
+    ok_env(json!({
+        "enabled": crate::autostart::enabled(&crate::autostart::launch_agents_dir())
+    }))
+}
+
+// POST /api/autostart { enabled: bool } → { enabled }
+async fn handle_autostart_set(Json(body): Json<Value>) -> Response {
+    let enable = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dir = crate::autostart::launch_agents_dir();
+    match crate::autostart::set(&dir, enable) {
+        Ok(()) => ok_env(json!({ "enabled": enable })),
+        Err(e) => err_env(StatusCode::INTERNAL_SERVER_ERROR, "E_INTERNAL", &e, None),
+    }
 }
 
 // ── 加速线路(阶段 4,任务书 §五)─────────────────────────
@@ -2025,6 +2051,7 @@ mod tests {
                 std::sync::RwLock::new(crate::nodecreds::Store::empty()),
             ),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
+            tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -2532,6 +2559,7 @@ mod tests {
                 std::sync::RwLock::new(crate::nodecreds::Store::empty()),
             ),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
+            tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         (state, root)
     }

@@ -91,6 +91,9 @@
     // ── 桌面版托管开关（阶段 1，任务书 §1.1）──
     // host/unhost 的错误形态为 {"error": code, "message": msg}（非 04 信封），需单独剥出 code
     desktopState: () => request("GET", "/api/desktop/state"),
+    // ── 开机自启(竞品吸收 1.1-3):launchd plist,{enabled} ──
+    autostart: () => request("GET", "/api/autostart"),
+    setAutostart: (enabled) => request("POST", "/api/autostart", { body: { enabled } }),
   // 多平台注册表(A 阶段,D3 导航数据源):{agents:[{id,name,tip,available,egress,hosting}]}
   agents: () => request("GET", "/api/desktop/agents"),
   // ── 生态管理(开发组·生态中心 A 段):MCP 服务器列表/操作 + 预设市场 ──

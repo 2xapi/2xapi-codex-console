@@ -80,6 +80,13 @@
           <option value="chat_completions">ChatCompletions</option>
           <option value="anthropic">Messages(Anthropic)</option>
         </select></div>
+        <div class="f" style="grid-column:1/-1"><label>UA 伪装 · 上游反封锁(可选)</label><select id="eUa">
+          <option value="">默认(网关)</option>
+          <option value="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36">浏览器 · Chrome macOS</option>
+          <option value="curl/8.6.0">curl</option>
+          <option value="PostmanRuntime/7.37.3">Postman</option>
+          <option value="OpenAI/Python 1.35.0">OAI SDK (openai-python)</option>
+        </select></div>
       </div>
       <table class="mtable"><thead><tr><th>模型名</th><th>上下文</th><th></th></tr></thead><tbody id="modelRows"></tbody></table>
       <div class="btn-row" style="margin-top:8px"><button class="btn ghost" data-a="mfetch">⤓ 拉取模型</button><button class="btn ghost" data-a="mrow-add">＋ 手动加一行</button></div>

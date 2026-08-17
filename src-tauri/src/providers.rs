@@ -1170,6 +1170,58 @@ mod tests {
         assert_eq!(v["reasoning_levels"].as_array().map(|a| a.len()), Some(2));
     }
 
+    // ── UA 伪装(user_agent:预设字符串原样存取;None=网关默认 UA)──────
+
+    #[test]
+    fn user_agent_round_trip_create_update_public() {
+        let path = tmp_path("ua_rt");
+
+        // create 落盘 + 重载仍在
+        let mut i = sample_input("UA", AccessMode::Official);
+        i.model = "m".into();
+        i.user_agent = Some("curl/8.6.0".into());
+        let p = create(&path, i).expect("create");
+        assert_eq!(p.user_agent.as_deref(), Some("curl/8.6.0"));
+        let data = load(&path);
+        assert_eq!(data.providers[0].user_agent.as_deref(), Some("curl/8.6.0"));
+
+        // value_to_input 接 userAgent / user_agent;缺省 → None(不清旧档)
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","userAgent":"curl/8.6.0"}))
+                .user_agent
+                .as_deref(),
+            Some("curl/8.6.0")
+        );
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m","user_agent":"PostmanRuntime/7.37.3"}))
+                .user_agent
+                .as_deref(),
+            Some("PostmanRuntime/7.37.3")
+        );
+        assert_eq!(value_to_input(&json!({"name":"X","model":"m"})).user_agent, None);
+
+        // public 输出 userAgent
+        let v = public_provider(&p);
+        assert_eq!(v["userAgent"], "curl/8.6.0");
+
+        // update 换新值 → 重载仍在
+        let mut up = sample_input("UA2", AccessMode::Official);
+        up.user_agent = Some("Mozilla/5.0 Chrome/126".into());
+        let p2 = update(&path, &p.id, up).expect("update");
+        assert_eq!(p2.user_agent.as_deref(), Some("Mozilla/5.0 Chrome/126"));
+        let data = load(&path);
+        assert_eq!(
+            data.providers[0].user_agent.as_deref(),
+            Some("Mozilla/5.0 Chrome/126")
+        );
+
+        // update 不带该字段 → 清空(回到网关默认;与网关 filter 空串语义一致)
+        let keep = sample_input("UA3", AccessMode::Official);
+        let p3 = update(&path, &p.id, keep).expect("update-none");
+        assert_eq!(p3.user_agent, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── agent 归属(UI2)──────────────────────────────────────
 
     #[test]

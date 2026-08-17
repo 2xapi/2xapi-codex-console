@@ -30,6 +30,10 @@ pub async fn proxy_responses(State(s): State<Arc<AppState>>, req: Request<Body>)
 /// /v1/images/generations(侦察实测 2xa 支持,b64 形态)。成功(200 且 data 有图)即
 /// `mark_dim(image_out=yes)` 单维实证标记——免探测成本,失败不标(参数错≠能力无)。
 pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
+    // 托盘「网关开/关」守卫(/v1/images/generations 不走 dispatch,入口处单独拦截)
+    if !s.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        return err_resp(StatusCode::SERVICE_UNAVAILABLE, "网关已由托盘关闭");
+    }
     let provider = match crate::providers::get_active(&s.providers_path) {
         Some(p) => p,
         None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择供应商"),
@@ -777,6 +781,10 @@ async fn dispatch(
     suffix: &str,
     agent: &str,
 ) -> Response<Body> {
+    // 托盘「网关开/关」守卫:关闭时全部代理入口统一 503 人话(含 /v1/* 及 agent 通路)
+    if !state.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        return err_resp(StatusCode::SERVICE_UNAVAILABLE, "网关已由托盘关闭");
+    }
     // FR-4.9 热切换：每次都重新读 active
     // 503 文案用注册表显示名(opencode/openclaw 等此前误报「Codex 供应商」,openclaw 真机验收发现)
     let agent_label = crate::agents::find(agent)
@@ -1591,6 +1599,7 @@ mod tests {
             cursor_home: root.join("cursorhome"),
             trae_home: root.join("traehome"),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
+            tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(crate::server::AccelCfg::default())),
@@ -1845,6 +1854,72 @@ mod tests {
         let (state, _providers_path, root) = make_state("noactive");
         let resp = proxy_responses(State(Arc::new(state)), req_post_responses("{}").await).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// UA 伪装:provider.user_agent 有值 → 上游收到该 UA(只对目标供应商生效);缺省 → 不设 UA 头(现状)。
+    #[tokio::test]
+    async fn provider_ua_overrides_upstream_user_agent() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let app = Router::new().route(
+            "/responses",
+            post(move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                let seen = seen_clone.clone();
+                async move {
+                    let ua = h
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from)
+                        .unwrap_or_default();
+                    seen.lock().unwrap().push(ua);
+                    (StatusCode::OK, "OK")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = format!("http://{}", addr);
+        let (state, providers_path, root) = make_state("ua-override");
+
+        // 缺省(None):不伪装 → 上游不收到 UA 头(网关现状)
+        add_provider(&providers_path, &base, "sk-default");
+        let r1 = proxy_responses(
+            State(Arc::new(clone_state(&state))),
+            req_post_responses("{}").await,
+        )
+        .await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let default_ua = seen.lock().unwrap().pop().expect("缺省应收到 UA");
+        assert!(default_ua.is_empty(), "缺省不应设 UA 头,实际: {default_ua}");
+
+        // 伪装:user_agent 有值 → 上游收到该 UA
+        let input = ProviderInput {
+            name: "UAS".into(),
+            base_url: base,
+            api_key: "sk-ua".into(),
+            model: "m".into(),
+            sub2api_multiplier: 1.0,
+            user_agent: Some("curl/8.6.0".into()),
+            ..ProviderInput::default()
+        };
+        let p = providers::create(&providers_path, input).unwrap();
+        providers::set_active(&providers_path, &p.id);
+        let r2 = proxy_responses(
+            State(Arc::new(clone_state(&state))),
+            req_post_responses("{}").await,
+        )
+        .await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            seen.lock().unwrap().pop().as_deref(),
+            Some("curl/8.6.0")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3163,6 +3238,7 @@ mod tests {
             cursor_home: s.cursor_home.clone(),
             trae_home: s.trae_home.clone(),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
+            tray_gate_enabled: s.tray_gate_enabled.clone(),
             launcher: s.launcher.clone(),
             health: s.health.clone(),
             accel: s.accel.clone(),
@@ -4003,6 +4079,7 @@ mod verify_wb_path {
             accel: Arc::new(Mutex::new(crate::server::AccelCfg::default())),
             nodecreds: Arc::new(std::sync::RwLock::new(crate::nodecreds::Store::empty())),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
+            tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let app2 = crate::server::build_router(state);
         use tower::ServiceExt;
