@@ -164,7 +164,7 @@ fn wrap_for_windows(spec: &mut Value) {
     let Some(obj) = spec.as_object_mut() else {
         return;
     };
-    let Some(cmd) = obj
+    let cmd = obj
         .get("command")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
