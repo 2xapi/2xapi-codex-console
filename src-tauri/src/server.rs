@@ -234,6 +234,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/backups", get(handle_backups))
         .route("/api/history/inspect", get(handle_history))
         // --- 开机自启(竞品吸收 1.1-3):launchd plist 写/删;读=文件存在 ---
+        .route("/api/version", get(handle_version))
         .route(
             "/api/autostart",
             get(handle_autostart).post(handle_autostart_set),
@@ -875,6 +876,11 @@ async fn handle_history(State(s): State<Arc<AppState>>) -> Response {
 }
 
 // ── 开机自启(竞品吸收 1.1-3):launchd plist 写/删 ──────────
+
+// GET /api/version → { version }(构建版本,与 Cargo.toml 对齐;前端关于页/检查更新用)
+async fn handle_version() -> Response {
+    (axum::http::StatusCode::OK, axum::Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))).into_response()
+}
 
 // GET /api/autostart → { enabled }
 async fn handle_autostart() -> Response {
