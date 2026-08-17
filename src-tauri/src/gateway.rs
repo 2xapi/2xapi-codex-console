@@ -300,6 +300,11 @@ async fn dispatch_anthropic_for(
         Err(resp) => return resp,
     };
 
+    // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
+    if is_html_upstream(&upstream) {
+        return err_resp(StatusCode::BAD_GATEWAY, HTML_UPSTREAM_ERR);
+    }
+
     // 用量台账(仪表盘后端):落一行(尽力而为,不阻塞)
     crate::usage_stats::log_request(
         &state.codex_home,
@@ -516,6 +521,10 @@ async fn dispatch_gemini(
                 Ok(r) => r,
                 Err(resp) => return resp,
             };
+            // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
+            if is_html_upstream(&upstream) {
+                return gemini_err(StatusCode::BAD_GATEWAY, "UNAVAILABLE", HTML_UPSTREAM_ERR);
+            }
             // 用量台账(仪表盘后端)
             crate::usage_stats::log_request(
                 &state.codex_home,
@@ -614,6 +623,11 @@ async fn dispatch_gemini(
                 Ok(r) => r,
                 Err(resp) => return resp,
             };
+
+            // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
+            if is_html_upstream(&upstream) {
+                return gemini_err(StatusCode::BAD_GATEWAY, "UNAVAILABLE", HTML_UPSTREAM_ERR);
+            }
 
             // 上游非成功:包装为 Gemini 错误形态(状态码透传)
             if !upstream.status().is_success() {
@@ -922,6 +936,10 @@ async fn dispatch(
             return resp;
         }
     };
+    // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
+    if is_html_upstream(&upstream) {
+        return err_resp(StatusCode::BAD_GATEWAY, HTML_UPSTREAM_ERR);
+    }
     // 用量台账(仪表盘后端):落一行(尽力而为,不阻塞)
     crate::usage_stats::log_request(
         &state.codex_home,
@@ -1506,6 +1524,22 @@ pub async fn test_node_via(
 
 fn err_resp(status: StatusCode, msg: &str) -> Response<Body> {
     (status, msg.to_string()).into_response()
+}
+
+/// 上游返回 HTML 页面(真机实证:base_url 缺 /v1 时 2xa 中转站对裸域路径回 200 text/html Web UI,
+/// 网关若透传 CLI 表现为空流/拿到一堆 HTML)→ 不透传,人话错误。
+/// 只拦 text/html;正常模型响应(text/event-stream / application/json 等)零影响。
+const HTML_UPSTREAM_ERR: &str = "上游返回了网页内容(HTTP 200 text/html),通常是 API 地址不对——请检查供应商 base_url 是否带 /v1(如 https://2xa.cc.cd/v1)";
+
+/// Content-Type 判 HTML。不读响应体 → SSE 流式/透传路径同样能拦(真机案例均为 text/html 头)。
+/// ponytail:不嗅探响应体——谎报头+HTML 体属未观测场景,需要时在缓冲路径加字节预检即可。
+fn is_html_upstream(upstream: &reqwest::Response) -> bool {
+    upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().starts_with("text/html"))
+        .unwrap_or(false)
 }
 
 // ── 单测（M3a Gate：mock 上游验证每跳）──────────────────────
@@ -2742,6 +2776,67 @@ mod tests {
             "应报平台名: {body}"
         );
         assert!(!body.contains("Codex 供应商"), "不得误报 Codex: {body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    async fn req_post_chat(body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// 纵深防御(真机实证两轮:base_url 缺 /v1 时上游回 200 text/html Web UI)→ 不透传,
+    /// 客户端拿到人话错误而非 HTML。
+    #[tokio::test]
+    async fn chat_html_upstream_returns_human_error_not_html() {
+        let html = "<!DOCTYPE html><html><head><title>2xa</title></head><body>welcome</body></html>";
+        let (base, _seen) = mock_chat_upstream(html, "text/html").await;
+        let (state, providers_path, root) = make_state("html-def");
+        add_provider(&providers_path, &base, "sk-html");
+
+        let resp = proxy_chat(
+            State(Arc::new(state)),
+            req_post_chat(r#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#).await,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "HTML 上游应 502 人话错误,不得透传 200 HTML"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("上游返回了网页内容") && body.contains("/v1"),
+            "应为人话错误: {body}"
+        );
+        assert!(!body.contains("<!DOCTYPE"), "不得透传 HTML: {body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 回归:正常 application/json 上游不受 HTML 拦截影响,原样透传。
+    #[tokio::test]
+    async fn chat_json_upstream_still_passthrough() {
+        let chat_resp = r#"{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}"#;
+        let (base, _seen) = mock_chat_upstream(chat_resp, "application/json").await;
+        let (state, providers_path, root) = make_state("html-ok");
+        add_provider(&providers_path, &base, "sk-json");
+
+        let resp = proxy_chat(
+            State(Arc::new(state)),
+            req_post_chat(r#"{"model":"gpt-test","messages":[]}"#).await,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], chat_resp.as_bytes(), "JSON 响应应原样透传");
         let _ = std::fs::remove_dir_all(&root);
     }
 
