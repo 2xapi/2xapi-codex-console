@@ -8,6 +8,7 @@
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
 
 pub mod claude_desktop;
+pub mod cursor;
 pub mod eco;
 pub mod gemini;
 pub mod grok;
@@ -121,6 +122,15 @@ static REGISTRY: &[AgentMeta] = &[
         egress: "chat",
         hosting: "config",
     },
+    AgentMeta {
+        id: "cursor",
+        name: "Cursor",
+        tip: "Cursor(vscdb 托管)",
+        available: true,
+        frontend_ready: true,
+        egress: "chat",
+        hosting: "config",
+    },
 ];
 
 /// 平台注册表迭代(registry_json 与测试共用同源)。
@@ -161,7 +171,7 @@ mod tests {
     #[test]
     fn registry_has_nine_unique_platforms() {
         let all: Vec<&str> = registry().map(|m| m.id).collect();
-        assert_eq!(all.len(), 9, "平台数应为 9(pi 已裁撤): {all:?}");
+        assert_eq!(all.len(), 10, "平台数应为 10(pi 已裁撤): {all:?}");
         let mut uniq = all.clone();
         uniq.sort_unstable();
         uniq.dedup();
@@ -193,12 +203,13 @@ mod tests {
                 "openclaw",
                 "hermes",
                 "claude-desktop",
-                "workbuddy"
+                "workbuddy",
+                "cursor"
             ]
         );
     }
 
-    /// 前端世界满编:九平台全部可点亮(「全部做好」批次交付后)。
+    /// 前端世界满编:十平台全部可点亮。
     #[test]
     fn frontend_ready_platforms() {
         let ready: Vec<&str> = registry()
@@ -216,7 +227,8 @@ mod tests {
                 "openclaw",
                 "hermes",
                 "claude-desktop",
-                "workbuddy"
+                "workbuddy",
+                "cursor"
             ]
         );
     }
@@ -226,15 +238,16 @@ mod tests {
     fn find_is_case_insensitive() {
         assert_eq!(find("Claude").unwrap().id, "claude");
         assert_eq!(find(" Claude-Desktop ").unwrap().id, "claude-desktop");
-        assert!(find("cursor").is_none());
+        assert_eq!(find("Cursor").unwrap().id, "cursor");
+        assert!(find("vscode").is_none());
     }
 
-    /// registry_json 结构:agents 数组 9 项,每项带完整字段。
+    /// registry_json 结构:agents 数组 10 项,每项带完整字段。
     #[test]
     fn registry_json_shape() {
         let v = registry_json();
         let arr = v["agents"].as_array().unwrap();
-        assert_eq!(arr.len(), 9);
+        assert_eq!(arr.len(), 10);
         for m in arr {
             assert!(m["id"].is_string());
             assert!(m["name"].is_string());

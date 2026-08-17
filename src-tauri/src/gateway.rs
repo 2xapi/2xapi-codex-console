@@ -132,6 +132,15 @@ pub async fn proxy_hermes_chat(
     dispatch(&s, req, "chat/completions", "hermes").await
 }
 
+/// Cursor 流量转发入口(`/cursor/*`;Cursor vscdb 托管 base=网关+/v1,客户端直发 chat/completions)。
+/// 取 agent=cursor 的 active 供应商(与 hermes 同模式)。
+pub async fn proxy_cursor_chat(
+    State(s): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> Response<Body> {
+    dispatch(&s, req, "chat/completions", "cursor").await
+}
+
 /// OpenCode 流量转发入口(`/opencode/*`;opencode 条目 baseURL=网关+/opencode/v1,
 /// npm openai-compatible 追加 /chat/completions)。取 agent=opencode 的 active 供应商。
 pub async fn proxy_opencode_chat(

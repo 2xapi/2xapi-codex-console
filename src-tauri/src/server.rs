@@ -102,12 +102,20 @@ pub fn build_router(state: AppState) -> Router {
             "/hermes/chat/completions",
             post(crate::gateway::proxy_hermes_chat),
         )
+        // Cursor 入口(F 阶段;托管 base=网关+/v1,客户端直发 chat/completions)
+        .route(
+            "/cursor/v1/chat/completions",
+            post(crate::gateway::proxy_cursor_chat),
+        )
+        .route(
+            "/cursor/chat/completions",
+            post(crate::gateway::proxy_cursor_chat),
+        )
         // OpenCode/OpenClaw 入口(多平台 B 阶段收尾;条目 baseURL=网关+/{agent}/v1)
         .route(
             "/opencode/v1/chat/completions",
             post(crate::gateway::proxy_opencode_chat),
-        )
-        .route(
+        )        .route(
             "/opencode/chat/completions",
             post(crate::gateway::proxy_opencode_chat),
         )
@@ -1480,6 +1488,7 @@ async fn handle_agent_state(
         "opencode" => ok_env(crate::agents::opencode::state(&s.oc_home)),
         "openclaw" => ok_env(crate::agents::openclaw::state(&s.oclaw_home)),
         "claude-desktop" => ok_env(crate::agents::claude_desktop::state(&s.cd_home)),
+        "cursor" => ok_env(crate::agents::cursor::state(&s.cursor_home)),
         _ => agent_unsupported_response(),
     }
 }
@@ -1585,6 +1594,19 @@ async fn handle_agent_host(
                 .unwrap_or("")
                 .trim(),
         )),
+        "cursor" => agent_op_response(crate::agents::cursor::host(
+            &s.cursor_home,
+            &s.backup_dir,
+            &s.providers_path,
+            body.get("providerId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+            body.get("way")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -1615,6 +1637,10 @@ async fn handle_agent_unhost(
             &s.backup_dir,
         )),
         "claude-desktop" => agent_op_response(crate::agents::claude_desktop::unhost(&s.cd_home)),
+        "cursor" => agent_op_response(crate::agents::cursor::unhost(
+            &s.cursor_home,
+            &s.backup_dir,
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -2137,7 +2163,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v["data"]["agents"].as_array().unwrap();
-        assert_eq!(arr.len(), 9);
+        assert_eq!(arr.len(), 10);
         assert_eq!(arr[0]["id"], "codex");
         assert_eq!(arr[0]["available"], Value::Bool(true));
         assert_eq!(arr[1]["id"], "claude");
@@ -2145,6 +2171,9 @@ mod tests {
         assert!(arr
             .iter()
             .any(|m| m["id"] == "workbuddy" && m["available"] == Value::Bool(true)));
+        assert!(arr
+            .iter()
+            .any(|m| m["id"] == "cursor" && m["available"] == Value::Bool(true)));
         assert!(!arr.iter().any(|m| m["id"] == "pi"), "pi 已裁撤不得出现");
     }
 
@@ -2392,7 +2421,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/desktop/cursor/state")
+                    .uri("/api/desktop/vscode/state")
                     .body(Body::empty())
                     .unwrap(),
             )
