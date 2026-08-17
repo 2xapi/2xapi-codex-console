@@ -20,9 +20,10 @@
     }
     const payload = await resp.json().catch(() => ({}));
     if (payload && payload.ok === true) return payload.data;
-    // 错误信封兼容两种形态:04 契约 {error:{code,message,fields}};加速等路由 {error:"人话"(字符串)}
+    // 错误信封兼容形态:{error:{code,message,fields}} / {error:"人话"} / {error:{code}, message:"人话"}
     const e = (payload && payload.error) || null;
-    const err = new Error((typeof e === "string" ? e : (e && e.message)) || "请求失败 (" + resp.status + ")");
+    const errMsg = typeof e === "string" ? e : ((e && e.message) || payload.message || "");
+    const err = new Error(errMsg || "请求失败 (" + resp.status + ")");
     err.code = (e && typeof e === "object" && e.code) || "E_UNKNOWN";
     err.fields = (e && e.fields) || null;
     err.status = resp.status;
@@ -63,6 +64,21 @@
     fetchBalance: (id) => request("POST", "/api/providers/fetch-balance", { body: { id } }),
     // ── 健康（不走信封，04 §2）──
     health: async () => (await fetch("/health")).json(),
+    // ── 关于:版本(后端 /api/version 不存在时回退 1.0.0);检查更新(优先后端路由,否则直连 GitHub,容错)──
+    version: async () => {
+      try { return await request("GET", "/api/version"); }
+      catch (e) { return { version: "1.0.0" }; }
+    },
+    checkUpdate: async () => {
+      try { return await request("GET", "/api/check-update"); }
+      catch (e) {
+        // 后端无 /api/check-update 路由 → 直连 GitHub Releases(可能被 CSP 拦,失败上抛给调用方容错)
+        const r = await fetch("https://api.github.com/repos/2xapi/2xapi-codex-console/releases/latest", { credentials: "omit" });
+        const v = await r.json().catch(function () { return {}; });
+        if (!r.ok || !v.tag_name) throw new Error("GitHub Releases 不可达");
+        return { latest: String(v.tag_name).replace(/^v/, "") };
+      }
+    },
 
     // ── 2xapi 登录子系统（契约外，key 获取入口；这些路由是 raw 响应，不走 04 信封）──
     session: async () => rawJson("GET", "/api/session"),

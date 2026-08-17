@@ -7,6 +7,7 @@
 //! - 四挂载点声明永久冻结:media_parse | tool_exec | proto_convert | dispatch
 
 use crate::registry;
+use crate::server::AppState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Map, Value};
@@ -588,13 +589,101 @@ async fn handle_invoke(
     {
         match entry.id.as_str() {
             "ffmpeg-frame-extract" => return builtin_frame_extract(&s.codex_home, &body).await,
-            "image-describe" => return crate::media_tools::image_describe(&s, &body).await,
-            "image-generate" => return crate::media_tools::image_generate(&s, &body).await,
-            "image-edit" => return crate::media_tools::image_edit(&s, &body).await,
+            "image-describe" => {
+                return builtin_media_failover(&s, &entry, &body, MediaTool::Describe).await
+            }
+            "image-generate" => {
+                return builtin_media_failover(&s, &entry, &body, MediaTool::Generate).await
+            }
+            "image-edit" => {
+                return builtin_media_failover(&s, &entry, &body, MediaTool::Edit).await
+            }
             _ => {} // ASR/TTS 等无本机实现 → 走 models 配置端点调用链(未配置即人话引导)
         }
     }
     invoke_with_failover(&entry, &body).await
+}
+
+/// 内置媒体工具分发(media_tools 三函数签名同构,枚举免去泛型 future 生命周期体操)。
+enum MediaTool {
+    Describe,
+    Generate,
+    Edit,
+}
+
+/// 内置媒体工具(识图/文生图/图编辑)故障转移,复用 http 型链模式:
+/// 条目配置了 models 且 failover 开启 → 按 models 优先级逐个尝试(主败切备用,全败聚合人话),
+/// 每个模型注入 model/api 覆盖进请求体(media_tools 的 api_base 据此换端点);
+/// 未配置(models 空)→ 原行为(active 供应商直连);单模型/关 failover → 只试主模型。
+async fn builtin_media_failover(
+    s: &AppState,
+    entry: &registry::Entry,
+    body: &Value,
+    tool: MediaTool,
+) -> Response {
+    let models = user_models(entry);
+    if models.is_empty() {
+        return match tool {
+            MediaTool::Describe => crate::media_tools::image_describe(s, body).await,
+            MediaTool::Generate => crate::media_tools::image_generate(s, body).await,
+            MediaTool::Edit => crate::media_tools::image_edit(s, body).await,
+        };
+    }
+    let failover = entry
+        .config
+        .get("failover")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let pool: Vec<&Value> = if models.len() == 1 || !failover {
+        vec![&models[0]]
+    } else {
+        models.iter().collect()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for (i, m) in pool.iter().enumerate() {
+        let label = if i == 0 { "主模型" } else { "备用模型" };
+        let mid = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let api = m.get("api").and_then(|v| v.as_str()).unwrap_or("");
+        let mut req = body.clone();
+        req["model"] = json!(mid);
+        if !api.is_empty() {
+            req["api"] = json!(api);
+        }
+        let resp = match tool {
+            MediaTool::Describe => crate::media_tools::image_describe(s, &req).await,
+            MediaTool::Generate => crate::media_tools::image_generate(s, &req).await,
+            MediaTool::Edit => crate::media_tools::image_edit(s, &req).await,
+        };
+        let bytes = match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
+            Ok(b) => b,
+            Err(_) => {
+                parts.push(format!("{label} {mid} 失败(响应读取失败)"));
+                continue;
+            }
+        };
+        let v: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                parts.push(format!("{label} {mid} 失败(响应非 JSON)"));
+                continue;
+            }
+        };
+        // 媒体工具契约:成功/业务失败均包 200(ok:true 才放行,失败切备用)
+        if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+            return raw_json(StatusCode::OK, &v);
+        }
+        let reason = v["error"]["human"]
+            .as_str()
+            .or_else(|| v["error"]["message"].as_str())
+            .unwrap_or("业务错误")
+            .to_string();
+        parts.push(format!("{label} {mid} 失败({reason})"));
+    }
+    err_env(
+        StatusCode::BAD_GATEWAY,
+        "E_PLUGIN_FAILOVER",
+        &format!("{}。请检查配置或稍后重试", parts.join(",")),
+    )
 }
 
 /// models 优先级:用户配置(config.models)优先,退 manifest 声明(meta.models)。
@@ -2016,5 +2105,154 @@ mod market_tests {
             !v["error"]["message"].as_str().unwrap().contains("备用"),
             "不应尝试备用: {v}"
         );
+    }
+
+    /// 内置媒体工具故障转移:models 配置下按优先级逐个尝试(主失败切备用,注入 model/api),
+    /// 全败聚合人话;未配置 models → 原行为(active 供应商直连)。
+    #[tokio::test]
+    async fn builtin_media_failover_chain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        // mock chat 上游:按请求体 model 分流(bad → 500,good → 成功)
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_c = seen_c.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    loop {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                let s = String::from_utf8_lossy(&buf);
+                                if let Some(i) = s.find("\r\n\r\n") {
+                                    let cl = s[..i]
+                                        .lines()
+                                        .find(|l| l.to_lowercase().starts_with("content-length:"))
+                                        .and_then(|l| l.split(':').nth(1))
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                        .unwrap_or(0);
+                                    if buf.len() >= i + 4 + cl {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).into_owned();
+                    seen_c.lock().unwrap().push(req.clone());
+                    let (status, body) = if req.contains("\"bad\"") {
+                        (500, r#"{"error":{"message":"boom"}}"#.to_string())
+                    } else {
+                        (
+                            200,
+                            r#"{"choices":[{"message":{"content":"红色"},"finish_reason":"stop"}]}"#
+                                .to_string(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        if status == 200 { "OK" } else { "Internal Server Error" },
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        let root = std::env::temp_dir().join(format!("2xapi-plugbuiltin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let st = mk_state(&root);
+        std::fs::write(
+            &st.providers_path,
+            json!({
+                "schema_version": 3, "active_provider_id": "p1",
+                "providers": [{ "id": "p1", "name": "t", "agent": "codex", "base_url": base, "api_key": "sk-t", "model": "m1" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let img = root.join("pic.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+
+        // 主模型 500 → 切备用成功(备用模型名进入响应)
+        let entry = entry_with_models(
+            json!([
+                {"id":"bad","api":"","note":"主"},
+                {"id":"good","api":"","note":"备"}
+            ]),
+            true,
+        );
+        let v = body_of(
+            builtin_media_failover(
+                &st,
+                &entry,
+                &json!({ "media_url": img.to_str().unwrap(), "prompt": "什么颜色?" }),
+                MediaTool::Describe,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["ok"], true, "主失败应切备用: {v}");
+        assert_eq!(v["data"]["text"], "红色");
+        assert_eq!(v["data"]["model"], "good");
+        {
+            let reqs = seen.lock().unwrap();
+            assert!(reqs.iter().any(|r| r.contains("\"bad\"")), "应先试主模型");
+            assert!(reqs.iter().any(|r| r.contains("\"good\"")), "再试备用模型");
+        }
+
+        // 全败 → 聚合人话
+        let entry2 = entry_with_models(
+            json!([
+                {"id":"bad","api":"","note":"主"},
+                {"id":"bad","api":"","note":"备"}
+            ]),
+            true,
+        );
+        let v2 = body_of(
+            builtin_media_failover(
+                &st,
+                &entry2,
+                &json!({ "media_url": img.to_str().unwrap(), "prompt": "什么颜色?" }),
+                MediaTool::Describe,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v2["ok"], false);
+        assert!(
+            v2["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("主模型 bad"),
+            "全败聚合: {v2}"
+        );
+
+        // 未配置 models → 原行为(active 供应商默认模型直连,成功)
+        let entry3 = entry_with_models(json!([]), true);
+        let v3 = body_of(
+            builtin_media_failover(
+                &st,
+                &entry3,
+                &json!({ "media_url": img.to_str().unwrap(), "prompt": "什么颜色?" }),
+                MediaTool::Describe,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v3["ok"], true, "未配置 models 走原行为: {v3}");
+        assert_eq!(v3["data"]["model"], "m1");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -21,6 +21,8 @@ var state = {
   setTab: "ip",        // 设置五分区
   sessions: null,      // GET /api/sessions items
   sessionsTotal: 0,
+  sessionsPage: 0,     // 已加载到第几页(50/页;首屏 50 + 加载更多)
+  sessionsLoading: false,
   sessionsSettings: null,
   sessionsRepairing: false,
   claudeSessions: null,      // GET /api/claude/sessions items(null=未加载/加载中;只读展示,无修复/删除)
@@ -38,6 +40,9 @@ var state = {
   busy: null,          // 进行中动作
   loginEmail: "", loginPassword: "", loginError: "", remembered: false,
   balShow: true,       // 顶栏实时余额开关(localStorage 持久)
+  aboutVersion: null,  // GET /api/version(后端未实现时回退 "1.0.0")
+  checkingUpdate: false,
+  updateState: null,   // null | {latest} | {err:true}(关于页「检查更新」结果)
   confirmCb: null,
   toastTimer: null,
 };
@@ -88,6 +93,15 @@ function loggedIn() {
 function sessionEmail() {
   var s = state.session || {};
   return (s.user && s.user.email) || s.email || "";
+}
+/* 平台注册表(/api/desktop/agents,id→name):供应商栏/空态平台名用;拉取前或未知 agent 回退首字母大写 */
+var AGENTS_REG = {};
+function agentName(g) {
+  if (AGENTS_REG[g]) return AGENTS_REG[g];
+  if (g === "codex") return "Codex";
+  if (g === "claude") return "Claude";
+  if (g === "hermes") return "Hermes";
+  return (g || "?").charAt(0).toUpperCase() + String(g || "").slice(1);
 }
 function fmtTime(ms) {
   if (!ms) return "—";
@@ -269,13 +283,12 @@ function renderNav() {
 }
 function renderRail() {
   var el = document.getElementById("railList"); if (!el) return;
-  var isC = state.agent === "claude";
-  var who = isC ? "Claude" : "Codex";
+  var who = agentName(state.agent);
   var mine = providersFor(state.agent);
   if (!mine.length) {
     el.innerHTML =
       '<div class="rail-head"><span class="eyebrow">' + who + ' 供应商</span><span class="tag">0</span></div>'
-      + '<div class="sub" style="padding:8px 2px">' + (isC ? "还没有 Claude 的供应商。" : "还没有供应商。") + '<br>' + (loggedIn() ? "登录后一键导入,或点下方「＋ 新建」。" : "登录 2xapi 一键导入,或点下方「＋ 新建」。") + '</div>'
+      + '<div class="sub" style="padding:8px 2px">还没有 ' + who + ' 的供应商。<br>' + (loggedIn() ? "登录后一键导入,或点下方「＋ 新建」。" : "登录 2xapi 一键导入,或点下方「＋ 新建」。") + '</div>'
       + '<button class="btn ghost" data-a="new" style="width:100%;margin-top:8px">＋ 新建供应商</button>';
     return;
   }
@@ -683,7 +696,7 @@ var GW_META = {
   "opencode":     { label: "OpenCode", emoji: "◐", gw: "127.0.0.1:8787/opencode", overlay: "叠加条目写入 opencode.json(provider.2xapi-gateway),已有供应商与插件零触碰;默认模型仅空缺时才接" },
   "openclaw":     { label: "OpenClaw", emoji: "🐾", gw: "127.0.0.1:8787/openclaw", overlay: "叠加条目写入 openclaw.json(models.providers),OpenClaw 自管理的派生注册表不碰;默认模型仅空缺时才接" },
   "claude-desktop": { label: "Claude 桌面版", emoji: "◇", gw: "127.0.0.1:8787/claude-desktop", overlay: "官方原生 3p 网关 profile(配置库写入);改配置后需重启 Claude Desktop 生效", restart: true },
-  "workbuddy":    { label: "WorkBuddy / CodeBuddy", emoji: "◆", gw: "127.0.0.1:8787/workbuddy", overlay: "叠加条目写入 models.json(双载体同步),已有条目零触碰" },
+  "workbuddy":    { label: "WorkBuddy / CodeBuddy", emoji: "◆", gw: "127.0.0.1:8787/workbuddy", overlay: "叠加条目写入 models.json(双载体同步),已有条目零触碰", start: true },
   "cursor":       { label: "Cursor", emoji: "⌘", gw: "127.0.0.1:8787/cursor", overlay: "托管写入 Cursor 的 state.vscdb(aiSettings 两字段 + Key 明文自动迁移钥匙串),登录态与其他配置零触碰;托管需先退出 Cursor;还原按快照精确恢复", restart: true }
 };
 var GW_AGENTS = {}; Object.keys(GW_META).forEach(function (k) { GW_AGENTS[k] = 1; });
@@ -815,19 +828,22 @@ function hermesDashHtml() {
  * 后端契约:GET|POST /api/desktop/:agent/eco(信封 data={servers});手动条目只读(409 拒写)。
  * 总部修订(2026-08-17):三 tab 设计作废,生态管理=MCP 单页;平台清单来自 /api/desktop/eco-presets。 */
 var ECO_STATE = { agent: "codex", data: null, presets: null, agentsList: null, loading: false, pendingInstall: null, pendingParams: {} };
-/* eco 支持平台(与后端 SUPPORTED 同步;世界内嵌生态入口按此渲染) */
-var ECO_SUPPORTED_IDS = { codex: 1, cursor: 1, "claude-desktop": 1, grokbuild: 1, opencode: 1, hermes: 1, trae: 1 };
+/* eco 支持平台(与后端 SUPPORTED 10 平台对齐;世界内嵌生态入口按此渲染) */
+var ECO_SUPPORTED_IDS = { codex: 1, cursor: 1, claude: 1, "claude-desktop": 1, grokbuild: 1, opencode: 1, hermes: 1, trae: 1, workbuddy: 1, openclaw: 1 };
 function loadEco(force) {
+  var agent = ECO_STATE.agent; /* 发起时的 agent;异步回填前校验,防 tab 切换竞态 */
   ECO_STATE.loading = true; render();
   var p = api.ecoPresets().then(function (v) {
     ECO_STATE.presets = (v && v.presets) || [];
     ECO_STATE.agentsList = (v && v.agents) || [];
   }).catch(function () { ECO_STATE.presets = []; ECO_STATE.agentsList = []; });
-  var l = api.ecoList(ECO_STATE.agent).then(function (v) {
+  var l = api.ecoList(agent).then(function (v) {
+    if (ECO_STATE.agent !== agent) return; /* 已切平台,丢弃过期回填 */
     ECO_STATE.data = v;
   }).catch(function (e) {
+    if (ECO_STATE.agent !== agent) return;
     ECO_STATE.data = { error: e.message };
-  }).finally(function () { ECO_STATE.loading = false; });
+  }).finally(function () { if (ECO_STATE.agent === agent) ECO_STATE.loading = false; });
   loadPlug();
   return Promise.all([p, l]).then(function () { if (state.view === "eco") render(); });
 }
@@ -1185,6 +1201,7 @@ function plug2IconById(id) {
   return ICONS[id] || "🔌";
 }
 /* 条目归一:后端驼峰契约字段 → 前端统一形状(缺失字段兜默认) */
+/* config_values/failover/models 是用户已存配置(详情返回),必须保留进条目供配置页回显 */
 function plug2NormEntry(p) {
   p = p || {};
   return {
@@ -1193,7 +1210,8 @@ function plug2NormEntry(p) {
     mount: p.mount || "", desc: p.desc || p.short_desc || "", power: p.power || "",
     input: p.input || {}, output: p.output || {},
     tags: p.tags || [], scenes: p.scenes || [], config: p.config || [], models: p.models || [],
-    md: p.md || "", docs: p.docs || "", ui: !!p.ui, status: p.status || ""
+    md: p.md || "", docs: p.docs || "", ui: !!p.ui, status: p.status || "",
+    config_values: p.config_values || null, failover: p.failover
   };
 }
 /* 市场契约形状检查:batch A 新字段(cap/tags/md)缺失 = 后端未就绪 → 回退演示数据 */
@@ -1227,15 +1245,20 @@ function plug2Models(p) {
     { model: "glm-5-flash", ep: "bigmodel.cn /v1", note: "低成本兜底" },
   ];
 }
-/* 配置页状态:models 行 / 参数值 / 故障转移开关(仅 UI 态,保存时组包提交) */
+/* 配置页状态:models 行 / 参数值 / 故障转移开关(仅 UI 态,保存时组包提交)。
+ * 已存配置优先(config_values/failover 来自详情),manifest def 兜底——ASR 保存 apiBase 后重开要回显。 */
 function plug2CfgState(p) {
   if (!PLUG2.cfgModels || PLUG2.cfgModels.id !== p.id) {
     PLUG2.cfgModels = { id: p.id, rows: plug2Models(p) };
     PLUG2.cfgVals = {};
+    var saved = p.config_values || {};
     (p.config || []).forEach(function (c) {
-      PLUG2.cfgVals[c.k] = (c.def !== undefined && c.def !== null) ? c.def : ((c.options && c.options.length) ? c.options[0] : "");
+      var sv = saved[c.k];
+      PLUG2.cfgVals[c.k] = (sv !== undefined && sv !== null && sv !== "")
+        ? sv
+        : ((c.def !== undefined && c.def !== null) ? c.def : ((c.options && c.options.length) ? c.options[0] : ""));
     });
-    PLUG2.cfgFailover = true;
+    PLUG2.cfgFailover = (p.failover === undefined || p.failover === null) ? true : !!p.failover;
   }
   return PLUG2.cfgModels;
 }
@@ -1289,11 +1312,14 @@ function plug2OpenDetail(id, dt) {
   render();
   if (PLUG2.mode !== "api") return;
   api.plugDetail(id).then(function (v) {
-    var e = (v && v.id) ? v : ((v && v.plugin) || null);
+    /* 详情契约 {ok:true, data:{manifest全量+config_values/failover/models}};部分实现直接返回条目对象 */
+    var e = (v && v.data && v.data.id) ? v.data : ((v && v.id) ? v : ((v && v.plugin) || null));
     if (!e) return;
     var i = PLUG2.data.findIndex(function (x) { return x.id === id; });
     if (i < 0) PLUG2.data.push(plug2NormEntry(e));
     else PLUG2.data[i] = plug2NormEntry(e);
+    /* 详情带回已存配置 → 重置配置页缓存,让回显用已存值而非 manifest def(首帧可能已按旧条目建缓存) */
+    PLUG2.cfgModels = null; PLUG2.cfgVals = null; PLUG2.cfgFailover = undefined;
     if (state.view === "plug" && PLUG2.tab === "detail" && PLUG2.detail === id) render();
   }).catch(function () { /* 详情失败维持市场数据 */ });
 }
@@ -1395,8 +1421,10 @@ function plugCenterHtml() {
 /* ── 市场页:搜索 / 分类 / 列表(行 = 图标+名称+作者·版本·挂载点 | 能力 | 输入→输出 | 标签 | 状态 | 操作)── */
 function plug2MarketHtml() {
   var cats = ["all", "识图", "文生图", "图编辑", "抽帧", "语音"];
+  /* 分类归一:后端 cap 用 ASR/TTS,前端分类叫「语音」——按映射表归一后过滤 */
+  var CAT_OF = { "ASR": "语音", "TTS": "语音" };
   var list = PLUG2.data.filter(function (p) {
-    if (PLUG2.cat !== "all" && p.cap !== PLUG2.cat) return false;
+    if (PLUG2.cat !== "all" && (CAT_OF[p.cap] || p.cap) !== PLUG2.cat) return false;
     if (PLUG2.q && (p.name + p.desc + (p.tags || []).join(" ")).toLowerCase().indexOf(PLUG2.q.toLowerCase()) < 0) return false;
     return true;
   });
@@ -1697,6 +1725,11 @@ function historyHtml() {  if (state.agent === "hermes") {
         + '<button class="btn sm ghost" data-a="sess-continue" data-i="' + esc(it.id) + '">继续</button></div>';
     }).join("");
   }
+  /* 首屏 50 条 + 加载更多(50/页追加);还有下一页才出按钮 */
+  if (s && s.length && s.length < state.sessionsTotal) {
+    listHtml += '<button class="btn ghost" data-a="sess-more" style="width:100%;margin-top:8px"' + (state.sessionsLoading ? " disabled" : "") + '>'
+      + (state.sessionsLoading ? "加载中…" : "加载更多") + '</button>';
+  }
   var autoOn = !!(state.sessionsSettings && state.sessionsSettings.autoRepairBeforeHost);
   return '<section class="card" style="min-height:100%"><h2>历史会话</h2>'
     + '<div class="sub">Codex 对话记录(~/.codex 统一保存);修复前自动备份。共 <b>' + state.sessionsTotal + '</b> 条。</div>'
@@ -1706,15 +1739,23 @@ function historyHtml() {  if (state.agent === "hermes") {
     + '</div>'
     + '<div style="margin-top:10px">' + listHtml + '</div></section>';
 }
-async function loadSessions() {
+/* Codex 会话列表:reset=true 重拉首页;false 追加下一页(50/页)——与 Claude 侧 csess-more 同构 */
+async function loadSessions(reset) {
+  if (reset !== false) { state.sessions = null; state.sessionsPage = 0; }
+  state.sessionsLoading = true;
+  render();
+  var page = (state.sessionsPage || 0) + 1;
   try {
-    var d = await api.sessions(1, 50, "");
-    state.sessions = d.items || [];
+    var d = await api.sessions(page, 50, "");
+    var items = d.items || [];
+    state.sessions = page === 1 ? items : (state.sessions || []).concat(items);
     state.sessionsTotal = d.total || 0;
+    state.sessionsPage = page;
   } catch (e) {
-    state.sessions = [];
+    if (reset !== false) state.sessions = [];
     showToast("获取会话失败:" + e.message, "error");
   }
+  state.sessionsLoading = false;
   render();
 }
 async function loadSessionsSettings() {
@@ -2239,10 +2280,13 @@ function setIpHtml() {
     + '<div class="sub" style="margin-bottom:6px">官方内置自动下发(本期只读展示);自己的代理随时加,仅本机保存。加速开启时从「已启用」线路混合择优。</div>'
     + '<div class="eyebrow" style="margin:8px 0 6px">官方内置(自动下发 · 只读)</div>'
     + (offLines.length ? offLines.map(function (l) {
+      var healthTags = "";
+      if (l.fails > 0) healthTags += '<span class="tag" style="border-color:var(--c-err);color:var(--c-err)">fails ' + l.fails + '</span>';
+      if (l.available === false) healthTags += '<span class="tag" style="border-color:var(--c-err);color:var(--c-err)">已摘除</span>';
       return '<div class="hist-row"><b style="min-width:92px">' + esc(l.name) + '</b>'
         + '<span class="meta" style="font-family:var(--mono);font-size:11px">' + esc(l.endpoint || l.scope || "自动下发") + '</span>'
         + '<span class="tag" style="border-color:var(--c-gw);color:var(--c-gw)">官方</span>'
-        + '<span class="tag">' + (l.latency ? l.latency + "ms" : "—") + '</span></div>';
+        + '<span class="tag">' + (l.latency ? l.latency + "ms" : "—") + '</span>' + healthTags + '</div>';
     }).join("") : '<div class="sub" style="padding:4px 0">暂无官方线路下发。</div>')
     + '<div class="eyebrow" style="margin:14px 0 6px">我的代理(自己添加 · 仅本机保存)</div>'
     + (myEp
@@ -2251,7 +2295,7 @@ function setIpHtml() {
         + '<span class="tag">我的</span>'
         + '<button class="btn sm ghost danger" data-a="ipm-del">删除</button></div>'
       : '<div class="sub" style="padding:4px 0">还没有自己的代理;在下面添加一条。</div>')
-    + '<div class="mg-tools" style="margin-top:8px"><input class="mono" id="ipmNew" data-a="ipm-new-input" style="flex:1;min-width:0;padding:6px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);font:11.5px var(--mono)" placeholder="socks5://127.0.0.1:7890 或 http://用户:密码@你的VPS:443" value="' + esc(nodeVal) + '">'
+    + '<div class="mg-tools" style="margin-top:8px"><input class="mono" id="ipmNew" data-a="ipm-new-input" style="flex:1;min-width:0;padding:6px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);font:11.5px var(--mono)" placeholder="https://你的节点:端口 或 http://用户:密码@你的VPS:443" value="' + esc(nodeVal) + '">'
     + '<button class="btn primary" data-a="ipm-add"' + (state.busy === "ipm" ? " disabled" : "") + '>＋ 添加</button>'
     + '<button class="btn ghost" data-a="ipm-test"' + (state.busy === "ipm" ? " disabled" : "") + '>测试连通</button></div>'
     + testHtml
@@ -2324,7 +2368,7 @@ function setUsageHtml() {
         + '<span class="tag">P50 ' + (p.p50Ms != null ? p.p50Ms + "ms" : "—") + '</span>'
         + '<span class="tag">P90 ' + (p.p90Ms != null ? p.p90Ms + "ms" : "—") + '</span>'
         + '<span class="tag">成功率 ' + okRate + '</span>'
-        + (p.lastTs ? '<span class="tag">' + fmtTime(p.lastTs) + '</span>' : '')
+        + (p.lastTs ? '<span class="tag">' + fmtTime(p.lastTs * 1000) + '</span>' : '')
         + (p.routes && p.routes.length ? '<div class="sub" style="width:100%;font-family:var(--mono);font-size:11px">' + esc(p.routes.join(" · ")) + '</div>' : '')
         + '</div>';
     }).join("");
@@ -2347,6 +2391,14 @@ async function doUsageRefresh() {
   renderSettings();
 }
 function setAccountHtml() {
+  if (!loggedIn()) {
+    /* 未登录:显示「未登录」+ 提示去顶栏登录,不再渲染空邮箱的「已登录」 */
+    return '<h3 style="margin:2px 0 4px;font-size:13.5px">账号</h3>'
+      + setRow('未登录', '<button class="btn sm ghost" data-a="login">登录 2xapi</button>',
+        '登录后可一键导入 Key、查看余额;登录入口在顶栏右侧')
+      + setRow('一键导入 Key', '<span class="tag">入口在顶栏 ⇭</span>', '顶栏蓝色入口,登录后即见——这是最常用的动作,不藏在这里')
+      + setRow('顶栏实时余额', '<button class="btn sm ghost" data-a="bal-toggle">' + (state.balShow ? "开" : "关") + '</button>', '余额不足 $1 时警示变色');
+  }
   var email = sessionEmail();
   var bal = state.balance;
   var balText = bal == null ? "…" : (bal < 0 ? "-" : "") + "$" + Math.abs(bal).toFixed(2);
@@ -2400,13 +2452,50 @@ function setAdvancedHtml() {
     + '<button class="btn sm danger" data-a="restore-official" style="margin-top:6px">执行恢复</button></div>';
 }
 function setAboutHtml() {
+  /* 惰性拉取版本号(仿 setAccountHtml 的 remembered 模式;失败回退 1.0.0) */
+  if (state.aboutVersion === null) {
+    api.version().then(function (v) {
+      state.aboutVersion = (v && v.version) || "1.0.0";
+      if (state.setTab === "about") renderSettings();
+    }).catch(function () {
+      state.aboutVersion = "1.0.0";
+      if (state.setTab === "about") renderSettings();
+    });
+  }
+  var ver = "v" + (state.aboutVersion || "1.0.0");
+  var upd = state.updateState;
+  var updHint = upd && upd.err
+    ? '<button class="btn sm ghost" data-a="about-update-link">GitHub Releases</button> 请到 Releases 查看最新版本'
+    : (upd && upd.latest ? '发现新版本 <b>v' + esc(upd.latest) + '</b> <button class="btn sm ghost" data-a="about-update-link">去下载</button>'
+      : '联网对比 GitHub Releases 最新版本');
   return '<h3 style="margin:2px 0 4px;font-size:13.5px">关于</h3>'
     + '<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--hair)">'
     + '<img src="brand-logo.svg" alt="2xapi" style="width:48px;height:48px;border-radius:12px;object-fit:cover;flex:none">'
-    + '<div style="min-width:0"><div style="font-size:13.5px;font-weight:600">2xapi Codex Console <span class="tag">v1.0.0</span></div>'
+    + '<div style="min-width:0"><div style="font-size:13.5px;font-weight:600">2xapi Codex Console <span class="tag">' + ver + '</span></div>'
     + '<div class="sub" style="margin-top:2px">让桌面版 Codex 一键走中转站</div></div></div>'
-    + setRow('检查更新', '<button class="btn sm ghost" data-a="about-update">检查</button>', '')
+    + setRow('检查更新', '<button class="btn sm ghost" data-a="about-update"' + (state.checkingUpdate ? " disabled" : "") + '>' + (state.checkingUpdate ? "检查中…" : "检查") + '</button>', updHint)
     + '<div class="sub" style="margin-top:10px">本软件为专有许可(Proprietary),仅供授权使用;Codex 与 Claude 的名称及图标归其各自所有方。</div>';
+}
+async function doCheckUpdate() {
+  if (state.checkingUpdate) return;
+  state.checkingUpdate = true; renderSettings();
+  var cur = state.aboutVersion || "1.0.0";
+  try {
+    var r = await api.checkUpdate();
+    var latest = (r && r.latest) || "";
+    if (latest && latest !== cur) {
+      state.updateState = { latest: latest };
+      showToast("发现新版本 v" + latest + ",点「去下载」查看 GitHub Releases", "ok");
+    } else {
+      state.updateState = { latest: latest || cur };
+      showToast("已是最新版本 " + (latest || cur), "ok");
+    }
+  } catch (e) {
+    state.updateState = { err: true };
+    showToast("检查失败,请稍后再试;最新版本见 GitHub Releases", "error");
+  }
+  state.checkingUpdate = false;
+  renderSettings();
 }
 async function doRestoreOfficial() {
   var yes = await askConfirm("恢复官方配置?", "清除本软件写入的全部托管痕迹(config 托管段 / auth Key),~/.codex 回到官方初始状态;操作前自动备份,可从 备份 找回。");
@@ -2802,6 +2891,7 @@ document.addEventListener("click", function (ev) {
     case "diag": doDiag(); break;
     case "test": doTestConnection(); break;
     case "sess-continue": showToast("继续历史会话:请在桌面版 Codex 里打开对应对话", "ok"); break;
+    case "sess-more": loadSessions(false); break;
     case "sess-repair": doSessionsRepair(); break;
     case "csess-refresh": loadClaudeSessions(true); break;
     case "csess-more": loadClaudeSessions(false); break;
@@ -2812,7 +2902,11 @@ document.addEventListener("click", function (ev) {
         showToast("运行日志摘要:会话 " + stt.total + " 个 · 记录 " + stt.rolloutTotal + " 条", "ok");
       }).catch(function () { showToast("运行日志界面后置,可查看 ~/.codex 目录", "ok"); });
       break;
-    case "about-update": showToast("已是最新版本 v1.0.0", "ok"); break;
+    case "about-update": doCheckUpdate(); break;
+    case "about-update-link":
+      api.openUrl("https://github.com/2xapi/2xapi-codex-console/releases/latest").then(function () { showToast("已在浏览器打开 GitHub Releases", "ok"); })
+        .catch(function (e) { showToast("打开失败,请手动访问 github.com/2xapi/2xapi-codex-console/releases(" + e.message + ")", "error"); });
+      break;
   }
 });
 
@@ -2929,11 +3023,13 @@ var GW_NAV_COLOR = {
 };
 function injectNavAgents() {
   return api.agents().then(function (reg) {
+    var list = (reg && reg.agents) || [];
+    list.forEach(function (m) { AGENTS_REG[m.id] = m.name; }); /* 注册表名供供应商栏/空态用 */
     var statics = Array.prototype.map.call(document.querySelectorAll('.nav .nav-btn.agent'), function (b) { return b.dataset.g; });
     var anchor = document.querySelectorAll('.nav .nav-btn.agent');
     anchor = anchor.length ? anchor[anchor.length - 1] : null;
     if (!anchor || anchor.dataset.navInjected) return;
-    var rest = ((reg && reg.agents) || []).filter(function (m) { return statics.indexOf(m.id) < 0; });
+    var rest = list.filter(function (m) { return statics.indexOf(m.id) < 0; });
     if (!rest.length) return;
     anchor.dataset.navInjected = "1";
     var html = rest.map(function (m) {

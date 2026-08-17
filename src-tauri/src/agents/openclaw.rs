@@ -319,6 +319,19 @@ pub fn unhost(oclaw_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
     )
 }
 
+/// POST /api/desktop/openclaw/start —— 未托管 409;托管后返回直接运行提示
+/// (openclaw 为整平台托管,条目含真实 base/key,命令本体无需 env 前缀,providerId 仅回显)。
+pub fn start(
+    oclaw_home: &Path,
+    providers_path: &Path,
+    provider_id: &str,
+) -> Result<Value, OpError> {
+    if state(oclaw_home)["hosting"].is_null() {
+        return Err((409, "E_NOT_HOSTED".into(), "请先托管,再启动".into()));
+    }
+    super::cli_start_response(providers_path, provider_id, "openclaw agent")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +457,25 @@ mod tests {
         assert_eq!(u["defaultModelRemoved"], json!(true));
         let s2 = state(&home);
         assert!(s2["hosting"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// start:未托管 409;托管后返回直接运行提示(providerId 仅回显)。
+    #[test]
+    fn start_requires_hosting_and_returns_command() {
+        let (home, backup, root) = setup("start");
+        let prov = fixture(&root, "chat_completions", "https://x.example");
+        // 未托管 → 409 人话
+        let err = start(&home, &prov, "p1").unwrap_err();
+        assert_eq!(err.0, 409);
+        assert_eq!(err.1, "E_NOT_HOSTED");
+        // 托管后 → 直接运行 CLI 提示
+        host(&home, &backup, &prov, "p1", "gateway").unwrap();
+        let v = start(&home, &prov, "p1").unwrap();
+        assert_eq!(v["command"], "openclaw agent");
+        assert_eq!(v["providerId"], "p1");
+        assert_eq!(v["providerName"], "t");
+        assert!(v["note"].as_str().unwrap().contains("直接运行 CLI"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

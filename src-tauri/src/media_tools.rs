@@ -44,6 +44,14 @@ fn api_url(base_url: &str, path: &str) -> String {
     }
 }
 
+/// 端点覆盖:body.api(内置工具故障转移链注入的备用端点)优先,否则供应商 base_url。
+fn api_base<'a>(p: &'a Provider, body: &'a Value) -> &'a str {
+    body.get("api")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&p.base_url)
+}
+
 /// 供应商解析:body.provider_id 指定,否则 active。
 fn resolve_provider(s: &AppState, body: &Value) -> Result<Provider, Box<Response>> {
     let pid = body
@@ -235,7 +243,7 @@ pub async fn image_describe(s: &AppState, body: &Value) -> Response {
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap_or_default();
-    let url = api_url(&p.base_url, "/chat/completions");
+    let url = api_url(api_base(&p, body), "/chat/completions");
     let resp = client
         .post(&url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
@@ -396,7 +404,7 @@ pub async fn image_generate(s: &AppState, body: &Value) -> Response {
         .build()
         .unwrap_or_default();
     let resp = match client
-        .post(api_url(&p.base_url, "/images/generations"))
+        .post(api_url(api_base(&p, body), "/images/generations"))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
         .json(&req_body)
         .send()
@@ -509,7 +517,7 @@ pub async fn image_edit(s: &AppState, body: &Value) -> Response {
         .build()
         .unwrap_or_default();
     let resp = match client
-        .post(api_url(&p.base_url, "/images/edits"))
+        .post(api_url(api_base(&p, body), "/images/edits"))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
         .multipart(form)
         .send()

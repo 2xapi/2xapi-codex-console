@@ -197,7 +197,7 @@ pub fn store_probe(codex_home: &Path, provider_id: &str, model: &str, caps: &Cap
     out
 }
 
-/// 手动覆盖(PUT):单维或整组 on/off,source=manual。
+/// 手动覆盖(PUT):单维或整组 on/off(source=manual);auto=清覆盖(回 source=auto)。
 pub fn set_manual(
     codex_home: &Path,
     provider_id: &str,
@@ -212,11 +212,32 @@ pub fn set_manual(
     let v = match val {
         "on" => Tri::Yes,
         "off" => Tri::No,
-        "auto" => Tri::Unknown, // 回 auto:清覆盖,恢复探测值语义
+        "auto" => Tri::Unknown,
         _ => return Err("值仅支持 on / off / auto".into()),
     };
     let mut all = load_all(codex_home);
     let key = tag_key(provider_id, model);
+    if val == "auto" {
+        // 清覆盖(注释即语义):条目回 source=auto(解除 manual 对探测/实证的「不覆盖」保护),
+        // 该维置 Unknown(=未标记、放行语义,下次探测/实证重填真实值);条目不存在 → 无覆盖可清,no-op。
+        if let Some(entry) = all.get_mut(&key) {
+            if let Some(obj) = entry.as_object_mut() {
+                let mut caps = Caps::from_json(obj.get("caps").unwrap_or(&Value::Null));
+                match dim {
+                    "text" => caps.text = Tri::Unknown,
+                    "tools" => caps.tools = Tri::Unknown,
+                    "reasoning" => caps.reasoning = Tri::Unknown,
+                    _ => caps.image_in = Tri::Unknown,
+                }
+                obj.insert("source".into(), json!("auto"));
+                obj.insert("caps".into(), caps.to_json());
+                obj.insert("updated_at".into(), json!(chrono::Utc::now().timestamp()));
+            }
+        }
+        let out = all.get(&key).cloned().unwrap_or(Value::Null);
+        save_all(codex_home, &all);
+        return Ok(out);
+    }
     let entry = all
         .entry(key.clone())
         .or_insert_with(|| json!({ "source": "manual", "caps": Caps::unknown().to_json() }));
@@ -446,6 +467,61 @@ mod tests {
     fn deny_words_and_keys() {
         assert!(IMAGE_DENY_WORDS.contains(&"no image attached"));
         assert_eq!(tag_key("a", "b"), "a::b");
+    }
+
+    /// set_manual val="auto" = 真正清覆盖:回 source=auto + 该维 Unknown(放行语义),
+    /// manual 值不再生效、后续探测可重填;条目不存在 → no-op 不建条目。
+    #[test]
+    fn manual_auto_clears_override() {
+        let r = root("auto");
+        // 探测 → 手动覆盖 on → auto 清覆盖
+        let caps = Caps {
+            text: Tri::Yes,
+            tools: Tri::No,
+            reasoning: Tri::Yes,
+            image_in: Tri::No,
+        };
+        store_probe(&r, "p1", "m1", &caps);
+        set_manual(&r, "p1", "m1", "image_in", "on").unwrap();
+        let all = load_all(&r);
+        assert_eq!(all[&tag_key("p1", "m1")]["source"], "manual");
+        assert_eq!(all[&tag_key("p1", "m1")]["caps"]["image_in"], "yes");
+
+        set_manual(&r, "p1", "m1", "image_in", "auto").unwrap();
+        let all = load_all(&r);
+        assert_eq!(
+            all[&tag_key("p1", "m1")]["source"],
+            "auto",
+            "auto 应移除 manual 标记"
+        );
+        assert_eq!(
+            all[&tag_key("p1", "m1")]["caps"]["image_in"],
+            "unknown",
+            "清覆盖后该维应回未标记(放行),待探测重填"
+        );
+        assert_eq!(
+            all[&tag_key("p1", "m1")]["caps"]["tools"],
+            "no",
+            "其余维探测值保留"
+        );
+        // 清覆盖后探测可再次覆盖(manual 保护已解除)
+        let caps2 = Caps {
+            text: Tri::Yes,
+            tools: Tri::No,
+            reasoning: Tri::Yes,
+            image_in: Tri::Yes,
+        };
+        store_probe(&r, "p1", "m1", &caps2);
+        assert_eq!(
+            load_all(&r)[&tag_key("p1", "m1")]["caps"]["image_in"],
+            "yes"
+        );
+        // 不存在的条目:auto no-op(不建 manual 条目)
+        assert_eq!(
+            set_manual(&r, "p2", "m9", "text", "auto").unwrap(),
+            Value::Null
+        );
+        assert!(!load_all(&r).contains_key(&tag_key("p2", "m9")));
     }
     #[test]
     fn mark_dim_creates_caps_and_respects_manual() {

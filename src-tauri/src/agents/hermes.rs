@@ -578,6 +578,19 @@ pub fn unhost(
     }))
 }
 
+/// POST /api/desktop/hermes/start —— 未托管 409;托管后返回直接运行提示
+/// (hermes 为整平台托管,条目含真实 base/key,命令本体无需 env 前缀,providerId 仅回显)。
+pub fn start(
+    config_path: &Path,
+    providers_path: &Path,
+    provider_id: &str,
+) -> Result<Value, OpError> {
+    if detect_state(config_path)["hosting"].is_null() {
+        return Err((409, "E_NOT_HOSTED".into(), "请先托管,再启动".into()));
+    }
+    super::cli_start_response(providers_path, provider_id, "hermes chat")
+}
+
 // ── tests ────────────────────────────────────────────────────
 
 #[cfg(test)]

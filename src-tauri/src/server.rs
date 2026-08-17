@@ -633,6 +633,24 @@ async fn handle_providers_delete(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    // 托管守卫(镜像前端 hostedBy):该供应商正被托管时禁止删除,须先还原官方。
+    // 后端可见的托管态 = codex desktop hosting(hosting.providerId=active,host 时置 active);
+    // claude 注入态为前端本地(后端无 claude-state 接口,前端 hostedBy 已先行拦截);
+    // gemini/grok/opencode/openclaw/claude-desktop/cursor/hermes 为整平台托管(providerId 常量/无),
+    // 与前端 hostedBy 一致不归因单个供应商。
+    let hosting = crate::desktop::detect_hosting(&s.config_path, &s.providers_path);
+    let codex_pid = hosting
+        .get("providerId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !codex_pid.is_empty() && codex_pid == id {
+        return err_env(
+            StatusCode::BAD_REQUEST,
+            "E_PROVIDER_HOSTED",
+            "托管中的供应商不能删除,请先在「Codex」还原官方",
+            None,
+        );
+    }
     crate::providers::delete(&s.providers_path, &id);
     ok_env(json!({ "id": id, "deleted": true }))
 }
@@ -753,7 +771,20 @@ async fn handle_providers_fetch_models(
     let (base_url, api_key, write_back_id): (String, String, Option<String>) = if !id.is_empty() {
         let data = crate::providers::load(&s.providers_path);
         match data.providers.iter().find(|p| p.id == id).cloned() {
-            Some(p) => (p.base_url, p.api_key, Some(id.to_string())),
+            Some(mut p) => {
+                // 改 Key 后按新 Key 拉取:body.apiKey(未保存的新 Key)若提供,覆盖存储 Key 用于本次探测
+                // (不落盘——保存动作走 PUT /api/providers/:id;前端编辑表单改 Key 后先拉模型再保存)。
+                let k = body
+                    .get("apiKey")
+                    .or_else(|| body.get("api_key"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if !k.is_empty() {
+                    p.api_key = k.to_string();
+                }
+                (p.base_url, p.api_key, Some(id.to_string()))
+            }
             None => return err_env(StatusCode::NOT_FOUND, "E_NOT_FOUND", "供应商不存在", None),
         }
     } else {
@@ -1706,6 +1737,42 @@ async fn handle_agent_start(
                 .trim(),
             &s.gem_home,
         )),
+        "grokbuild" => agent_op_response(crate::agents::grok::start(
+            &s.providers_path,
+            body.get("way")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gateway")
+                .trim(),
+            body.get("providerId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+            &s.grok_home,
+        )),
+        "hermes" => agent_op_response(crate::agents::hermes::start(
+            &s.hermes_home.join("config.yaml"),
+            &s.providers_path,
+            body.get("providerId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+        )),
+        "opencode" => agent_op_response(crate::agents::opencode::start(
+            &s.oc_home,
+            &s.providers_path,
+            body.get("providerId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+        )),
+        "openclaw" => agent_op_response(crate::agents::openclaw::start(
+            &s.oclaw_home,
+            &s.providers_path,
+            body.get("providerId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+        )),
         _ => agent_unsupported_response(),
     }
 }
@@ -2057,12 +2124,72 @@ mod tests {
 
     /// 媒体服务路由 e2e(超融合 A 线二期 B 段):上传→GET 字节一致+Content-Type→
     /// ext 错位 404(不暴露)→伪装 mime 415→列表→删除→GET 404。tempdir 隔离,零真实配置。
+    /// 删除守卫:供应商正被 Codex 托管(desktop hosting)→ 400 人话拒删;未托管 → 正常删除。
+    #[tokio::test]
+    async fn providers_delete_blocked_while_codex_hosted() {
+        let dir =
+            std::env::temp_dir().join(format!("2xapi-delguard-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut st = dummy_state();
+        st.config_path = dir.join("config.toml");
+        st.providers_path = dir.join("providers.json");
+        // 托管态:custom 段指向网关(与 desktop host gateway 同形态)+ active=p1
+        std::fs::write(
+            &st.config_path,
+            "[model_providers.custom]\nbase_url = \"http://127.0.0.1:8787\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &st.providers_path,
+            r#"{"schema_version":3,"active_provider_id":"p1","providers":[{"id":"p1","name":"t","agent":"codex","base_url":"https://up.example.com","api_key":"sk-1","model":"m1"}]}"#,
+        )
+        .unwrap();
+        let app = build_router(st.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/providers/p1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "托管中应拒删");
+        assert!(
+            String::from_utf8_lossy(
+                &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            )
+            .contains("托管中的供应商不能删除"),
+            "拒删应带人话"
+        );
+        // 未托管(custom 段移除)→ 删除成功
+        std::fs::write(&st.config_path, "").unwrap();
+        let app2 = build_router(st.clone());
+        let resp2 = app2
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/providers/p1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK, "未托管应可删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 媒体服务路由 e2e(超融合 A 线二期 B 段):上传→GET 字节一致+Content-Type→
+    /// ext 错位 404(不暴露)→伪装 mime 415→列表→删除→GET 404。tempdir 隔离,零真实配置。
     #[tokio::test]
     async fn media_routes_roundtrip() {
         let mut st = dummy_state();
         let dir =
             std::env::temp_dir().join(format!("2xapi-media-e2e-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
         st.codex_home = dir.clone();
         let app = build_router(st);
 

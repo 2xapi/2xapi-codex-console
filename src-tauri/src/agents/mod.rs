@@ -18,6 +18,7 @@ pub mod opencode;
 pub mod workbuddy;
 
 use serde_json::{json, Value};
+use std::path::Path;
 
 /// 单个 agent 平台的元数据。
 #[derive(Debug, Clone)]
@@ -161,6 +162,33 @@ pub fn registry_json() -> Value {
             })
             .collect::<Vec<_>>(),
     })
+}
+
+/// 整平台托管的 CLI 型 agent(hermes/opencode/openclaw)通用启动响应:
+/// 配置已写盘、直接运行 CLI 即走网关,命令本体无需 env 前缀(与 grok 同族)。
+/// providerId 仅回显(平台级托管不绑死单个供应商,hosting.providerId 为常量/整体态);
+/// 托管态由各模块先验(未托管 409)。
+pub fn cli_start_response(
+    providers_path: &Path,
+    provider_id: &str,
+    command: &str,
+) -> Result<Value, (u16, String, String)> {
+    let provider_name = if provider_id.trim().is_empty() {
+        String::new()
+    } else {
+        crate::providers::load(providers_path)
+            .providers
+            .iter()
+            .find(|p| p.id == provider_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    };
+    Ok(json!({
+        "command": command,
+        "providerId": provider_id,
+        "providerName": provider_name,
+        "note": "配置已写盘,直接运行 CLI 即可",
+    }))
 }
 
 #[cfg(test)]

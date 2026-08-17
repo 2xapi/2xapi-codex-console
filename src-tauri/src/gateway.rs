@@ -210,6 +210,10 @@ async fn dispatch_anthropic_for(
     req: Request<Body>,
     agent: &str,
 ) -> Response<Body> {
+    // 托盘「网关开/关」守卫:关闭时全部代理入口统一 503 人话(同 dispatch/proxy_images)
+    if !state.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        return err_resp(StatusCode::SERVICE_UNAVAILABLE, "网关已由托盘关闭");
+    }
     let provider = match crate::providers::get_provider_for_agent(&state.providers_path, agent) {
         // Key 资源池(A 线一期):见 dispatch 注释
         Some(p) => crate::keypool::apply(&state.keypool, p),
@@ -262,8 +266,13 @@ async fn dispatch_anthropic_for(
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
 
-    // 媒体关卡(超融合二期):同 codex 通道;纯文本零路径变化
-    if let Some(resp) = media_gate(state, &provider, "", &body_bytes) {
+    // 媒体关卡(超融合二期):同 codex 通道(模型取请求体 model,与 codex 通路一致);
+    // 纯文本零路径变化
+    let req_model: String = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or_default();
+    if let Some(resp) = media_gate(state, &provider, &req_model, &body_bytes) {
         return resp;
     }
 
@@ -386,6 +395,14 @@ async fn dispatch_gemini(
     model_action: &str,
     req: Request<Body>,
 ) -> Response<Body> {
+    // 托盘「网关开/关」守卫:关闭时全部代理入口统一 503 人话(同 dispatch/proxy_images)
+    if !state.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        return gemini_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "网关已由托盘关闭",
+        );
+    }
     let (model, action) = match model_action.rsplit_once(':') {
         Some(x) => x,
         None => {

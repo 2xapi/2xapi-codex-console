@@ -270,3 +270,12 @@ pub fn unhost(oc_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
         json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }),
     )
 }
+
+/// POST /api/desktop/opencode/start —— 未托管 409;托管后返回直接运行提示
+/// (opencode 为整平台托管,条目含真实 base/key,命令本体无需 env 前缀,providerId 仅回显)。
+pub fn start(oc_home: &Path, providers_path: &Path, provider_id: &str) -> Result<Value, OpError> {
+    if state(oc_home)["hosting"].is_null() {
+        return Err((409, "E_NOT_HOSTED".into(), "请先托管,再启动".into()));
+    }
+    super::cli_start_response(providers_path, provider_id, "opencode run")
+}

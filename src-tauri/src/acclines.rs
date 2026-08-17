@@ -84,11 +84,34 @@ fn builtin_default(codex_home: &Path) -> AccLines {
     }
 }
 
-/// 读取 `{codex_home}/accel-credentials.json`({user,pass});缺失/非法 → None。
-/// pub:供装配方(server.rs 的 test-node、gateway.rs 的 custom 线路)注入凭证。
+/// 读取 `{codex_home}/accel-credentials.json` 的线路凭证(user/pass)。
+/// 兼容两种形态:
+/// - 旧 v1 单对象 `{user,pass}`(直接解析);
+/// - nodecreds 写盘的 v2 Store `{version, legacy, creds}`(取 legacy;无 legacy 取表内任一凭证)。
+///   双格式都解析失败时记录错误路径(不静默丢凭证);文件缺失/合法但无凭证 → None。
+///   pub:供装配方(server.rs 的 test-node、gateway.rs 的 custom 线路)注入凭证。
 pub fn load_credentials(codex_home: &Path) -> Option<Cred> {
-    let raw = std::fs::read_to_string(codex_home.join("accel-credentials.json")).ok()?;
-    serde_json::from_str(&raw).ok()
+    let path = codex_home.join("accel-credentials.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    // v1 单对象 {user,pass}(v2 Store 文档无顶层 user/pass,此解析会失败,不误匹配)
+    if let Ok(c) = serde_json::from_str::<Cred>(&raw) {
+        return Some(c);
+    }
+    // v2 Store:legacy 优先,否则取表内任一账号凭证(都是可用的 basic auth 凭证)
+    if let Ok(store) = serde_json::from_str::<crate::nodecreds::Store>(&raw) {
+        if let Some(l) = store.legacy_cred() {
+            return Some(l);
+        }
+        return store.creds.values().next().map(|c| Cred {
+            user: c.user.clone(),
+            pass: c.pass.clone(),
+        });
+    }
+    eprintln!(
+        "[acclines] load_credentials: 无法解析 {} (既非 v1 {{user,pass}},也非 v2 Store)",
+        path.display()
+    );
+    None
 }
 
 /// 给没有凭证的线路注入本地 accel-credentials.json 的凭证(已有凭证的保留)。
@@ -524,6 +547,53 @@ mod tests {
             enabled,
             credential: None,
         }
+    }
+
+    // ── load_credentials:v1 单对象 与 nodecreds v2 Store 双格式兼容 ──
+
+    #[test]
+    fn load_credentials_v1_single_object() {
+        let root = sandbox("cred-v1");
+        std::fs::write(
+            root.join("accel-credentials.json"),
+            r#"{"user":"u1","pass":"p1"}"#,
+        )
+        .unwrap();
+        let c = load_credentials(&root).expect("v1 应解析成功");
+        assert_eq!((c.user.as_str(), c.pass.as_str()), ("u1", "p1"));
+    }
+
+    #[test]
+    fn load_credentials_v2_store_legacy_and_entries() {
+        // v2 Store:legacy 优先
+        let root = sandbox("cred-v2-legacy");
+        std::fs::write(
+            root.join("accel-credentials.json"),
+            r#"{"version":2,"legacy":{"user":"u2","pass":"p2"},"creds":{}}"#,
+        )
+        .unwrap();
+        let c = load_credentials(&root).expect("v2 legacy 应解析成功");
+        assert_eq!((c.user.as_str(), c.pass.as_str()), ("u2", "p2"));
+
+        // v2 Store 无 legacy → 取表内任一账号凭证
+        let root2 = sandbox("cred-v2-entry");
+        std::fs::write(
+            root2.join("accel-credentials.json"),
+            r#"{"version":2,"creds":{"abc":{"user":"u3","pass":"p3","quota_total_bytes":0,"quota_used_bytes":0,"proxy_endpoint":"http://x","issued_at":0,"degraded_to_direct":false}}}"#,
+        )
+        .unwrap();
+        let c2 = load_credentials(&root2).expect("v2 entries 应解析成功");
+        assert_eq!((c2.user.as_str(), c2.pass.as_str()), ("u3", "p3"));
+    }
+
+    #[test]
+    fn load_credentials_illegal_logs_and_returns_none() {
+        // 非法 JSON(双格式均失败)→ None 且不 panic(错误路径 eprintln 已记录)
+        let root = sandbox("cred-bad");
+        std::fs::write(root.join("accel-credentials.json"), "{broken").unwrap();
+        assert!(load_credentials(&root).is_none());
+        // 缺失文件 → None
+        assert!(load_credentials(&root).is_none());
     }
 
     // ── match_line:命中/不命中/多线按 priority/disabled 跳过 ──
