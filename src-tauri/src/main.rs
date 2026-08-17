@@ -525,6 +525,9 @@ fn main() {
     // deeplink 一键导入(竞品吸收 1.1-5):2xapi:// 协议由 Info.plist 注册,系统唤起后走 Opened 事件。
     // 注:dev(cargo run)无 .app 包无协议注册,仅打包后生效;2xapi 站点生成的链接直达这里。
     app.run(|app_handle, event| {
+        // cfg 与 tauri 的 RunEvent::Opened 同门控:该变体仅 macos/ios/android 存在
+        //(Windows 无此事件;Mac 全绿零覆盖的 cfg 分支教训,CI 三平台矩阵是唯一防线)
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         if let tauri::RunEvent::Opened { urls } = event {
             for url in urls {
                 if let Err(e) = handle_deeplink(app_handle, &url) {
