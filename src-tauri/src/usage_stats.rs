@@ -2,12 +2,20 @@
 //!
 //! - 落盘:网关每请求 append 一行 JSONL 到 `{codex_home}/usage-stats.jsonl`
 //!   (ts/provider/key 脱敏/route/line/延迟/ok),不落明文 Key(安全约定与 usage 块一致)。
-//! - 聚合:GET /api/usage-stats 全量读文件,按 provider 聚合
+//! - 聚合:GET /api/usage-stats 有界读取当前文件与单份轮转文件,按 provider 聚合
 //!   {count, p50, p90, ok_rate, last_ts}——P50/P90 = 性能自然基准(调研部建议路线)。
-//! - 规模:桌面应用单机流量小,全量读可接受;量大再上 SQLite/索引(ponytail:)。
+//! - 规模:单文件 5 MiB,保留一份轮转,查询最多读取 10 MiB。
 
 use serde::Serialize;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+static USAGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+fn usage_lock() -> &'static Mutex<()> {
+    USAGE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReqLog {
@@ -19,12 +27,73 @@ pub struct ReqLog {
     pub route: String,
     /// 线路 id;直连 = "direct"。
     pub line: String,
+    /// 命中加速线路后因线路故障或 per-Key 限额而改走直连。
+    pub degraded_to_direct: bool,
     pub latency_ms: u64,
     pub ok: bool,
 }
 
 fn log_path(codex_home: &Path) -> std::path::PathBuf {
     codex_home.join("usage-stats.jsonl")
+}
+
+fn rotated_log_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension("1.jsonl")
+}
+
+fn rotate_if_needed(path: &Path, incoming_bytes: u64, max_bytes: u64) -> std::io::Result<()> {
+    let current_bytes = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    if current_bytes.saturating_add(incoming_bytes) <= max_bytes {
+        return Ok(());
+    }
+    let rotated = rotated_log_path(path);
+    match std::fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if current_bytes > 0 {
+        std::fs::rename(path, rotated)?;
+    }
+    Ok(())
+}
+
+fn read_recent(path: &Path, max_bytes: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return String::new();
+    };
+    let start = len.saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    if start > 0 {
+        let Some(line_end) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return String::new();
+        };
+        bytes.drain(..=line_end);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn percentile_nearest_rank(sorted: &[u64], quantile: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() as f64 * quantile).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
 }
 
 /// Key 脱敏:前 3 + … + 尾 4;过短只留省略号(与 server usage 块同形态,不落明文)。
@@ -42,11 +111,21 @@ pub fn mask_key(key: &str) -> String {
 /// 追加一行请求日志(尽力而为,失败不阻塞网关)。
 pub fn log_request(codex_home: &Path, r: &ReqLog) {
     use std::io::Write;
+    let Ok(_guard) = usage_lock().lock() else {
+        return;
+    };
     let Ok(raw) = serde_json::to_string(r) else {
         return;
     };
+    if raw.len() as u64 + 1 > MAX_LOG_BYTES {
+        return;
+    }
     let path = log_path(codex_home);
-    std::fs::create_dir_all(codex_home).ok();
+    if std::fs::create_dir_all(codex_home).is_err()
+        || rotate_if_needed(&path, raw.len() as u64 + 1, MAX_LOG_BYTES).is_err()
+    {
+        return;
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -56,13 +135,18 @@ pub fn log_request(codex_home: &Path, r: &ReqLog) {
     }
 }
 
-/// 全量读并聚合(按 provider_id 分组);无数据 → 空。
+/// 有界读取当前文件与单份轮转文件并聚合(按 provider_id 分组);无数据 → 空。
 pub fn summary(codex_home: &Path) -> serde_json::Value {
     use serde_json::Value;
-    let raw = match std::fs::read_to_string(log_path(codex_home)) {
-        Ok(r) => r,
-        Err(_) => return serde_json::json!({ "providers": [] }),
+    let Ok(_guard) = usage_lock().lock() else {
+        return serde_json::json!({ "providers": [] });
     };
+    let path = log_path(codex_home);
+    let raw = [rotated_log_path(&path), path]
+        .into_iter()
+        .map(|path| read_recent(&path, MAX_LOG_BYTES))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut by_provider: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
     for line in raw.lines() {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
@@ -84,14 +168,17 @@ pub fn summary(codex_home: &Path) -> serde_json::Value {
                 .filter_map(|r| r.get("latency_ms").and_then(|x| x.as_u64()))
                 .collect();
             lats.sort_unstable();
-            let p = |q: f64| {
-                lats.get(((lats.len() as f64) * q).floor() as usize)
-                    .copied()
-                    .unwrap_or(0)
-            };
             let ok = rows
                 .iter()
                 .filter(|r| r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+                .count();
+            let direct_fallbacks = rows
+                .iter()
+                .filter(|r| {
+                    r.get("degraded_to_direct")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false)
+                })
                 .count();
             let routes: Vec<&str> = rows
                 .iter()
@@ -109,9 +196,10 @@ pub fn summary(codex_home: &Path) -> serde_json::Value {
                 "providerId": pid,
                 "providerName": name,
                 "count": rows.len(),
-                "p50Ms": p(0.50),
-                "p90Ms": p(0.90),
+                "p50Ms": percentile_nearest_rank(&lats, 0.50),
+                "p90Ms": percentile_nearest_rank(&lats, 0.90),
                 "okRate": if rows.is_empty() { 0.0 } else { ok as f64 / rows.len() as f64 },
+                "directFallbackCount": direct_fallbacks,
                 "lastTs": last_ts,
                 "routes": routes,
             })
@@ -150,6 +238,7 @@ mod tests {
                     key_masked: mask_key("sk-abcdefghijkl"),
                     route: "codex".into(),
                     line: "direct".into(),
+                    degraded_to_direct: false,
                     latency_ms: ms,
                     ok,
                 },
@@ -159,10 +248,11 @@ mod tests {
         let prov = &v["providers"][0];
         assert_eq!(prov["providerId"], "p1");
         assert_eq!(prov["count"], 4);
-        // 4 条:0.5*4=2 → 索引 2 = 30;0.9*4=3.6 → floor 3 = 40
-        assert_eq!(prov["p50Ms"], 30);
+        // 最近秩:4 条 P50=第 2 条 20,P90=第 4 条 40。
+        assert_eq!(prov["p50Ms"], 20);
         assert_eq!(prov["p90Ms"], 40);
         assert!((prov["okRate"].as_f64().unwrap() - 0.75).abs() < 1e-9);
+        assert_eq!(prov["directFallbackCount"], 0);
         assert_eq!(prov["lastTs"], 4);
         assert_eq!(prov["routes"][0], "codex");
         // 无数据 → 空
@@ -173,5 +263,33 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&empty_home);
+    }
+
+    #[test]
+    fn rotation_bounds_files_and_summary_reads_both() {
+        let home = tmp("rotate");
+        let path = log_path(&home);
+        std::fs::write(
+            &path,
+            "{\"provider_id\":\"old\",\"latency_ms\":10,\"ok\":true}\n",
+        )
+        .unwrap();
+        rotate_if_needed(&path, 32, 32).unwrap();
+        assert!(rotated_log_path(&path).exists());
+        std::fs::write(
+            &path,
+            "{\"provider_id\":\"new\",\"latency_ms\":20,\"ok\":false}\n",
+        )
+        .unwrap();
+
+        let providers = summary(&home)["providers"].as_array().unwrap().clone();
+        assert_eq!(providers.len(), 2);
+        assert!(providers
+            .iter()
+            .any(|provider| provider["providerId"] == "old"));
+        assert!(providers
+            .iter()
+            .any(|provider| provider["providerId"] == "new"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

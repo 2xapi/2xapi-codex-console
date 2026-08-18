@@ -196,6 +196,9 @@ fn read_hermes_yaml(path: &Path) -> Result<serde_yaml::Value, String> {
 
 /// 原子写文本(同工程 .tmp+rename 惯例)。
 fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
     let tmp = path.with_extension("yaml.tmp");
     std::fs::write(&tmp, content).map_err(|e| format!("写临时文件失败: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("落盘失败: {e}"))
@@ -217,52 +220,143 @@ fn backup_yaml_file(src: &Path, backup_dir: &Path, purpose: &str) -> Result<(), 
         "purpose": purpose,
         "createdAt": chrono::Local::now().to_rfc3339(),
         "configPath": src.to_string_lossy(),
+        "backupFile": backup_path.file_name().and_then(|name| name.to_str()),
         "sha256": {
             "algo": "sha256",
             "note": "see file bytes"
         },
     });
-    let manifest_path = format!("{}.manifest.json", backup_path.display());
-    std::fs::write(
-        manifest_path,
-        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
-    )
-    .ok();
+    let manifest_path = PathBuf::from(format!("{}.manifest.json", backup_path.display()));
+    let manifest_raw = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+    if let Err(error) = std::fs::write(&manifest_path, manifest_raw) {
+        let cleanup = std::fs::remove_file(&backup_path).err();
+        return Err(match cleanup {
+            Some(cleanup_error) => format!(
+                "写备份 manifest 失败: {error}；清理无 manifest 的备份 {} 失败: {cleanup_error}",
+                backup_path.display()
+            ),
+            None => format!("写备份 manifest 失败: {error}"),
+        });
+    }
     Ok(())
 }
 
 /// 找最近的 hermes pre-host 快照(unhost 时恢复 model 段指针)。
-fn find_pre_host_snapshot(backup_dir: &Path) -> Option<serde_yaml::Value> {
+fn find_pre_host_snapshot(
+    backup_dir: &Path,
+    config_path: &Path,
+) -> Result<Option<serde_yaml::Value>, OpError> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    let rd = std::fs::read_dir(backup_dir).ok()?;
-    for e in rd.flatten() {
+    let rd = match std::fs::read_dir(backup_dir) {
+        Ok(rd) => rd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err((500, "E_IO".into(), error.to_string())),
+    };
+    let normalized_target = normalize_path(config_path);
+    let normalized_backup_dir = normalize_path(backup_dir);
+    for entry in rd {
+        let e = entry.map_err(|error| (500, "E_IO".into(), error.to_string()))?;
         let name = e.file_name().to_string_lossy().to_string();
         if !name.starts_with(BACKUP_PREFIX) || !name.ends_with(".manifest.json") {
             continue;
         }
-        let manifest: Value =
-            serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+        let manifest_raw = std::fs::read_to_string(e.path())
+            .map_err(|error| (500, "E_IO".into(), error.to_string()))?;
+        let manifest: Value = serde_json::from_str(&manifest_raw).map_err(|error| {
+            (
+                422,
+                "E_BACKUP_MANIFEST".into(),
+                format!("Hermes 备份 manifest 损坏: {error}"),
+            )
+        })?;
+        if manifest.get("version").and_then(Value::as_u64) != Some(1)
+            || manifest.get("kind").and_then(Value::as_str) != Some("hermes-config")
+        {
+            return Err((
+                422,
+                "E_BACKUP_MANIFEST".into(),
+                "Hermes 备份 manifest 类型或版本不受支持".into(),
+            ));
+        }
         if manifest.get("purpose").and_then(|v| v.as_str()) != Some("pre-host") {
             continue;
         }
-        let yaml_path = e
-            .path()
-            .with_file_name(name.trim_end_matches(".manifest.json"));
-        let mtime = e.metadata().and_then(|m| m.modified()).ok();
-        if best
-            .as_ref()
-            .map(|(t, _)| mtime.map(|n| n > *t).unwrap_or(false))
-            .unwrap_or(true)
+        let target = manifest.get("configPath").and_then(Value::as_str).ok_or((
+            422,
+            "E_BACKUP_MANIFEST".into(),
+            "Hermes 备份 manifest 缺少 configPath".into(),
+        ))?;
+        if normalize_path(Path::new(target)) != normalized_target {
+            continue;
+        }
+        let derived_name = name.trim_end_matches(".manifest.json");
+        let backup_name = manifest
+            .get("backupFile")
+            .and_then(Value::as_str)
+            .unwrap_or(derived_name);
+        if Path::new(backup_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(backup_name)
+            || backup_name != derived_name
         {
-            if let Some(mtime) = mtime {
-                best = Some((mtime, yaml_path));
-            }
+            return Err((
+                422,
+                "E_BACKUP_MANIFEST".into(),
+                "Hermes 备份 manifest 的 backupFile 非法".into(),
+            ));
+        }
+        let yaml_path = backup_dir.join(backup_name);
+        if normalize_path(&yaml_path)
+            .parent()
+            .is_none_or(|parent| parent != normalized_backup_dir)
+        {
+            return Err((
+                422,
+                "E_BACKUP_TARGET".into(),
+                "Hermes 备份文件不在受控备份目录".into(),
+            ));
+        }
+        let mtime = yaml_path
+            .metadata()
+            .and_then(|m| m.modified())
+            .map_err(|error| {
+                (
+                    422,
+                    "E_BACKUP_TARGET".into(),
+                    format!("Hermes 备份文件不可用: {error}"),
+                )
+            })?;
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, yaml_path));
         }
     }
-    let path = best?.1;
-    let raw = std::fs::read_to_string(path).ok()?;
+    let Some(path) = best.map(|(_, path)| path) else {
+        return Ok(None);
+    };
+    let raw =
+        std::fs::read_to_string(path).map_err(|error| (500, "E_IO".into(), error.to_string()))?;
     let healed = deduplicate_top_level_keys(&raw);
-    serde_yaml::from_str(&healed).ok()
+    serde_yaml::from_str(&healed).map(Some).map_err(|error| {
+        (
+            422,
+            "E_BACKUP_CONFIG".into(),
+            format!("Hermes pre-host 快照损坏: {error}"),
+        )
+    })
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|canonical| canonical.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
 }
 
 // ── 条目构造 ─────────────────────────────────────────────────
@@ -352,21 +446,9 @@ pub fn detect_state(config_path: &Path) -> Value {
     })
 }
 
-/// 仅当全局 active 指向 hermes 供应商时清除(active 为全 agent 共用单值,不得误清其他 agent 的)。
-fn clear_active_if_hermes(providers_path: &Path) {
-    let data = crate::providers::load(providers_path);
-    let should_clear = data
-        .active_provider_id
-        .as_deref()
-        .map(|id| {
-            data.providers
-                .iter()
-                .any(|p| p.id == id && p.agent == "hermes")
-        })
-        .unwrap_or(false);
-    if should_clear {
-        crate::providers::clear_active(providers_path);
-    }
+/// 清除 Hermes 自己的 active，不影响其他平台。
+fn clear_active_if_hermes(providers_path: &Path) -> Result<(), OpError> {
+    crate::desktop::clear_active_checked(providers_path, "hermes")
 }
 
 /// host:custom_providers upsert 2xapi-gateway + 指针受控切换;way 仅 gateway(叠加平台无 direct)。
@@ -388,7 +470,7 @@ pub fn host(
     let provider = data
         .providers
         .iter()
-        .find(|p| p.id == provider_id && (p.agent == "hermes" || p.agent.is_empty()))
+        .find(|p| p.id == provider_id)
         .cloned()
         .ok_or_else(|| {
             (
@@ -397,6 +479,7 @@ pub fn host(
                 "找不到该 hermes 供应商".to_string(),
             )
         })?;
+    crate::desktop::validate_provider_agent(&provider, "hermes")?;
     if provider.model.is_empty() {
         return Err((
             422,
@@ -467,27 +550,35 @@ pub fn host(
     }
 
     // 幂等:序列化结果与治愈后原文相同 → no-op(但仍 set_active,对齐 codex 语义)
-    let config_written = if new_text != healed {
-        let already = entry_exists(&doc);
-        let purpose = if already { "pre-switch" } else { "pre-host" };
-        backup_yaml_file(config_path, backup_dir, purpose)
-            .map_err(|e| (500, "E_IO".to_string(), e))?;
-        write_text_atomic(config_path, &new_text).map_err(|e| (500, "E_IO".to_string(), e))?;
-        true
-    } else {
-        false
-    };
+    let paths = [config_path.to_path_buf(), providers_path.to_path_buf()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let config_written = if new_text != healed {
+            let already = entry_exists(&doc);
+            let purpose = if already { "pre-switch" } else { "pre-host" };
+            backup_yaml_file(config_path, backup_dir, purpose)
+                .map_err(|e| (500, "E_IO".to_string(), e))?;
+            write_text_atomic(config_path, &new_text).map_err(|e| (500, "E_IO".to_string(), e))?;
+            true
+        } else {
+            false
+        };
 
-    crate::providers::set_active(providers_path, &provider.id);
+        crate::desktop::set_active_checked(providers_path, &provider, "hermes")?;
 
-    Ok(json!({
-        "hosted": true,
-        "switched": switched,
-        "pointerSwitched": switched,
-        "entryWritten": true,
-        "hosting": detect_state(config_path)["hosting"].clone(),
-        "changed": { "config": config_written },
-    }))
+        Ok(json!({
+            "hosted": true,
+            "switched": switched,
+            "pointerSwitched": switched,
+            "entryWritten": true,
+            "hosting": detect_state(config_path)["hosting"].clone(),
+            "changed": { "config": config_written },
+        }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// unhost:仅移除本产品条目;指针指向本条目时恢复(快照优先,无快照回官方默认)。
@@ -518,7 +609,7 @@ pub fn unhost(
 
     if !entry_exists(&doc) {
         // 未托管(或用户自己删过)→ 幂等 no-op
-        clear_active_if_hermes(providers_path);
+        clear_active_if_hermes(providers_path)?;
         return Ok(json!({ "restored": false, "alreadyClean": true }));
     }
 
@@ -544,8 +635,8 @@ pub fn unhost(
     let pointer_now = current_pointer(&doc);
     let mut pointer_restored = false;
     if pointer_now.as_deref() == Some(ENTRY_NAME) {
-        let restored_model =
-            find_pre_host_snapshot(backup_dir).and_then(|snap| snap.get("model").cloned());
+        let restored_model = find_pre_host_snapshot(backup_dir, config_path)?
+            .and_then(|snap| snap.get("model").cloned());
         match restored_model {
             Some(m) => {
                 new_text = replace_section(&new_text, "model", &m)
@@ -565,17 +656,24 @@ pub fn unhost(
         pointer_restored = true;
     }
 
-    backup_yaml_file(config_path, backup_dir, "pre-unhost")
-        .map_err(|e| (500, "E_IO".to_string(), e))?;
-    write_text_atomic(config_path, &new_text).map_err(|e| (500, "E_IO".to_string(), e))?;
+    let paths = [config_path.to_path_buf(), providers_path.to_path_buf()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        backup_yaml_file(config_path, backup_dir, "pre-unhost")
+            .map_err(|e| (500, "E_IO".to_string(), e))?;
+        write_text_atomic(config_path, &new_text).map_err(|e| (500, "E_IO".to_string(), e))?;
+        clear_active_if_hermes(providers_path)?;
 
-    clear_active_if_hermes(providers_path);
-
-    Ok(json!({
-        "restored": true,
-        "pointerRestored": pointer_restored,
-        "hosting": detect_state(config_path)["hosting"].clone(),
-    }))
+        Ok(json!({
+            "restored": true,
+            "pointerRestored": pointer_restored,
+            "hosting": detect_state(config_path)["hosting"].clone(),
+        }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// POST /api/desktop/hermes/start —— 未托管 409;托管后返回直接运行提示
@@ -627,6 +725,7 @@ mod tests {
             user_agent: None,
             model: model.into(),
             models: vec![],
+            claude_desktop_model_routes: vec![],
             context_window: None,
             proxy_url: None,
             timeout_secs: None,
@@ -644,6 +743,7 @@ mod tests {
         let data = ProviderData {
             schema_version: 1,
             active_provider_id: None,
+            active_provider_ids: Default::default(),
             providers,
         };
         std::fs::write(&path, serde_json::to_string(&data).unwrap()).unwrap();
@@ -785,7 +885,7 @@ mod tests {
         std::fs::write(&config, USER_CONFIG).unwrap();
         let providers = providers_file(&dir, vec![provider_fixture("p1", "codex", "gpt-5.5")]);
         let err = host(&config, &backup, &providers, "p1", "gateway").unwrap_err();
-        assert_eq!(err.1, "E_PROVIDER_NOT_FOUND");
+        assert_eq!(err.1, "E_PROVIDER_AGENT_MISMATCH");
         assert!(!config.exists() || std::fs::read_to_string(&config).unwrap() == USER_CONFIG);
     }
 
@@ -825,6 +925,29 @@ mod tests {
         assert_eq!(doc.get("_config_version").unwrap().as_i64(), Some(33));
     }
 
+    #[test]
+    fn unhost_clears_only_hermes_active() {
+        let (dir, config, backup) = tmpdir("unhost-active-scope");
+        std::fs::write(&config, USER_CONFIG).unwrap();
+        let providers = providers_file(
+            &dir,
+            vec![
+                provider_fixture("codex-p", "codex", "gpt-5.5"),
+                provider_fixture("hermes-p", "hermes", "gpt-5.5"),
+            ],
+        );
+        crate::providers::set_active(&providers, "codex-p");
+        host(&config, &backup, &providers, "hermes-p", "gateway").unwrap();
+        unhost(&config, &backup, &providers).unwrap();
+
+        let data = crate::providers::load(&providers);
+        assert_eq!(
+            data.active_provider_ids.get("codex").map(String::as_str),
+            Some("codex-p")
+        );
+        assert!(!data.active_provider_ids.contains_key("hermes"));
+    }
+
     /// unhost 指针恢复:快照优先(官方指针场景)。
     #[test]
     fn unhost_restores_pointer_from_snapshot() {
@@ -843,6 +966,48 @@ mod tests {
         );
         assert_eq!(
             doc.get("model").unwrap().get("default").unwrap().as_str(),
+            Some("gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn unhost_ignores_pre_host_manifest_for_another_config_path() {
+        let (dir, config, backup) = tmpdir("unhost-target-match");
+        std::fs::write(&config, USER_CONFIG).unwrap();
+        let providers = providers_file(&dir, vec![provider_fixture("p1", "hermes", "gpt-5.5")]);
+        host(&config, &backup, &providers, "p1", "gateway").unwrap();
+
+        let foreign_config = dir.join("other-config.yaml");
+        let foreign_name = "hermes-config-foreign.yaml";
+        std::fs::write(
+            backup.join(foreign_name),
+            "model:\n  provider: attacker-router\n  default: attacker-model\n",
+        )
+        .unwrap();
+        std::fs::write(
+            backup.join(format!("{foreign_name}.manifest.json")),
+            json!({
+                "version": 1,
+                "kind": "hermes-config",
+                "purpose": "pre-host",
+                "configPath": foreign_config,
+                "backupFile": foreign_name,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        unhost(&config, &backup, &providers).unwrap();
+
+        let restored = read_hermes_yaml(&config).unwrap();
+        assert_eq!(current_pointer(&restored).as_deref(), Some("openai-api"));
+        assert_eq!(
+            restored
+                .get("model")
+                .unwrap()
+                .get("default")
+                .unwrap()
+                .as_str(),
             Some("gpt-5.5")
         );
     }

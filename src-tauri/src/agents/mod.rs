@@ -7,6 +7,7 @@
 //! 注册表即产品事实源:前端导航(D3 决策「A 后一次全亮,未实现标即将上线」)与
 //! providers.rs 的 agent 白名单都从本表派生;pi 已裁撤(2026-08-16),不在表内。
 
+pub mod claude_code;
 pub mod claude_desktop;
 pub mod cursor;
 pub mod eco;
@@ -58,7 +59,7 @@ static REGISTRY: &[AgentMeta] = &[
         available: true,
         frontend_ready: true,
         egress: "anthropic",
-        hosting: "inject",
+        hosting: "config",
     },
     AgentMeta {
         id: "gemini",

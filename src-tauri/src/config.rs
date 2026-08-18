@@ -25,6 +25,38 @@ pub(crate) const AUTH_OFFICIAL_BAK: &str = "auth.json.official.bak";
 
 // ── TOML 读写（JSON Value ↔ TOML，原子写）────────────────────
 
+fn write_private_atomic(
+    path: &Path,
+    data: &[u8],
+    tmp_extension: &str,
+    context: &str,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败({context}): {e}"))?;
+    }
+    let tmp = path.with_extension(tmp_extension);
+    std::fs::write(&tmp, data).map_err(|e| format!("写入临时文件失败({context}): {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("设置临时文件权限失败({context}): {error}"));
+        }
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("重命名失败({context}): {error}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("设置文件权限失败({context}): {e}"))?;
+    }
+    Ok(())
+}
+
 /// 读 TOML → JSON Value；失败返回空对象。
 pub fn read_toml(path: &Path) -> Value {
     match std::fs::read_to_string(path) {
@@ -40,10 +72,7 @@ pub fn read_toml(path: &Path) -> Value {
 pub fn write_toml(path: &Path, cfg: &Value) -> Result<(), String> {
     let toml_val = json_to_toml(cfg);
     let s = toml::to_string_pretty(&toml_val).map_err(|e| format!("TOML 编码失败: {e}"))?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, s).map_err(|e| format!("写入临时文件失败: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("重命名失败: {e}"))?;
-    Ok(())
+    write_private_atomic(path, s.as_bytes(), "toml.tmp", "config.toml")
 }
 
 pub(crate) fn config_to_toml_string(cfg: &Value) -> Result<String, String> {
@@ -103,10 +132,7 @@ pub(crate) fn read_auth_json(path: &Path) -> Value {
 
 pub(crate) fn write_auth_json(path: &Path, v: &Value) -> Result<(), String> {
     let raw = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &raw).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
+    write_private_atomic(path, raw.as_bytes(), "json.tmp", "auth.json")
 }
 
 // ── 受控字段合并（FR-3.6：保留用户未知字段）──────────────────
@@ -222,9 +248,25 @@ pub fn apply_provider(
     let merged = build_config_value(&current_cfg, provider, &catalog_path.to_string_lossy());
     let new_toml = config_to_toml_string(&merged)?;
 
+    // PureApi 首次切换的 auth 官方态备份也必须先完成；失败时不得先覆盖 config。
+    let auth_p = codex_home.join("auth.json");
+    let bak_p = codex_home.join(AUTH_OFFICIAL_BAK);
+    let auth_backup_created = if provider.access_mode == AccessMode::PureApi && !bak_p.exists() {
+        match std::fs::read(&auth_p) {
+            Ok(data) => {
+                write_private_atomic(&bak_p, &data, "bak.tmp", "auth 官方备份")?;
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(format!("读取 auth 备份源失败: {error}")),
+        }
+    } else {
+        false
+    };
+
     // config 幂等写
     let config_written = if new_toml != current_toml {
-        let _ = backup_file(config_path, backup_dir, "config-apply", "pre-apply");
+        backup_file(config_path, backup_dir, "config-apply", "pre-apply")?;
         write_toml(config_path, &merged)?;
         true
     } else {
@@ -246,16 +288,6 @@ pub fn apply_provider(
     // auth.json（仅 PureApi 动）
     let (auth_changed, backup_created) = match provider.access_mode {
         AccessMode::PureApi => {
-            let auth_p = codex_home.join("auth.json");
-            let bak_p = codex_home.join(AUTH_OFFICIAL_BAK);
-            // 01-D4：首次切换前备份（.bak 不存在才备份，保护最早的官方态）
-            let mut created = false;
-            if !bak_p.exists() {
-                if let Ok(data) = std::fs::read(&auth_p) {
-                    std::fs::write(&bak_p, &data).map_err(|e| format!("备份 auth 失败: {e}"))?;
-                    created = true;
-                }
-            }
             // 设 OPENAI_API_KEY（幂等）
             let mut existing = read_auth_json(&auth_p);
             let key = provider.api_key.clone();
@@ -270,7 +302,7 @@ pub fn apply_provider(
                 }
                 write_auth_json(&auth_p, &existing)?;
             }
-            (changed, created)
+            (changed, auth_backup_created)
         }
         _ => (false, false),
     };
@@ -339,6 +371,8 @@ pub fn activate(
 
     let outcome = apply_provider(config_path, backup_dir, codex_home, &provider)?;
 
+    data.active_provider_ids
+        .insert(provider.agent.clone(), provider_id.to_string());
     data.active_provider_id = Some(provider_id.to_string());
     if let Some(p) = data.providers.iter_mut().find(|p| p.id == provider_id) {
         p.config_toml_snapshot = Some(outcome.config_toml_snapshot.clone());
@@ -361,18 +395,7 @@ pub fn activate_official(
     providers_path: &Path,
     codex_home: &Path,
 ) -> Result<OfficialOutcome, String> {
-    // 01-D4：恢复 auth.json
-    let bak_p = codex_home.join(AUTH_OFFICIAL_BAK);
-    let auth_p = codex_home.join("auth.json");
-    let auth_restored = if bak_p.exists() {
-        let data = std::fs::read(&bak_p).map_err(|e| format!("读 .bak 失败: {e}"))?;
-        std::fs::write(&auth_p, &data).map_err(|e| format!("恢复 auth 失败: {e}"))?;
-        true
-    } else {
-        false
-    };
-
-    // config → official（用空 official provider；不动 model 字段）
+    // 先计算并建立 config 回滚基线；备份失败时不得覆盖 config/auth。
     let official = Provider {
         access_mode: AccessMode::Official,
         ..Provider::default()
@@ -381,13 +404,29 @@ pub fn activate_official(
     let current_toml = config_to_toml_string(&current_cfg).unwrap_or_default();
     let merged = build_config_value(&current_cfg, &official, "");
     let new_toml = config_to_toml_string(&merged)?;
-    let config_written = if new_toml != current_toml {
-        let _ = backup_file(
+    let config_needs_write = new_toml != current_toml;
+    if config_needs_write {
+        backup_file(
             config_path,
             backup_dir,
             "config-apply",
             "pre-activate-official",
-        );
+        )?;
+    }
+
+    // 01-D4：恢复 auth.json
+    let bak_p = codex_home.join(AUTH_OFFICIAL_BAK);
+    let auth_p = codex_home.join("auth.json");
+    let auth_restored = if bak_p.exists() {
+        let data = std::fs::read(&bak_p).map_err(|e| format!("读 .bak 失败: {e}"))?;
+        write_private_atomic(&auth_p, &data, "restore.tmp", "恢复 auth")?;
+        true
+    } else {
+        false
+    };
+
+    // config → official（用空 official provider；不动 model 字段）
+    let config_written = if config_needs_write {
         write_toml(config_path, &merged)?;
         true
     } else {
@@ -397,7 +436,15 @@ pub fn activate_official(
 
     // 清 active
     let mut data = crate::providers::load(providers_path);
-    data.active_provider_id = None;
+    data.active_provider_ids.remove("codex");
+    if data
+        .active_provider_id
+        .as_deref()
+        .and_then(|id| data.providers.iter().find(|provider| provider.id == id))
+        .is_some_and(|provider| provider.agent == "codex")
+    {
+        data.active_provider_id = data.active_provider_ids.values().next().cloned();
+    }
     crate::providers::store(providers_path, &data)?;
 
     Ok(OfficialOutcome {
@@ -481,45 +528,172 @@ pub fn backup_file(
     backup_dir: &Path,
     prefix: &str,
     purpose: &str,
-) -> Result<(), String> {
-    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let backup_name = format!("{prefix}-{timestamp}.toml");
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f").to_string();
+    let target_name = src
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("config")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+    let target_hash = path_hash(src);
+    let extension = src.extension().and_then(|v| v.to_str()).unwrap_or("bak");
+    let backup_name = format!(
+        "{prefix}-{target_name}-{target_hash}-{timestamp}-{}.{}",
+        uuid::Uuid::new_v4(),
+        extension
+    );
     let backup_path = backup_dir.join(&backup_name);
 
-    match std::fs::read(src) {
+    let (data, original_exists, hash) = match std::fs::read(src) {
         Ok(data) => {
             let mut hasher = Sha256::new();
             hasher.update(&data);
-            let hash = hex::encode(hasher.finalize());
-            std::fs::write(&backup_path, &data).map_err(|e| e.to_string())?;
-            let manifest = json!({
-                "version": 1,
-                "kind": "config",
-                "purpose": purpose,
-                "createdAt": chrono::Local::now().to_rfc3339(),
-                "configPath": src.to_string_lossy(),
-                "originalExists": true,
-                "sha256": hash,
-            });
-            let manifest_path = format!("{}.manifest.json", backup_path.display());
-            std::fs::write(
-                &manifest_path,
-                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
-            )
-            .ok();
+            (data, true, Some(hex::encode(hasher.finalize())))
         }
-        Err(_) => {
-            std::fs::write(&backup_path, "# original config.toml did not exist\n").ok();
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false, None),
+        Err(error) => return Err(format!("读取原配置失败: {error}")),
+    };
+    write_private_atomic(&backup_path, &data, "backup.tmp", "配置备份")?;
+    let manifest = json!({
+        "version": 2,
+        "kind": "config",
+        "purpose": purpose,
+        "createdAt": chrono::Local::now().to_rfc3339(),
+        "configPath": src.to_string_lossy(),
+        "originalExists": original_exists,
+        "sha256": hash,
+    });
+    let manifest_path = manifest_path(&backup_path);
+    let manifest_raw = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+    if let Err(error) = write_private_atomic(
+        &manifest_path,
+        manifest_raw.as_bytes(),
+        "manifest.tmp",
+        "备份 manifest",
+    ) {
+        let _ = std::fs::remove_file(&backup_path);
+        return Err(error);
     }
-    Ok(())
+    Ok(backup_path)
 }
 
-/// 从备份恢复 config。
-pub fn restore(config_path: &Path, backup_path: &str) -> Result<(), String> {
+fn path_hash(path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hex::encode(hasher.finalize())[..12].to_string()
+}
+
+fn manifest_path(backup_path: &Path) -> PathBuf {
+    if backup_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .is_some_and(|name| name.ends_with(".manifest.json"))
+    {
+        return backup_path.to_path_buf();
+    }
+    let mut name = backup_path
+        .file_name()
+        .map(|v| v.to_os_string())
+        .unwrap_or_default();
+    name.push(".manifest.json");
+    backup_path.with_file_name(name)
+}
+
+fn normalized_path(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|e| format!("解析路径失败: {e}"));
+    }
+    let parent = path.parent().ok_or_else(|| "路径缺少父目录".to_string())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "路径缺少文件名".to_string())?;
+    Ok(std::fs::canonicalize(parent)
+        .map_err(|e| format!("解析路径失败: {e}"))?
+        .join(file_name))
+}
+
+fn read_manifest(backup_path: &Path) -> Result<Value, String> {
+    let path = manifest_path(backup_path);
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取备份 manifest 失败: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("备份 manifest 格式错误: {e}"))
+}
+
+pub(crate) fn backup_matches_target(backup_path: &Path, target: &Path) -> bool {
+    let Ok(manifest) = read_manifest(backup_path) else {
+        return false;
+    };
+    let Some(config_path) = manifest.get("configPath").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let (Ok(source), Ok(target)) = (
+        normalized_path(Path::new(config_path)),
+        normalized_path(target),
+    ) else {
+        return false;
+    };
+    source == target
+}
+
+pub(crate) fn read_verified_backup(
+    backup_path: &Path,
+    target: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    let manifest = read_manifest(backup_path)?;
+    if !backup_matches_target(backup_path, target) {
+        return Err("备份来源与目标配置不匹配".into());
+    }
+    let original_exists = manifest
+        .get("originalExists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !original_exists {
+        return Ok(None);
+    }
     let data = std::fs::read(backup_path).map_err(|e| format!("读取备份失败: {e}"))?;
-    std::fs::write(config_path, data).map_err(|e| format!("写入失败: {e}"))?;
-    Ok(())
+    let expected = manifest
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "备份缺少 sha256 校验值".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let actual = hex::encode(hasher.finalize());
+    if actual != expected {
+        return Err("备份内容校验失败,拒绝恢复".into());
+    }
+    Ok(Some(data))
+}
+
+fn is_within_dir(path: &Path, dir: &Path) -> Result<bool, String> {
+    let path = std::fs::canonicalize(path).map_err(|e| format!("解析备份路径失败: {e}"))?;
+    let dir = std::fs::canonicalize(dir).map_err(|e| format!("解析备份目录失败: {e}"))?;
+    Ok(path.starts_with(dir))
+}
+
+/// 从备份恢复 config，并校验 manifest 的原目标与内容哈希。
+pub fn restore(config_path: &Path, backup_path: &str) -> Result<(), String> {
+    let backup_path = Path::new(backup_path);
+    let data = read_verified_backup(backup_path, config_path)?;
+    if data.is_none() {
+        let _ = std::fs::remove_file(config_path);
+        return Ok(());
+    }
+    let data = data.unwrap_or_default();
+    write_private_atomic(config_path, &data, "restore.tmp", "恢复配置")
+}
+
+pub fn restore_from_dir(
+    config_path: &Path,
+    backup_dir: &Path,
+    backup_path: &str,
+) -> Result<(), String> {
+    let backup_path = Path::new(backup_path);
+    if !is_within_dir(backup_path, backup_dir)? {
+        return Err("只能恢复应用备份目录内的文件".into());
+    }
+    restore(config_path, backup_path.to_string_lossy().as_ref())
 }
 
 /// 手动快照当前 config。
@@ -744,6 +918,7 @@ mod tests {
             serde_json::to_string(&ProviderData {
                 schema_version: 1,
                 active_provider_id: None,
+                active_provider_ids: Default::default(),
                 providers: vec![p.clone()],
             })
             .unwrap(),
@@ -766,5 +941,190 @@ mod tests {
         let data = crate::providers::load(&providers_path);
         assert_eq!(data.active_provider_id, Some(p.id));
         let _ = std::fs::remove_dir_all(&_root);
+    }
+
+    #[test]
+    fn backups_are_unique_and_restore_only_the_original_target() {
+        let (root, cfg, bk, _home) = sandbox("backup-identity");
+        let other = root.join("other.toml");
+        std::fs::write(&cfg, "model = \"a\"\n").unwrap();
+        std::fs::write(&other, "model = \"other\"\n").unwrap();
+
+        backup_file(&cfg, &bk, "config-apply", "pre-host").unwrap();
+        backup_file(&cfg, &bk, "config-apply", "pre-host").unwrap();
+        let backups: Vec<_> = std::fs::read_dir(&bk)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".manifest.json")
+            })
+            .collect();
+        assert_eq!(backups.len(), 2, "同秒备份不得互相覆盖");
+
+        let backup_path = backups[0].path();
+        assert!(
+            restore(&other, &backup_path.to_string_lossy()).is_err(),
+            "备份不得恢复到 manifest 之外的目标"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "model = \"other\"\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_provider_stops_when_backup_fails() {
+        let (root, cfg, bk, home) = sandbox("backup-fail-apply");
+        std::fs::write(&cfg, "model_provider = \"openai\"\n").unwrap();
+        std::fs::remove_dir_all(&bk).unwrap();
+        std::fs::write(&bk, "not a directory").unwrap();
+        let before = std::fs::read_to_string(&cfg).unwrap();
+
+        let error = apply_provider(&cfg, &bk, &home, &provider_with(AccessMode::Mixed))
+            .expect_err("备份失败必须阻止覆盖");
+        assert!(error.contains("备份目录"), "错误应说明备份失败: {error}");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_provider_stops_when_auth_backup_fails() {
+        let (root, cfg, bk, home) = sandbox("auth-backup-fail-apply");
+        std::fs::write(&cfg, "model_provider = \"openai\"\n").unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            "{\"tokens\":{\"id_token\":\"OFFICIAL\"}}",
+        )
+        .unwrap();
+        std::fs::create_dir(home.join("auth.json.official.bak.tmp")).unwrap();
+        let config_before = std::fs::read_to_string(&cfg).unwrap();
+        let auth_before = std::fs::read_to_string(home.join("auth.json")).unwrap();
+
+        apply_provider(&cfg, &bk, &home, &pureapi_provider())
+            .expect_err("auth 官方态备份失败必须阻止配置覆盖");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), config_before);
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            auth_before
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_provider_stops_when_auth_backup_source_is_unreadable() {
+        let (root, cfg, bk, home) = sandbox("auth-backup-read-fail");
+        std::fs::write(&cfg, "model_provider = \"openai\"\n").unwrap();
+        std::fs::create_dir(home.join("auth.json")).unwrap();
+        let config_before = std::fs::read_to_string(&cfg).unwrap();
+
+        apply_provider(&cfg, &bk, &home, &pureapi_provider())
+            .expect_err("auth 备份源不可读时必须阻止配置覆盖");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), config_before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activate_official_stops_before_auth_restore_when_backup_fails() {
+        let (root, cfg, bk, home) = sandbox("backup-fail-official");
+        std::fs::write(
+            home.join("auth.json"),
+            "{\"tokens\":{\"id_token\":\"OFFICIAL\"}}",
+        )
+        .unwrap();
+        let provider = pureapi_provider();
+        apply_provider(&cfg, &bk, &home, &provider).unwrap();
+        let providers_path = home.join("providers.json");
+        crate::providers::store(
+            &providers_path,
+            &ProviderData {
+                schema_version: 3,
+                active_provider_id: Some(provider.id.clone()),
+                active_provider_ids: [("codex".into(), provider.id.clone())]
+                    .into_iter()
+                    .collect(),
+                providers: vec![provider],
+            },
+        )
+        .unwrap();
+        let config_before = std::fs::read_to_string(&cfg).unwrap();
+        let auth_before = std::fs::read_to_string(home.join("auth.json")).unwrap();
+        std::fs::remove_dir_all(&bk).unwrap();
+        std::fs::write(&bk, "not a directory").unwrap();
+
+        activate_official(&cfg, &bk, &providers_path, &home)
+            .expect_err("备份失败必须阻止官方配置覆盖");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), config_before);
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            auth_before,
+            "config 备份失败时不得提前恢复 auth"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_target_comparison_fails_when_both_paths_cannot_normalize() {
+        let (root, _cfg, _bk, _home) = sandbox("backup-none-none");
+        let backup = root.join("invalid.bak");
+        std::fs::write(&backup, b"x").unwrap();
+        std::fs::write(
+            manifest_path(&backup),
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "configPath": root.join("missing-source/config.toml").to_string_lossy(),
+                "originalExists": true,
+                "sha256": "unused"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !backup_matches_target(&backup, &root.join("missing-target/config.toml")),
+            "两个路径同时规范化失败时不能因 None == None 被视为匹配"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_config_auth_and_backups_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, cfg, bk, home) = sandbox("private-files");
+        std::fs::write(&cfg, "model_provider = \"openai\"\n").unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            "{\"tokens\":{\"id_token\":\"official-secret\"}}",
+        )
+        .unwrap();
+        apply_provider(&cfg, &bk, &home, &provider_with(AccessMode::Mixed)).unwrap();
+        apply_provider(&cfg, &bk, &home, &pureapi_provider()).unwrap();
+
+        for path in [
+            cfg.clone(),
+            home.join("auth.json"),
+            home.join(AUTH_OFFICIAL_BAK),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "秘密文件必须为 0600: {}",
+                path.display()
+            );
+        }
+        for entry in std::fs::read_dir(&bk).unwrap().flatten() {
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600,
+                "备份及 manifest 必须为 0600: {}",
+                entry.path().display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }

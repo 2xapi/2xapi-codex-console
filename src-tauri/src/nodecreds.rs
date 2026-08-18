@@ -17,8 +17,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// 节点签发服务默认地址(已上线的加速节点)。
-pub const DEFAULT_ISSUE_BASE: &str = "http://156.238.251.207:443";
+/// 节点签发服务默认地址(生产签发只允许 HTTPS)。
+pub const DEFAULT_ISSUE_BASE: &str = "https://156.238.251.207:443";
+/// 节点代理地址仍由代理协议决定，不等同于签发接口地址。
+pub const DEFAULT_PROXY_ENDPOINT: &str = "http://156.238.251.207:443";
 
 /// 凭证文件名(与旧版单对象格式同路径,load 兼容迁移)。
 const FILE_NAME: &str = "accel-credentials.json";
@@ -117,19 +119,29 @@ fn store_path(codex_home: &Path) -> std::path::PathBuf {
 /// - 旧单对象 `{user,pass}` → 装入 legacy,视为 v2 空表;
 /// - 文件缺失/非法 → 空 Store(legacy=None)。
 pub fn load_store(codex_home: &Path) -> Store {
-    let Ok(raw) = std::fs::read_to_string(store_path(codex_home)) else {
+    let path = store_path(codex_home);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
         return Store::empty();
     };
     if let Ok(s) = serde_json::from_str::<Store>(&raw) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         return s;
     }
     // 旧单对象格式 → 迁移为 v2(legacy 装载,creds 空)
     match serde_json::from_str::<crate::acclines::Cred>(&raw) {
-        Ok(legacy) => Store {
-            version: 2,
-            legacy: Some(legacy),
-            creds: HashMap::new(),
-        },
+        Ok(legacy) => {
+            let store = Store {
+                version: 2,
+                legacy: Some(legacy),
+                creds: HashMap::new(),
+            };
+            let _ = save_store(codex_home, &store);
+            store
+        }
         Err(_) => Store::empty(),
     }
 }
@@ -148,6 +160,11 @@ pub fn save_store(codex_home: &Path, store: &Store) -> std::io::Result<()> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -171,6 +188,18 @@ pub enum IssueErr {
     Unreachable(String),
 }
 
+fn validate_issue_base(base_url: &str) -> Result<(), IssueErr> {
+    let parsed = reqwest::Url::parse(base_url.trim_end_matches('/'))
+        .map_err(|e| IssueErr::Unreachable(format!("签发地址无效: {e}")))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) => Ok(()),
+        _ => Err(IssueErr::Unreachable(
+            "拒绝向非回环 HTTP 地址发送签发请求,请配置 HTTPS".into(),
+        )),
+    }
+}
+
 /// 200 响应体(节点契约字段为 camelCase)。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -190,6 +219,7 @@ struct IssueResp {
 /// - 401 → KeyInvalid;403 → QuotaFull(尽力解析 body 里 error 文案);
 /// - 其他/网络/超时/非 JSON → Unreachable。
 pub async fn issue_node_cred(base_url: &str, api_key: &str) -> Result<NodeCred, IssueErr> {
+    validate_issue_base(base_url)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .no_proxy() // 绕过系统代理,仿 probe.rs
@@ -216,7 +246,7 @@ pub async fn issue_node_cred(base_url: &str, api_key: &str) -> Result<NodeCred, 
                 quota_used_bytes: body.quota_used_bytes.unwrap_or(0),
                 proxy_endpoint: body
                     .proxy_endpoint
-                    .unwrap_or_else(|| DEFAULT_ISSUE_BASE.to_string()),
+                    .unwrap_or_else(|| DEFAULT_PROXY_ENDPOINT.to_string()),
                 issued_at: chrono::Utc::now().timestamp(),
                 degraded_to_direct: false,
             })
@@ -303,6 +333,40 @@ mod tests {
         assert_eq!(
             (lg.user.as_str(), lg.pass.as_str()),
             ("old-user", "old-pass")
+        );
+        let persisted: Store =
+            serde_json::from_str(&std::fs::read_to_string(home.join(FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(persisted.version, 2, "旧格式读取后应立即迁移落盘");
+        assert!(persisted.legacy.is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(home.join(FILE_NAME))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_v2_repairs_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = sandbox("repair-mode");
+        let path = home.join(FILE_NAME);
+        std::fs::write(&path, serde_json::to_vec_pretty(&Store::empty()).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(load_store(&home).version, 2);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -465,6 +529,14 @@ mod tests {
             IssueErr::Unreachable(_) => {}
             other => panic!("拒连应 Unreachable,got {other:?}"),
         }
+    }
+
+    #[test]
+    fn production_issue_endpoint_uses_tls() {
+        assert!(
+            DEFAULT_ISSUE_BASE.starts_with("https://"),
+            "生产签发端点必须使用 HTTPS"
+        );
     }
 
     // ⑤ hash_key 稳定 + Debug 脱敏

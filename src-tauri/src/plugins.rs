@@ -50,6 +50,28 @@ pub fn validate_manifest(m: &Map<String, Value>) -> Result<(), String> {
     if !MOUNTS.contains(&mount) {
         return Err(format!("mount 须为 {MOUNTS:?} 之一,得到 {mount:?}"));
     }
+    for field in ["name", "version"] {
+        if !m.get(field).is_some_and(Value::is_string) {
+            return Err(format!("{field} 须为字符串"));
+        }
+    }
+    for field in ["input", "output"] {
+        if !m.get(field).is_some_and(Value::is_object) {
+            return Err(format!("{field} 须为对象"));
+        }
+    }
+    if let Some(icon) = m.get("icon") {
+        let icon = icon
+            .as_str()
+            .ok_or_else(|| "icon 须为纯文本字符串".to_string())?;
+        if icon.chars().count() > 32
+            || icon
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '<' | '>' | '&' | '"' | '\'' | '`'))
+        {
+            return Err("icon 只能是 32 字符以内的纯文本或 emoji".into());
+        }
+    }
     // ── v2 扩展字段(存在即验型)──
     if let Some(models) = m.get("models") {
         let arr = models
@@ -59,15 +81,17 @@ pub fn validate_manifest(m: &Map<String, Value>) -> Result<(), String> {
             let o = mm
                 .as_object()
                 .ok_or(format!("models[{i}] 须为对象 {{id, api, note}}"))?;
-            if o.get("id").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+            if o.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
                 return Err(format!("models[{i}] 缺 id(必填)"));
             }
         }
     }
     if let Some(config) = m.get("config") {
-        let arr = config
-            .as_array()
-            .ok_or("config 须为数组(配置项 schema)")?;
+        let arr = config.as_array().ok_or("config 须为数组(配置项 schema)")?;
         for (i, c) in arr.iter().enumerate() {
             let o = c
                 .as_object()
@@ -84,9 +108,7 @@ pub fn validate_manifest(m: &Map<String, Value>) -> Result<(), String> {
         }
     }
     if let Some(scenes) = m.get("scenes") {
-        scenes
-            .as_array()
-            .ok_or("scenes 须为数组(应用场景列表)")?;
+        scenes.as_array().ok_or("scenes 须为数组(应用场景列表)")?;
     }
     if let Some(md) = m.get("md") {
         if !md.is_string() {
@@ -99,6 +121,52 @@ pub fn validate_manifest(m: &Map<String, Value>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn public_config_values(codex_home: &std::path::Path, entry: &registry::Entry) -> Value {
+    let mut values = entry
+        .config
+        .get("values")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for key in values.keys().cloned().collect::<Vec<_>>() {
+        if registry::is_secret_config_key(entry, &key) {
+            values.insert(
+                key.clone(),
+                json!(
+                    if registry::get_plugin_secret(codex_home, &entry.id, &key).is_some() {
+                        registry::SECRET_MASK
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+    }
+    Value::Object(values)
+}
+
+fn resolved_config_values(
+    codex_home: &std::path::Path,
+    entry: &registry::Entry,
+) -> Map<String, Value> {
+    let mut values = entry
+        .config
+        .get("values")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for key in values.keys().cloned().collect::<Vec<_>>() {
+        if registry::is_secret_config_key(entry, &key) {
+            if let Some(secret) = registry::get_plugin_secret(codex_home, &entry.id, &key) {
+                values.insert(key, json!(secret));
+            } else {
+                values.remove(&key);
+            }
+        }
+    }
+    values
 }
 
 /// 拉取并校验 manifest;Ok = manifest 全量(含 endpoint 回填)。
@@ -181,10 +249,7 @@ pub fn routes() -> Router<Arc<crate::server::AppState>> {
     Router::new()
         .route("/api/plugins", get(handle_list).post(handle_register))
         .route("/api/plugins/local", post(handle_local_add))
-        .route(
-            "/api/plugins/:id",
-            get(handle_detail).delete(handle_remove),
-        )
+        .route("/api/plugins/:id", get(handle_detail).delete(handle_remove))
         .route("/api/plugins/:id/install", post(handle_install))
         .route("/api/plugins/:id/toggle", post(handle_toggle))
         .route("/api/plugins/:id/config", put(handle_config))
@@ -299,7 +364,11 @@ async fn handle_local_add(
     }
     m.insert("source".into(), json!(source));
     m.insert("source_id".into(), json!("local"));
-    let pid = m.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let pid = m
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     registry::upsert_plugin(&s.codex_home, &m);
     raw_json(
         StatusCode::OK,
@@ -334,7 +403,10 @@ async fn handle_install(
             }
         }
         registry::set_enabled(&s.codex_home, &id, true);
-        return raw_json(StatusCode::OK, &json!({ "ok": true, "installed": true, "id": id }));
+        return raw_json(
+            StatusCode::OK,
+            &json!({ "ok": true, "installed": true, "id": id }),
+        );
     }
     // 官方市场条目 → 取市场 manifest 登记(version 以市场为准,避免登记旧版致「可更新」误标)
     let market = official_market();
@@ -347,7 +419,10 @@ async fn handle_install(
         mm.insert("builtin".into(), json!(true));
         registry::upsert_plugin(&s.codex_home, &mm);
         registry::set_enabled(&s.codex_home, &id, true);
-        return raw_json(StatusCode::OK, &json!({ "ok": true, "installed": true, "id": id }));
+        return raw_json(
+            StatusCode::OK,
+            &json!({ "ok": true, "installed": true, "id": id }),
+        );
     }
     err_env(
         StatusCode::NOT_FOUND,
@@ -365,24 +440,19 @@ async fn handle_detail(
     };
     let mut d = entry.meta.clone();
     d.insert("enabled".into(), json!(entry.enabled));
-    d.insert("status".into(), json!(if entry.enabled { "enabled" } else { "disabled" }));
+    d.insert(
+        "status".into(),
+        json!(if entry.enabled { "enabled" } else { "disabled" }),
+    );
     d.insert("source".into(), json!(entry.source));
     d.insert("updated_at".into(), json!(entry.updated_at));
     d.insert(
         "config_values".into(),
-        entry
-            .config
-            .get("values")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
+        public_config_values(&s.codex_home, &entry),
     );
     d.insert(
         "failover".into(),
-        entry
-            .config
-            .get("failover")
-            .cloned()
-            .unwrap_or(json!(true)),
+        entry.config.get("failover").cloned().unwrap_or(json!(true)),
     );
     d.insert("models".into(), json!(user_models(&entry)));
     raw_json(StatusCode::OK, &json!({ "ok": true, "data": d }))
@@ -398,18 +468,18 @@ async fn handle_config(
         return err_env(StatusCode::NOT_FOUND, "E_NO_PLUGIN", "插件不存在");
     };
     let Some(values) = body.get("config").and_then(|v| v.as_object()).cloned() else {
-        return err_env(
-            StatusCode::BAD_REQUEST,
-            "E_ARGS",
-            "config 须为对象 {k: v}",
-        );
+        return err_env(StatusCode::BAD_REQUEST, "E_ARGS", "config 须为对象 {k: v}");
     };
     // models 缺省 = 保留既有(部分保存);给出则须数组且每项 id 非空
     let models = match body.get("models") {
         Some(v) if v.is_array() => {
             let arr = v.as_array().unwrap();
             for (i, m) in arr.iter().enumerate() {
-                if m.get("id").and_then(|x| x.as_str()).unwrap_or("").is_empty() {
+                if m.get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     return err_env(
                         StatusCode::BAD_REQUEST,
                         "E_ARGS",
@@ -437,13 +507,45 @@ async fn handle_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     let mut config = Map::new();
+    let mut public_values = Map::new();
+    for (key, value) in &values {
+        if registry::is_secret_config_key(&entry, key) {
+            let secret = value.as_str().unwrap_or("");
+            if secret != registry::SECRET_MASK {
+                if let Err(error) =
+                    registry::set_plugin_secret(&s.codex_home, &entry.id, key, secret)
+                {
+                    return err_env(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "E_PLUGIN_SECRET_SAVE",
+                        &error,
+                    );
+                }
+            }
+            public_values.insert(
+                key.clone(),
+                json!(
+                    if registry::get_plugin_secret(&s.codex_home, &entry.id, key).is_some() {
+                        registry::SECRET_MASK
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        } else {
+            public_values.insert(key.clone(), value.clone());
+        }
+    }
     config.insert("models".into(), json!(models.unwrap_or_default()));
     config.insert("failover".into(), json!(failover));
-    config.insert("values".into(), json!(values));
+    config.insert("values".into(), Value::Object(public_values));
     if !registry::set_config(&s.codex_home, &id, config.clone()) {
         return err_env(StatusCode::NOT_FOUND, "E_NO_PLUGIN", "插件不存在");
     }
-    raw_json(StatusCode::OK, &json!({ "ok": true, "id": id, "config": config }))
+    raw_json(
+        StatusCode::OK,
+        &json!({ "ok": true, "id": id, "config": config, "config_values": public_config_values(&s.codex_home, &entry) }),
+    )
 }
 
 /// 更新:官方/远程条目重新拉 manifest 比对版本;本地条目 400 人话「本地插件更新请重新添加」。
@@ -588,7 +690,10 @@ async fn handle_invoke(
             .unwrap_or(false)
     {
         match entry.id.as_str() {
-            "ffmpeg-frame-extract" => return builtin_frame_extract(&s.codex_home, &body).await,
+            "ffmpeg-frame-extract" => {
+                let values = resolved_config_values(&s.codex_home, &entry);
+                return builtin_frame_extract_config(&s.codex_home, &body, Some(&values)).await;
+            }
             "image-describe" => {
                 return builtin_media_failover(&s, &entry, &body, MediaTool::Describe).await
             }
@@ -598,10 +703,19 @@ async fn handle_invoke(
             "image-edit" => {
                 return builtin_media_failover(&s, &entry, &body, MediaTool::Edit).await
             }
-            _ => {} // ASR/TTS 等无本机实现 → 走 models 配置端点调用链(未配置即人话引导)
+            "asr-speech" => {
+                let values = resolved_config_values(&s.codex_home, &entry);
+                return builtin_asr_speech(&s.codex_home, &entry, &body, &values).await;
+            }
+            "tts-speech" => {
+                let values = resolved_config_values(&s.codex_home, &entry);
+                return builtin_tts_speech(&s.codex_home, &entry, &body, &values).await;
+            }
+            _ => {}
         }
     }
-    invoke_with_failover(&entry, &body).await
+    let values = resolved_config_values(&s.codex_home, &entry);
+    invoke_with_failover_config(&entry, &body, Some(&values)).await
 }
 
 /// 内置媒体工具分发(media_tools 三函数签名同构,枚举免去泛型 future 生命周期体操)。
@@ -643,12 +757,8 @@ async fn builtin_media_failover(
     for (i, m) in pool.iter().enumerate() {
         let label = if i == 0 { "主模型" } else { "备用模型" };
         let mid = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let api = m.get("api").and_then(|v| v.as_str()).unwrap_or("");
         let mut req = body.clone();
         req["model"] = json!(mid);
-        if !api.is_empty() {
-            req["api"] = json!(api);
-        }
         let resp = match tool {
             MediaTool::Describe => crate::media_tools::image_describe(s, &req).await,
             MediaTool::Generate => crate::media_tools::image_generate(s, &req).await,
@@ -701,6 +811,479 @@ fn user_models(entry: &registry::Entry) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+#[derive(Clone)]
+struct SpeechEndpoint {
+    api: String,
+    model: String,
+}
+
+const MAX_ASR_INPUT_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_ASR_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_TTS_RESPONSE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_VIDEO_INPUT_BYTES: u64 = 100 * 1024 * 1024;
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_keyed_endpoint(api_base: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(api_base).map_err(|error| format!("API 地址无效: {error}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if parsed.host_str().is_some_and(is_loopback_host) => Ok(()),
+        "http" => Err("拒绝向非回环明文 HTTP 地址发送 API Key,请改用 HTTPS".into()),
+        _ => Err("API 地址仅支持 HTTPS，或本机回环 HTTP".into()),
+    }
+}
+
+async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("响应超过大小上限 {max_bytes} bytes"));
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("响应读取失败: {error}"))?
+    {
+        if data.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("响应超过大小上限 {max_bytes} bytes"));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
+fn config_text<'a>(config: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    config
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn body_text<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn speech_endpoints(
+    entry: &registry::Entry,
+    body: &Value,
+    config: &Map<String, Value>,
+    default_model: &str,
+) -> Vec<SpeechEndpoint> {
+    let explicit_model = body_text(body, "model");
+    let configured_model = config_text(config, "model");
+    let configured_api = config_text(config, "apiBase");
+    let models = user_models(entry);
+    let mut endpoints = Vec::new();
+
+    for model in &models {
+        let model_api = model
+            .get("api")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(api) = model_api.or(configured_api) else {
+            continue;
+        };
+        let manifest_model = model
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let selected_model = if model_api.is_some() {
+            explicit_model.or(manifest_model).or(configured_model)
+        } else {
+            explicit_model.or(configured_model).or(manifest_model)
+        }
+        .unwrap_or(default_model);
+        if endpoints.iter().any(|endpoint: &SpeechEndpoint| {
+            endpoint.api == api && endpoint.model == selected_model
+        }) {
+            continue;
+        }
+        endpoints.push(SpeechEndpoint {
+            api: api.to_string(),
+            model: selected_model.to_string(),
+        });
+    }
+
+    if let Some(api) = configured_api {
+        if !endpoints.iter().any(|endpoint| endpoint.api == api) {
+            let fallback_model = models
+                .first()
+                .and_then(|model| model.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            endpoints.push(SpeechEndpoint {
+                api: api.to_string(),
+                model: explicit_model
+                    .or(configured_model)
+                    .or(fallback_model)
+                    .unwrap_or(default_model)
+                    .to_string(),
+            });
+        }
+    }
+
+    let failover = entry
+        .config
+        .get("failover")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !failover && endpoints.len() > 1 {
+        endpoints.truncate(1);
+    }
+    endpoints
+}
+
+fn openai_audio_url(api_base: &str, operation: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    let endpoint = format!("/audio/{operation}");
+    if base.ends_with(&endpoint) {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}{endpoint}")
+    } else {
+        format!("{base}/v1{endpoint}")
+    }
+}
+
+fn resolve_media_path(
+    codex_home: &std::path::Path,
+    media_url: &str,
+    max_bytes: u64,
+) -> Result<std::path::PathBuf, (&'static str, String)> {
+    let media_url = media_url.trim();
+    if media_url.contains("..") {
+        return Err(("E_ARGS", "media_url 不得包含路径穿越片段".into()));
+    }
+    let media_root = crate::media::media_root(codex_home);
+    let candidate = if let Some(tail) = media_url.rsplit('/').next() {
+        if let Some((id, ext)) = tail.split_once('.') {
+            if !id.is_empty()
+                && id.chars().all(|c| c.is_ascii_hexdigit())
+                && !ext.is_empty()
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                media_root.join(tail)
+            } else {
+                std::path::PathBuf::from(media_url)
+            }
+        } else {
+            std::path::PathBuf::from(media_url)
+        }
+    } else {
+        std::path::PathBuf::from(media_url)
+    };
+    if !candidate.is_absolute() {
+        return Err(("E_ARGS", "media_url 形态不支持".into()));
+    }
+    let root = std::fs::canonicalize(&media_root)
+        .map_err(|_| ("E_MEDIA_NOT_FOUND", "媒体暂存目录不存在".into()))?;
+    let path = std::fs::canonicalize(&candidate)
+        .map_err(|_| ("E_MEDIA_NOT_FOUND", "媒体文件不存在".into()))?;
+    if !path.starts_with(&root) {
+        return Err(("E_MEDIA_SCOPE", "仅允许读取应用媒体暂存目录中的文件".into()));
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| ("E_MEDIA_READ", format!("读取媒体元数据失败: {error}")))?;
+    if !metadata.is_file() {
+        return Err(("E_MEDIA_READ", "媒体地址必须指向普通文件".into()));
+    }
+    if metadata.len() > max_bytes {
+        return Err((
+            "E_MEDIA_TOO_LARGE",
+            format!("媒体文件超过 {}MB 上限", max_bytes / 1024 / 1024),
+        ));
+    }
+    Ok(path)
+}
+
+fn audio_mime_for_path(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "m4a" => Some("audio/mp4"),
+        "mp4" => Some("audio/mp4"),
+        "webm" => Some("audio/webm"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        _ => None,
+    }
+}
+
+fn speech_config_error(message: &str) -> Response {
+    err_env(StatusCode::BAD_REQUEST, "E_PLUGIN_CONFIG", message)
+}
+
+fn speech_failover_error(parts: &[String]) -> Response {
+    err_env(
+        StatusCode::BAD_GATEWAY,
+        "E_PLUGIN_FAILOVER",
+        &format!("{}。请检查配置或稍后重试", parts.join(",")),
+    )
+}
+
+async fn attempt_asr(
+    endpoint: &SpeechEndpoint,
+    api_key: &str,
+    media_path: &std::path::Path,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    validate_keyed_endpoint(&endpoint.api)?;
+    let metadata = tokio::fs::metadata(media_path)
+        .await
+        .map_err(|error| format!("读取音频元数据失败: {error}"))?;
+    if metadata.len() > MAX_ASR_INPUT_BYTES {
+        return Err(format!(
+            "音频文件超过 {}MB 上限",
+            MAX_ASR_INPUT_BYTES / 1024 / 1024
+        ));
+    }
+    let data = tokio::fs::read(media_path)
+        .await
+        .map_err(|error| format!("读取音频失败: {error}"))?;
+    let filename = media_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio.bin")
+        .to_string();
+    let mut file = reqwest::multipart::Part::bytes(data).file_name(filename);
+    if let Some(mime) = audio_mime_for_path(media_path) {
+        file = file
+            .mime_str(mime)
+            .map_err(|error| format!("音频 MIME 无效: {error}"))?;
+    }
+    let form = reqwest::multipart::Form::new()
+        .part("file", file)
+        .text("model", endpoint.model.clone());
+    let response = plugin_client()
+        .post(openai_audio_url(&endpoint.api, "transcriptions"))
+        .bearer_auth(api_key)
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!("响应超时(上限 {timeout_ms}ms)")
+            } else {
+                format!("不可达: {error}")
+            }
+        })?;
+    let status = response.status();
+    let bytes = response_bytes_limited(response, MAX_ASR_RESPONSE_BYTES).await?;
+    if !status.is_success() {
+        return Err(format!(
+            "上游错误(HTTP {}): {}",
+            status.as_u16(),
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        ));
+    }
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|error| format!("响应非 JSON: {error}"))?;
+    value
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("data")?.get("text")?.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "响应缺少 text".to_string())
+}
+
+async fn builtin_asr_speech(
+    codex_home: &std::path::Path,
+    entry: &registry::Entry,
+    body: &Value,
+    config: &Map<String, Value>,
+) -> Response {
+    let Some(media_url) = body_text(body, "media_url") else {
+        return raw_json(
+            StatusCode::OK,
+            &json!({"ok": false, "error": {"code": "E_ARGS", "message": "media_url 必填", "human": "请提供待识别音频的媒体地址"}}),
+        );
+    };
+    let media_path = match resolve_media_path(codex_home, media_url, MAX_ASR_INPUT_BYTES) {
+        Ok(path) => path,
+        Err((code, message)) => {
+            return raw_json(
+                StatusCode::OK,
+                &json!({"ok": false, "error": {"code": code, "message": message, "human": "请先上传音频并使用网关暂存地址"}}),
+            );
+        }
+    };
+    let Some(api_key) = config_text(config, "apiKey") else {
+        return speech_config_error("请先配置 ASR API Key");
+    };
+    let endpoints = speech_endpoints(entry, body, config, "whisper-1");
+    if endpoints.is_empty() {
+        return speech_config_error("请先配置 ASR apiBase 或模型端点");
+    }
+    let timeout_ms = entry
+        .meta
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    let mut parts = Vec::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        match attempt_asr(endpoint, api_key, &media_path, timeout_ms).await {
+            Ok(text) => {
+                return raw_json(StatusCode::OK, &json!({"ok": true, "data": {"text": text}}));
+            }
+            Err(reason) => parts.push(format!(
+                "{} {} 失败({reason})",
+                if index == 0 {
+                    "主端点"
+                } else {
+                    "备用端点"
+                },
+                endpoint.model
+            )),
+        }
+    }
+    speech_failover_error(&parts)
+}
+
+fn response_audio_mime(content_type: Option<&str>) -> &'static str {
+    let value = content_type.unwrap_or("").to_ascii_lowercase();
+    if value.starts_with("audio/mpeg") || value.starts_with("audio/mp3") {
+        "audio/mpeg"
+    } else if value.starts_with("audio/wav")
+        || value.starts_with("audio/x-wav")
+        || value.starts_with("audio/wave")
+    {
+        "audio/wav"
+    } else {
+        ""
+    }
+}
+
+async fn attempt_tts(
+    codex_home: &std::path::Path,
+    endpoint: &SpeechEndpoint,
+    api_key: &str,
+    text: &str,
+    voice: &str,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    validate_keyed_endpoint(&endpoint.api)?;
+    let response = plugin_client()
+        .post(openai_audio_url(&endpoint.api, "speech"))
+        .bearer_auth(api_key)
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .json(&json!({
+            "model": endpoint.model,
+            "input": text,
+            "voice": voice,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                format!("响应超时(上限 {timeout_ms}ms)")
+            } else {
+                format!("不可达: {error}")
+            }
+        })?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = response_bytes_limited(response, MAX_TTS_RESPONSE_BYTES).await?;
+    if !status.is_success() {
+        return Err(format!(
+            "上游错误(HTTP {}): {}",
+            status.as_u16(),
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        ));
+    }
+    if bytes.is_empty() {
+        return Err("上游返回空音频".into());
+    }
+    let mime = response_audio_mime(content_type.as_deref());
+    let item = crate::media::store_upload(codex_home, &bytes, mime, "tts-speech")
+        .map_err(|(_, message)| format!("音频暂存失败: {message}"))?;
+    Ok(json!({
+        "media_url": format!("/media/{}.{}", item.id, item.ext),
+        "mime": item.mime,
+    }))
+}
+
+async fn builtin_tts_speech(
+    codex_home: &std::path::Path,
+    entry: &registry::Entry,
+    body: &Value,
+    config: &Map<String, Value>,
+) -> Response {
+    let Some(text) = body_text(body, "text") else {
+        return raw_json(
+            StatusCode::OK,
+            &json!({"ok": false, "error": {"code": "E_ARGS", "message": "text 必填", "human": "请输入要合成的文字"}}),
+        );
+    };
+    let Some(api_key) = config_text(config, "apiKey") else {
+        return speech_config_error("请先配置 TTS API Key");
+    };
+    let voice = body_text(body, "voice")
+        .or_else(|| config_text(config, "voice"))
+        .unwrap_or("alloy");
+    let endpoints = speech_endpoints(entry, body, config, "tts-1");
+    if endpoints.is_empty() {
+        return speech_config_error("请先配置 TTS apiBase 或模型端点");
+    }
+    let timeout_ms = entry
+        .meta
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    let mut parts = Vec::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        match attempt_tts(codex_home, endpoint, api_key, text, voice, timeout_ms).await {
+            Ok(data) => {
+                return raw_json(StatusCode::OK, &json!({"ok": true, "data": data}));
+            }
+            Err(reason) => parts.push(format!(
+                "{} {} 失败({reason})",
+                if index == 0 {
+                    "主端点"
+                } else {
+                    "备用端点"
+                },
+                endpoint.model
+            )),
+        }
+    }
+    speech_failover_error(&parts)
+}
+
 /// 单模型调用:POST {base}/invoke(model 注入 body);Ok=HTTP <500 响应体(含 200 包业务错误);
 /// Err=网络错/5xx/超时/非 JSON(人话原因)。
 async fn attempt_invoke(
@@ -736,7 +1319,20 @@ async fn attempt_invoke(
 
 /// 故障转移调用链:无 models → 原 endpoint 调用(行为不变);单模型/关闭 failover → 只试主模型
 /// (结果原样返回);多模型 → 按优先级逐个尝试(网络错/5xx/超时/业务错都切换),全败聚合人话。
+#[cfg(test)]
 async fn invoke_with_failover(entry: &registry::Entry, body: &Value) -> Response {
+    invoke_with_failover_config(entry, body, None).await
+}
+
+async fn invoke_with_failover_config(
+    entry: &registry::Entry,
+    body: &Value,
+    config: Option<&Map<String, Value>>,
+) -> Response {
+    let mut payload = body.clone();
+    if let Some(config) = config {
+        payload["config"] = Value::Object(config.clone());
+    }
     let timeout_ms = entry
         .meta
         .get("timeout_ms")
@@ -744,7 +1340,7 @@ async fn invoke_with_failover(entry: &registry::Entry, body: &Value) -> Response
         .unwrap_or(DEFAULT_TIMEOUT_MS);
     let models = user_models(entry);
     if models.is_empty() {
-        return invoke_plugin(entry, body).await;
+        return invoke_plugin(entry, &payload).await;
     }
     let failover = entry
         .config
@@ -768,11 +1364,8 @@ async fn invoke_with_failover(entry: &registry::Entry, body: &Value) -> Response
                 &format!("主模型 {mid} 未配置服务端点(api 为空),请检查插件配置"),
             );
         }
-        return match attempt_invoke(api, mid, body, timeout_ms).await {
-            Ok((status, v)) => raw_json(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-                &v,
-            ),
+        return match attempt_invoke(api, mid, &payload, timeout_ms).await {
+            Ok((status, v)) => raw_json(StatusCode::from_u16(status).unwrap_or(StatusCode::OK), &v),
             Err(reason) => err_env(
                 StatusCode::BAD_GATEWAY,
                 "E_PLUGIN_FAILOVER",
@@ -790,12 +1383,9 @@ async fn invoke_with_failover(entry: &registry::Entry, body: &Value) -> Response
             parts.push(format!("{label} {mid} 未配置服务端点(api 为空)"));
             continue;
         }
-        match attempt_invoke(api, mid, body, timeout_ms).await {
+        match attempt_invoke(api, mid, &payload, timeout_ms).await {
             Ok((status, v)) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
-                return raw_json(
-                    StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-                    &v,
-                );
+                return raw_json(StatusCode::from_u16(status).unwrap_or(StatusCode::OK), &v);
             }
             Ok((_, v)) => {
                 let reason = v["error"]["human"]
@@ -899,6 +1489,12 @@ mod tests {
             m
         })
         .is_err());
+        assert!(validate_manifest(&{
+            let mut m = good.clone();
+            m.insert("icon".into(), json!("<img src=x onerror=alert(1)>"));
+            m
+        })
+        .is_err());
     }
 
     #[tokio::test]
@@ -949,8 +1545,8 @@ mod tests {
 
 pub const OFFICIAL_SOURCE: &str = "official";
 
-/// 官方源内置清单:官方 6 条(识图/文生图/图编辑/抽帧/ASR/TTS)。
-/// 前 4 条=tool 条目(invoke 分发本机实现);ASR/TTS 为可配置端点插件(默认端点留空,文档提示用户配置)。
+/// 官方源内置清单:官方 6 条(识图/文生图/图编辑/抽帧/ASR/TTS),统一登记为内置 tool。
+/// ASR/TTS 在本机完成 OpenAI 兼容协议适配,端点默认留空并由用户配置。
 /// 数据与 `插件演示-产品UI/` PLUG2_DATA 一致(含 md/scenes/config/models 全字段)。
 fn official_market() -> Value {
     json!({
@@ -961,7 +1557,7 @@ fn official_market() -> Value {
                 "id": "ffmpeg-frame-extract",
                 "name": "视频抽帧 · 视频转图片",
                 "author": "官方",
-                "version": "1.0.0",
+                "version": "1.0.1",
                 "cap": "抽帧",
                 "icon": "🎞️",
                 "mount": "media_parse",
@@ -1074,7 +1670,7 @@ fn official_market() -> Value {
                 "id": "asr-speech",
                 "name": "语音识别 · 音频转文字",
                 "author": "官方",
-                "version": "1.1.0",
+                "version": "1.2.0",
                 "cap": "ASR",
                 "icon": "🎙️",
                 "mount": "media_parse",
@@ -1102,7 +1698,7 @@ fn official_market() -> Value {
                 "id": "tts-speech",
                 "name": "语音合成 · 文字转语音",
                 "author": "官方",
-                "version": "1.1.0",
+                "version": "1.2.0",
                 "cap": "TTS",
                 "icon": "🔊",
                 "mount": "tool_exec",
@@ -1119,6 +1715,7 @@ fn official_market() -> Value {
                 "config": [
                     { "k": "apiBase", "label": "TTS API 地址", "type": "text", "def": "", "hint": "任意提供 TTS 的服务(OpenAI / Azure / 中转站),默认留空,调用返回人话引导配置" },
                     { "k": "apiKey", "label": "API Key", "type": "password", "req": true, "hint": "你的服务商 Key" },
+                    { "k": "model", "label": "合成模型", "type": "select", "def": "tts-1", "options": ["tts-1", "tts-1-hd", "gpt-4o-mini-tts", "其他"] },
                     { "k": "voice", "label": "默认音色", "type": "select", "def": "alloy", "options": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"] }
                 ],
                 "scenes": [
@@ -1175,7 +1772,22 @@ pub async fn fetch_market(url: &str) -> Result<Value, String> {
 // ── 内置抽帧 tool(官方转正:注册表 tool 条目,invoke 分发本机 ffmpeg)──
 
 /// 从媒体暂存 URL / 本地路径抽一帧。ffmpeg 缺失/失败 → 200 包错误(插件契约同形)。
+#[cfg(test)]
 async fn builtin_frame_extract(codex_home: &std::path::Path, body: &Value) -> Response {
+    builtin_frame_extract_config(codex_home, body, None).await
+}
+
+fn numeric_value(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+}
+
+async fn builtin_frame_extract_config(
+    codex_home: &std::path::Path,
+    body: &Value,
+    config: Option<&Map<String, Value>>,
+) -> Response {
     let Some(media_url) = body
         .get("media_url")
         .and_then(|v| v.as_str())
@@ -1186,38 +1798,27 @@ async fn builtin_frame_extract(codex_home: &std::path::Path, body: &Value) -> Re
             &json!({"ok": false, "error": {"code": "E_ARGS", "message": "media_url 必填", "human": "请提供视频的媒体地址"}}),
         );
     };
-    let t = body.get("t").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    // 源定位:网关暂存 URL(尾段 {id}.{ext})或绝对本地路径;id 限 hex 防路径穿越
-    let src: String = match media_url.rsplit('/').next() {
-        Some(tail)
-            if tail.contains('.')
-                && tail
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit()) =>
-        {
-            let p = crate::media::media_root(codex_home).join(tail);
-            if !p.exists() {
-                return raw_json(
-                    StatusCode::OK,
-                    &json!({"ok": false, "error": {"code": "E_MEDIA_NOT_FOUND", "message": "media_url 不在暂存", "human": "该媒体地址不在本机暂存,请先上传"}}),
-                );
-            }
-            p.to_string_lossy().into_owned()
-        }
-        _ if media_url.starts_with('/') && !media_url.contains("..") => media_url.to_string(),
-        _ => {
+    let t = body
+        .get("t")
+        .and_then(numeric_value)
+        .or_else(|| config?.get("defaultT").and_then(numeric_value))
+        .unwrap_or(0.0);
+    let ffmpeg_path = body_text(body, "ffmpegPath")
+        .or_else(|| config.and_then(|values| config_text(values, "ffmpegPath")))
+        .unwrap_or("ffmpeg")
+        .to_string();
+    let src = match resolve_media_path(codex_home, media_url, MAX_VIDEO_INPUT_BYTES) {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err((code, message)) => {
             return raw_json(
                 StatusCode::OK,
-                &json!({"ok": false, "error": {"code": "E_ARGS", "message": "media_url 形态不支持", "human": "支持网关暂存地址(/media/{id}.{ext})或本机绝对路径"}}),
+                &json!({"ok": false, "error": {"code": code, "message": message, "human": "请先上传视频并使用网关暂存地址"}}),
             );
         }
     };
     let home = codex_home.to_path_buf();
     let extracted = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("ffmpeg")
+        std::process::Command::new(ffmpeg_path)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -1430,6 +2031,13 @@ async fn handle_market_install(
             Ok(m) => m,
             Err(e) => return err_env(StatusCode::BAD_REQUEST, "E_PLUGIN_MANIFEST", &e),
         };
+        if m.get("id").and_then(Value::as_str) != Some(plugin_id.as_str()) {
+            return err_env(
+                StatusCode::BAD_REQUEST,
+                "E_PLUGIN_MANIFEST",
+                "远程 manifest id 与所选插件不一致,拒绝安装",
+            );
+        }
         m.insert("source_id".into(), json!(source_id));
         m
     };
@@ -1455,6 +2063,8 @@ async fn handle_market_install(
 #[cfg(test)]
 mod market_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         let h = std::env::temp_dir().join(format!("2xapi-mkt-{tag}-{}", std::process::id()));
@@ -1493,13 +2103,16 @@ mod market_tests {
         // 旧版登记(1.0.0)→ 幂等安装同步市场版
         let root2 = tmp_home("install-stale");
         let s2 = std::sync::Arc::new(mk_state(&root2));
-        let mut stale = official_market()["plugins"][0].as_object().cloned().unwrap();
+        let mut stale = official_market()["plugins"][0]
+            .as_object()
+            .cloned()
+            .unwrap();
         stale.insert("version".into(), json!("1.0.0"));
         registry::upsert_plugin(&s2.codex_home, &stale);
         let resp2 = handle_install(State(s2.clone()), Path("ffmpeg-frame-extract".into())).await;
         assert_eq!(body_of(resp2).await["ok"], true);
         let e2 = registry::get_plugin(&s2.codex_home, "ffmpeg-frame-extract").unwrap();
-        assert_eq!(e2.meta["version"], "1.0.0", "市场 ffmpeg 版=1.0.0,同步后一致");
+        assert_eq!(e2.meta["version"], "1.0.1", "市场 ffmpeg 版应同步到最新版");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&root2);
     }
@@ -1593,6 +2206,80 @@ mod market_tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn builtin_frame_extract_honors_config_and_body_overrides() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tmp_home("ffmpeg-config");
+        let media_root = crate::media::media_root(&home);
+        std::fs::create_dir_all(&media_root).unwrap();
+        let input = media_root.join("feedface.mp4");
+        let script = home.join("fake-ffmpeg.sh");
+        let args_log = home.join("ffmpeg-args.txt");
+        std::fs::write(&input, b"video fixture").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '\\377\\330\\377\\331'\n",
+                args_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let config: Map<String, Value> = serde_json::from_value(json!({
+            "ffmpegPath": script.to_string_lossy(),
+            "defaultT": "2.75"
+        }))
+        .unwrap();
+        let value = body_of(
+            builtin_frame_extract_config(
+                &home,
+                &json!({"media_url": input.to_string_lossy()}),
+                Some(&config),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["ok"], true, "配置的 ffmpegPath 应被执行: {value}");
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert!(args
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["-ss", "2.75"]));
+
+        let override_config: Map<String, Value> = serde_json::from_value(json!({
+            "ffmpegPath": "/definitely/missing/ffmpeg",
+            "defaultT": 9
+        }))
+        .unwrap();
+        let value = body_of(
+            builtin_frame_extract_config(
+                &home,
+                &json!({
+                    "media_url": input.to_string_lossy(),
+                    "ffmpegPath": script.to_string_lossy(),
+                    "t": 1.25
+                }),
+                Some(&override_config),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["ok"], true, "body 显式配置应优先: {value}");
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert!(args
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["-ss", "1.25"]));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// 市场清单 schema 校验(mock 清单源:合法/坏 schema_version 两形态)。
     #[tokio::test]
     async fn fetch_market_schema_validation() {
@@ -1646,13 +2333,12 @@ mod market_tests {
             oclaw_home: root.join("oclaw"),
             cd_home: root.to_path_buf(),
             cursor_home: root.join("cursorhome"),
-            trae_home: root.join("traehome"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(crate::server::AccelCfg::default())),
-            nodecreds: std::sync::Arc::new(std::sync::RwLock::new(
-                crate::nodecreds::Store::empty(),
-            )),
+            nodecreds: std::sync::Arc::new(
+                std::sync::RwLock::new(crate::nodecreds::Store::empty()),
+            ),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
             tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
@@ -1707,6 +2393,114 @@ mod market_tests {
         serde_json::from_slice(&b).unwrap()
     }
 
+    #[tokio::test]
+    async fn market_install_rejects_manifest_id_mismatch() {
+        let root = tmp_home("manifest-id-mismatch");
+        let state = std::sync::Arc::new(mk_state(&root));
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+        let server = mock_http(vec![
+            (
+                "/market".into(),
+                200,
+                r#"{"schema_version":1,"plugins":[{"id":"wanted-plugin","endpoint":"http://__ADDR__/plugin"}]}"#.into(),
+            ),
+            (
+                "/plugin/manifest".into(),
+                200,
+                r#"{"id":"different-plugin","name":"Different","version":"1.0.0","mount":"tool_exec","input":{},"output":{}}"#.into(),
+            ),
+        ])
+        .await;
+        save_sources(
+            &state.codex_home,
+            &[json!({"id":"remote-source","name":"Remote","url":format!("{server}/market")})],
+        );
+
+        let response = handle_market_install(
+            State(state.clone()),
+            Json(json!({"sourceId":"remote-source","pluginId":"wanted-plugin"})),
+        )
+        .await;
+        let value = body_of(response).await;
+        assert_eq!(value["ok"], false, "manifest id 不一致必须拒绝: {value}");
+        assert_eq!(value["error"]["code"], "E_PLUGIN_MANIFEST");
+        assert!(
+            registry::get_plugin(&state.codex_home, "remote-source.different-plugin").is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    async fn mock_capture(
+        status: u16,
+        content_type: &str,
+        response_body: Vec<u8>,
+    ) -> (String, tokio::sync::oneshot::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    panic!("mock 请求未读到完整头部");
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                break (header_end, content_length);
+            };
+            let body_start = header_end + 4;
+            while request.len() < body_start + content_length {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let captured = CapturedRequest {
+                head: String::from_utf8_lossy(&request[..header_end]).into_owned(),
+                body: request[body_start..request.len().min(body_start + content_length)].to_vec(),
+            };
+            let reason = match status {
+                200 => "OK",
+                400 => "Bad Request",
+                500 => "Internal Server Error",
+                _ => "Response",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&response_body).await.unwrap();
+            let _ = sender.send(captured);
+        });
+        (format!("http://{addr}"), receiver)
+    }
+
     fn entry_with_models(models: Value, failover: bool) -> registry::Entry {
         let mut meta = Map::new();
         meta.insert("timeout_ms".into(), json!(2000));
@@ -1724,6 +2518,216 @@ mod market_tests {
             source: "local".into(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn speech_security_checks_and_same_api_model_failover() {
+        assert!(validate_keyed_endpoint("https://speech.example/v1").is_ok());
+        assert!(validate_keyed_endpoint("http://127.0.0.1:8787/v1").is_ok());
+        assert!(validate_keyed_endpoint("http://speech.example/v1").is_err());
+
+        let entry = entry_with_models(
+            json!([
+                {"id":"whisper-a","api":"https://speech.example/v1"},
+                {"id":"whisper-b","api":"https://speech.example/v1"}
+            ]),
+            true,
+        );
+        let endpoints = speech_endpoints(&entry, &json!({}), &Map::new(), "whisper-1");
+        assert_eq!(
+            endpoints.len(),
+            2,
+            "同一 API 地址的不同模型都必须保留用于故障转移"
+        );
+        assert_eq!(endpoints[0].model, "whisper-a");
+        assert_eq!(endpoints[1].model, "whisper-b");
+    }
+
+    #[test]
+    fn plugin_media_input_is_staging_only_and_size_limited() {
+        let home = tmp_home("media-scope");
+        let media_root = crate::media::media_root(&home);
+        std::fs::create_dir_all(&media_root).unwrap();
+        let managed = media_root.join("aaaaaaaa.wav");
+        std::fs::write(&managed, b"RIFF0000WAVEfixture").unwrap();
+        assert!(resolve_media_path(&home, "/media/aaaaaaaa.wav", MAX_ASR_INPUT_BYTES).is_ok());
+
+        let outside = home.join("outside.wav");
+        std::fs::write(&outside, b"RIFF0000WAVEoutside").unwrap();
+        assert!(
+            resolve_media_path(
+                &home,
+                outside.to_string_lossy().as_ref(),
+                MAX_ASR_INPUT_BYTES
+            )
+            .is_err(),
+            "暂存目录外绝对路径必须拒绝"
+        );
+
+        let oversized = media_root.join("bbbbbbbb.wav");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_ASR_INPUT_BYTES + 1).unwrap();
+        assert!(
+            resolve_media_path(&home, "/media/bbbbbbbb.wav", MAX_ASR_INPUT_BYTES).is_err(),
+            "超限音频必须在读取前拒绝"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn builtin_asr_uses_standard_multipart_and_authorization() {
+        let home = tmp_home("asr-standard");
+        let media_root = crate::media::media_root(&home);
+        std::fs::create_dir_all(&media_root).unwrap();
+        let audio = media_root.join("aaaaaaaa.wav");
+        std::fs::write(&audio, b"RIFF0000WAVEasr-fixture").unwrap();
+        let (api, captured) = mock_capture(
+            200,
+            "application/json",
+            r#"{"text":"识别成功"}"#.as_bytes().to_vec(),
+        )
+        .await;
+        let entry = entry_with_models(json!([]), true);
+        let config: Map<String, Value> = serde_json::from_value(json!({
+            "apiBase": api,
+            "apiKey": "asr-secret",
+            "model": "whisper-custom"
+        }))
+        .unwrap();
+
+        let response = builtin_asr_speech(
+            &home,
+            &entry,
+            &json!({"media_url": audio.to_string_lossy()}),
+            &config,
+        )
+        .await;
+        let value = body_of(response).await;
+        assert_eq!(value["ok"], true, "ASR 应返回插件成功信封: {value}");
+        assert_eq!(value["data"]["text"], "识别成功");
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), captured)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = request.head.to_ascii_lowercase();
+        assert!(
+            head.starts_with("post /v1/audio/transcriptions http/1.1"),
+            "应调用标准转写路径: {}",
+            request.head
+        );
+        assert!(head.contains("authorization: bearer asr-secret"));
+        assert!(head.contains("content-type: multipart/form-data; boundary="));
+        let multipart = String::from_utf8_lossy(&request.body);
+        assert!(multipart.contains("name=\"file\"; filename=\"aaaaaaaa.wav\""));
+        assert!(multipart.contains("name=\"model\""));
+        assert!(multipart.contains("whisper-custom"));
+        assert!(
+            multipart.contains("asr-fixture"),
+            "multipart 应包含音频文件内容"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn builtin_tts_uses_standard_json_and_stores_audio() {
+        let home = tmp_home("tts-standard");
+        let audio = b"ID3\x04\0\0\0\0\0\0tts-fixture".to_vec();
+        let (api, captured) = mock_capture(200, "audio/mpeg", audio.clone()).await;
+        let entry = entry_with_models(json!([]), true);
+        let config: Map<String, Value> = serde_json::from_value(json!({
+            "apiBase": api,
+            "apiKey": "tts-secret",
+            "model": "tts-custom",
+            "voice": "nova"
+        }))
+        .unwrap();
+
+        let response =
+            builtin_tts_speech(&home, &entry, &json!({"text": "你好，世界"}), &config).await;
+        let value = body_of(response).await;
+        assert_eq!(value["ok"], true, "TTS 应返回插件成功信封: {value}");
+        assert_eq!(value["data"]["mime"], "audio/mpeg");
+        let media_url = value["data"]["media_url"].as_str().unwrap();
+        assert!(media_url.starts_with("/media/") && media_url.ends_with(".mp3"));
+        assert_eq!(
+            std::fs::read(
+                crate::media::media_root(&home).join(media_url.trim_start_matches("/media/"))
+            )
+            .unwrap(),
+            audio,
+            "音频响应应原样进入媒体暂存"
+        );
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), captured)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = request.head.to_ascii_lowercase();
+        assert!(head.starts_with("post /v1/audio/speech http/1.1"));
+        assert!(head.contains("authorization: bearer tts-secret"));
+        assert!(head.contains("content-type: application/json"));
+        let payload: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(payload["model"], "tts-custom");
+        assert_eq!(payload["input"], "你好，世界");
+        assert_eq!(payload["voice"], "nova");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn builtin_asr_fails_over_to_next_configured_endpoint() {
+        let home = tmp_home("asr-failover");
+        let media_root = crate::media::media_root(&home);
+        std::fs::create_dir_all(&media_root).unwrap();
+        let audio = media_root.join("bbbbbbbb.wav");
+        std::fs::write(&audio, b"RIFF0000WAVEfailover").unwrap();
+        let (primary, primary_request) = mock_capture(
+            500,
+            "application/json",
+            br#"{"error":{"message":"down"}}"#.to_vec(),
+        )
+        .await;
+        let (backup, backup_request) = mock_capture(
+            200,
+            "application/json",
+            r#"{"text":"备用成功"}"#.as_bytes().to_vec(),
+        )
+        .await;
+        let entry = entry_with_models(
+            json!([
+                {"id":"whisper-primary","api":primary},
+                {"id":"whisper-backup","api":backup}
+            ]),
+            true,
+        );
+        let config: Map<String, Value> = serde_json::from_value(json!({
+            "apiKey": "shared-secret"
+        }))
+        .unwrap();
+
+        let value = body_of(
+            builtin_asr_speech(
+                &home,
+                &entry,
+                &json!({"media_url": audio.to_string_lossy()}),
+                &config,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["ok"], true, "主端点 500 后应切备用: {value}");
+        assert_eq!(value["data"]["text"], "备用成功");
+
+        for captured in [primary_request, backup_request] {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), captured)
+                .await
+                .unwrap()
+                .unwrap();
+            let head = request.head.to_ascii_lowercase();
+            assert!(head.starts_with("post /v1/audio/transcriptions http/1.1"));
+            assert!(head.contains("authorization: bearer shared-secret"));
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1784,7 +2788,10 @@ mod market_tests {
                 p["id"]
             );
             assert!(
-                p["scenes"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+                p["scenes"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false),
                 "scenes 非空: {}",
                 p["id"]
             );
@@ -1816,12 +2823,18 @@ mod market_tests {
         let resp = handle_local_add(State(s.clone()), Json(manifest)).await;
         let v = body_of(resp).await;
         assert_eq!(v["ok"], true, "{v}");
-        assert_eq!(v["id"], "local.my-describer", "本地添加 id 应加 local. 前缀");
+        assert_eq!(
+            v["id"], "local.my-describer",
+            "本地添加 id 应加 local. 前缀"
+        );
         let e = registry::get_plugin(&s.codex_home, "local.my-describer").unwrap();
         assert_eq!(e.source, "local");
         assert_eq!(e.kind, registry::Kind::Plugin);
         assert_eq!(e.config["failover"], true, "故障转移默认开");
-        assert_eq!(e.config["values"]["lang"], "中文", "默认配置应从 manifest def 种子化");
+        assert_eq!(
+            e.config["values"]["lang"], "中文",
+            "默认配置应从 manifest def 种子化"
+        );
         assert_eq!(e.config["models"][0]["id"], "gpt-5.6");
         assert!(!e.updated_at.is_empty());
         // file 文本形态
@@ -1832,7 +2845,8 @@ mod market_tests {
         .await;
         assert_eq!(body_of(resp).await["id"], "local.p2");
         // 非法 manifest 拒
-        let resp = handle_local_add(State(s.clone()), Json(json!({ "id": "x", "name": "n" }))).await;
+        let resp =
+            handle_local_add(State(s.clone()), Json(json!({ "id": "x", "name": "n" }))).await;
         let v = body_of(resp).await;
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"]["code"], "E_PLUGIN_MANIFEST");
@@ -2182,8 +3196,14 @@ mod market_tests {
             .to_string(),
         )
         .unwrap();
-        let img = root.join("pic.png");
-        std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+        let image = crate::media::store_upload(
+            &st.codex_home,
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+            "image/png",
+            "test",
+        )
+        .unwrap();
+        let media_url = format!("/media/{}.{}", image.id, image.ext);
 
         // 主模型 500 → 切备用成功(备用模型名进入响应)
         let entry = entry_with_models(
@@ -2197,7 +3217,7 @@ mod market_tests {
             builtin_media_failover(
                 &st,
                 &entry,
-                &json!({ "media_url": img.to_str().unwrap(), "prompt": "什么颜色?" }),
+                &json!({ "media_url": media_url, "prompt": "什么颜色?" }),
                 MediaTool::Describe,
             )
             .await,
@@ -2224,7 +3244,7 @@ mod market_tests {
             builtin_media_failover(
                 &st,
                 &entry2,
-                &json!({ "media_url": img.to_str().unwrap(), "prompt": "什么颜色?" }),
+                &json!({ "media_url": media_url, "prompt": "什么颜色?" }),
                 MediaTool::Describe,
             )
             .await,
@@ -2245,7 +3265,7 @@ mod market_tests {
             builtin_media_failover(
                 &st,
                 &entry3,
-                &json!({ "media_url": img.to_str().unwrap(), "prompt": "什么颜色?" }),
+                &json!({ "media_url": media_url, "prompt": "什么颜色?" }),
                 MediaTool::Describe,
             )
             .await,

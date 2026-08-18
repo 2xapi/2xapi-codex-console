@@ -5,6 +5,25 @@ const PLIST_NAME: &str = "com.2xapi.codexconsole.plist";
 const LABEL: &str = "com.2xapi.codexconsole";
 const APP_PATH: &str = "/Applications/2xapi Codex Console.app/Contents/MacOS/console-2xapi";
 
+pub fn supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn executable_path() -> std::path::PathBuf {
+    std::env::var_os("CODEX_CONSOLE_EXECUTABLE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from(APP_PATH))
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// launchd LaunchAgents 目录(Home 回退逻辑与 codex_home 一致:Windows 无 HOME 时用 USERPROFILE)。
 pub fn launch_agents_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME")
@@ -28,10 +47,14 @@ pub fn enabled(dir: &std::path::Path) -> bool {
 
 /// 写:创建 plist(RunAtLoad 随登录加载);删:移除文件。幂等:重复开/关不报错。
 pub fn set(dir: &std::path::Path, enable: bool) -> Result<(), String> {
+    if !supported() {
+        return Err("当前平台不支持 macOS launchd 自启".into());
+    }
     let path = plist_path(dir);
     if enable {
         std::fs::create_dir_all(dir).map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
-        std::fs::write(&path, plist_xml()).map_err(|e| format!("写 plist 失败: {e}"))
+        std::fs::write(&path, plist_xml(&executable_path()))
+            .map_err(|e| format!("写 plist 失败: {e}"))
     } else {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -41,7 +64,8 @@ pub fn set(dir: &std::path::Path, enable: bool) -> Result<(), String> {
     }
 }
 
-fn plist_xml() -> String {
+fn plist_xml(program: &std::path::Path) -> String {
+    let program = xml_escape(&program.to_string_lossy());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -51,7 +75,7 @@ fn plist_xml() -> String {
     <string>{LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{APP_PATH}</string>
+        <string>{program}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -85,7 +109,7 @@ mod tests {
         let raw = std::fs::read_to_string(plist_path(&d)).unwrap();
         assert!(raw.contains(LABEL));
         assert!(raw.contains("<key>RunAtLoad</key>"));
-        assert!(raw.contains(APP_PATH));
+        assert!(raw.contains(&xml_escape(&executable_path().to_string_lossy())));
         set(&d, false).unwrap();
         assert!(!enabled(&d));
         assert!(!plist_path(&d).exists());

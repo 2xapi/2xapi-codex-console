@@ -12,20 +12,54 @@ use std::path::{Path, PathBuf};
 pub type OpError = (u16, String, String);
 
 fn vscdb_path(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+    if cfg!(windows) {
+        std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join("AppData/Roaming"))
+            .join("Cursor/User/globalStorage/state.vscdb")
+    } else if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+    } else {
+        std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join(".config"))
+            .join("Cursor/User/globalStorage/state.vscdb")
+    }
+}
+
+fn sqlite_sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+    let mut path = db.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 const AI_SETTINGS_KEY: &str = "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser";
 const OPENAI_KEY_KEY: &str = "cursorAuth/openAIKey";
+const MANAGED_KEY: &str = "2xapi/cursorManaged";
 const SNAPSHOT_NAME: &str = "cursor-ai-before.json";
 
 /// Cursor 主进程是否在运行(写前必须退出,运行中写会被覆盖)。
 fn cursor_running() -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-x", "Cursor"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        return std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq Cursor.exe", "/NH"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .to_ascii_lowercase()
+                    .contains("cursor.exe")
+            })
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("pgrep")
+            .args(["-x", "Cursor"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 }
 
 // ── ItemTable 读写(只碰目标键)───────────────────────────
@@ -50,6 +84,7 @@ fn read_item(db: &Path, key: &str) -> Result<Option<String>, OpError> {
     }
 }
 
+#[cfg(test)]
 fn upsert_item(db: &Path, key: &str, value: &str) -> Result<(), OpError> {
     let exists = read_item(db, key)?.is_some();
     let conn = open_db(db)?;
@@ -69,30 +104,82 @@ fn upsert_item(db: &Path, key: &str, value: &str) -> Result<(), OpError> {
     Ok(())
 }
 
-fn delete_item(db: &Path, key: &str) -> Result<(), OpError> {
-    let conn = open_db(db)?;
-    conn.execute("DELETE FROM ItemTable WHERE key = ?1", rusqlite::params![key])
+fn write_managed_transaction(
+    db: &Path,
+    ai: &Value,
+    key: Option<&str>,
+    marker: Option<&str>,
+) -> Result<(), OpError> {
+    let mut conn = open_db(db)?;
+    let tx = conn
+        .transaction()
         .map_err(|e| (500, "E_CURSOR_DB".into(), e.to_string()))?;
-    Ok(())
+    tx.execute(
+        "INSERT INTO ItemTable (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        rusqlite::params![AI_SETTINGS_KEY, ai.to_string()],
+    )
+    .map_err(|e| (500, "E_CURSOR_DB".into(), e.to_string()))?;
+    match key {
+        Some(value) => {
+            tx.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![OPENAI_KEY_KEY, value],
+            )
+            .map_err(|e| (500, "E_CURSOR_DB".into(), e.to_string()))?;
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM ItemTable WHERE key = ?1",
+                rusqlite::params![OPENAI_KEY_KEY],
+            )
+            .map_err(|e| (500, "E_CURSOR_DB".into(), e.to_string()))?;
+        }
+    }
+    match marker {
+        Some(value) => {
+            tx.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![MANAGED_KEY, value],
+            )
+            .map_err(|e| (500, "E_CURSOR_DB".into(), e.to_string()))?;
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM ItemTable WHERE key = ?1",
+                rusqlite::params![MANAGED_KEY],
+            )
+            .map_err(|e| (500, "E_CURSOR_DB".into(), e.to_string()))?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| (500, "E_CURSOR_DB".into(), e.to_string()))
 }
 
 fn read_ai_settings(db: &Path) -> Result<Value, OpError> {
     match read_item(db, AI_SETTINGS_KEY)? {
-        Some(raw) => serde_json::from_str(&raw)
-            .map_err(|e| (500, "E_CURSOR_DB".into(), format!("aiSettings 非 JSON: {e}"))),
+        Some(raw) => serde_json::from_str(&raw).map_err(|e| {
+            (
+                500,
+                "E_CURSOR_DB".into(),
+                format!("aiSettings 非 JSON: {e}"),
+            )
+        }),
         None => Ok(json!({})),
     }
 }
 
+#[cfg(test)]
 fn write_ai_settings(db: &Path, v: &Value) -> Result<(), OpError> {
     upsert_item(db, AI_SETTINGS_KEY, &v.to_string())
 }
 
 /// aiSettings JSON 内取/建 `aiSettings` 子对象(调研实证:该键值为大 JSON,aiSettings 是其顶层段)。
 fn ai_settings_mut(ai: &mut Value) -> Result<&mut Map<String, Value>, OpError> {
-    let obj = ai
-        .as_object_mut()
-        .ok_or((500, "E_CURSOR_DB".into(), "aiSettings 值不是 JSON 对象".into()))?;
+    let obj = ai.as_object_mut().ok_or((
+        500,
+        "E_CURSOR_DB".into(),
+        "aiSettings 值不是 JSON 对象".into(),
+    ))?;
     obj.entry("aiSettings")
         .or_insert_with(|| json!({}))
         .as_object_mut()
@@ -116,9 +203,12 @@ pub fn state(home: &Path) -> Value {
                     .pointer("/aiSettings/openAIBaseUrl")
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
-                // 只认网关地址为本产品托管标记(禁地址匹配铁律:用户手配的第三方地址不冒充托管态)
-                if base.contains(crate::desktop::GATEWAY_ADDR) {
-                    hosting = json!({ "way": "gateway", "baseUrl": base });
+                // DB 内私有标记是本产品托管凭据，避免把用户手配的同地址误判为托管。
+                if read_item(&db, MANAGED_KEY).ok().flatten().is_some() {
+                    hosting = json!({
+                        "way": if base.contains(crate::desktop::GATEWAY_ADDR) { "gateway" } else { "direct" },
+                        "baseUrl": base
+                    });
                 }
             }
         }
@@ -169,6 +259,7 @@ pub fn host(
         .find(|p| p.id == provider_id)
         .cloned()
         .ok_or_else(|| (404, "E_PROVIDER_NOT_FOUND".into(), "找不到该供应商".into()))?;
+    crate::desktop::validate_provider_agent(&provider, "cursor")?;
     if provider.model.is_empty() {
         return Err((
             422,
@@ -177,52 +268,88 @@ pub fn host(
         ));
     }
 
-    // 三保险:①整体备份 vscdb ②快照原 JSON(供 unhost 还原)③下面逐键写
+    let before = read_ai_settings(&db)?;
+    let before_key = read_item(&db, OPENAI_KEY_KEY)?;
+    let snapshot_file = snapshot_path(backup_dir);
+    let paths = [
+        db.clone(),
+        sqlite_sidecar_path(&db, "-wal"),
+        sqlite_sidecar_path(&db, "-shm"),
+        snapshot_file.clone(),
+        providers_path.to_path_buf(),
+    ];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    // 三保险:①整体备份 vscdb ②快照原 JSON ③SQLite 事务写；失败恢复 DB/快照/active。
     std::fs::create_dir_all(backup_dir).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
     crate::config::backup_file(&db, backup_dir, "cursor-vscdb", "pre-host")
         .map_err(|e| (500, "E_IO".into(), e))?;
-    let before = read_ai_settings(&db)?;
-    // 快照仅首次托管时记录:幂等 host/重复托管不覆盖,保证 unhost 还原到最初的用户配置
-    if !snapshot_path(backup_dir).exists() {
-        std::fs::write(snapshot_path(backup_dir), before.to_string())
-            .map_err(|e| (500, "E_IO".into(), e.to_string()))?;
-    }
 
     // 写 aiSettings 两字段
-    let mut ai = before;
+    let mut ai = before.clone();
     let settings = ai_settings_mut(&mut ai)?;
     let base = if way == "gateway" {
         format!("http://{}/v1", crate::desktop::GATEWAY_ADDR)
     } else {
         let b = provider.base_url.trim_end_matches('/').to_string();
-        if b.ends_with("/v1") { b } else { format!("{b}/v1") }
+        if b.ends_with("/v1") {
+            b
+        } else {
+            format!("{b}/v1")
+        }
     };
     settings.insert("useOpenAIKey".into(), json!(true));
     settings.insert("openAIBaseUrl".into(), json!(base));
-    write_ai_settings(&db, &ai)?;
-
     // Key 明文回退(启动自动迁移进钥匙串并删明文;gateway=占位零真 Key)
     let key = if way == "gateway" {
         "2xapi-gateway-managed".to_string()
     } else {
         provider.api_key.clone()
     };
-    upsert_item(&db, OPENAI_KEY_KEY, &key)?;
-
-    crate::providers::set_active(providers_path, &provider.id);
-    Ok(json!({
-        "hosted": true,
-        "way": way,
-        "baseUrl": base,
-        "restart": true,
-        "hint": "Cursor 托管已写入;重启 Cursor 后自动读入(Key 迁移进系统钥匙串)。托管期间请保持 Cursor 关闭时再修改。",
-    }))
+    let outcome = (|| {
+        // 快照仅首次托管时记录受控字段和原明文 Key；不快照整个 applicationUser。
+        if !snapshot_file.exists() {
+            let ai_settings = before.get("aiSettings").and_then(Value::as_object);
+            let snap = json!({
+                "version": 2,
+                "fields": {
+                    "useOpenAIKey": ai_settings.and_then(|settings| settings.get("useOpenAIKey")).cloned().unwrap_or(Value::Null),
+                    "useOpenAIKeyPresent": ai_settings.is_some_and(|settings| settings.contains_key("useOpenAIKey")),
+                    "openAIBaseUrl": ai_settings.and_then(|settings| settings.get("openAIBaseUrl")).cloned().unwrap_or(Value::Null),
+                    "openAIBaseUrlPresent": ai_settings.is_some_and(|settings| settings.contains_key("openAIBaseUrl")),
+                },
+                "openAIKey": before_key.clone(),
+                "openAIKeyPresent": before_key.is_some(),
+            });
+            std::fs::write(&snapshot_file, snap.to_string())
+                .map_err(|e| (500, "E_IO".into(), e.to_string()))?;
+        }
+        write_managed_transaction(
+            &db,
+            &ai,
+            Some(&key),
+            Some(&json!({ "way": way, "providerId": provider.id }).to_string()),
+        )?;
+        crate::desktop::set_active_checked(providers_path, &provider, "cursor")?;
+        Ok(json!({
+            "hosted": true,
+            "way": way,
+            "baseUrl": base,
+            "restart": true,
+            "hint": "Cursor 托管已写入;重启 Cursor 后自动读入(Key 迁移进系统钥匙串)。托管期间请保持 Cursor 关闭时再修改。",
+        }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// POST /api/desktop/cursor/unhost —— 快照还原(aiSettings 回原 JSON + 删 Key 明文键);无快照=摘除受控字段。
 pub fn unhost(home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
     let db = vscdb_path(home);
+    let providers_path = crate::desktop::providers_path_from_backup_dir(backup_dir);
     if !db.exists() {
+        crate::desktop::clear_active_checked(&providers_path, "cursor")?;
         return Ok(json!({ "hosted": false, "changed": false }));
     }
     if cursor_running() {
@@ -232,49 +359,106 @@ pub fn unhost(home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
             "Cursor 正在运行,请先退出 Cursor 再还原".into(),
         ));
     }
-    let snap = std::fs::read_to_string(snapshot_path(backup_dir)).ok();
-    let mut changed = false;
-    match snap {
-        // 快照在 → 整段还原(精确回 host 前)
-        Some(raw) => {
-            let restored = serde_json::from_str::<Value>(&raw)
-                .map_err(|e| (500, "E_CURSOR_DB".into(), format!("快照损坏: {e}")))?;
-            let before = read_ai_settings(&db)?;
-            if before != restored {
-                write_ai_settings(&db, &restored)?;
-                changed = true;
+    let snapshot_file = snapshot_path(backup_dir);
+    let paths = [
+        db.clone(),
+        sqlite_sidecar_path(&db, "-wal"),
+        sqlite_sidecar_path(&db, "-shm"),
+        snapshot_file.clone(),
+        providers_path.clone(),
+    ];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let snap = match std::fs::read_to_string(&snapshot_file) {
+            Ok(raw) => Some(raw),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err((500, "E_IO".into(), error.to_string())),
+        };
+        let before = read_ai_settings(&db)?;
+        let before_key = read_item(&db, OPENAI_KEY_KEY)?;
+        let marker = read_item(&db, MANAGED_KEY)?;
+        let mut current = before.clone();
+        let mut restored_key = before_key.clone();
+        match snap.as_deref() {
+            Some(raw) => {
+                let snapshot = serde_json::from_str::<Value>(raw)
+                    .map_err(|e| (500, "E_CURSOR_DB".into(), format!("快照损坏: {e}")))?;
+                let settings = ai_settings_mut(&mut current)?;
+                let fields = if snapshot.get("version").and_then(Value::as_u64) == Some(2) {
+                    snapshot.get("fields").unwrap_or(&Value::Null)
+                } else {
+                    snapshot.pointer("/aiSettings").unwrap_or(&Value::Null)
+                };
+                for (field, present_key) in [
+                    ("useOpenAIKey", "useOpenAIKeyPresent"),
+                    ("openAIBaseUrl", "openAIBaseUrlPresent"),
+                ] {
+                    let present = if snapshot.get("version").and_then(Value::as_u64) == Some(2) {
+                        fields
+                            .get(present_key)
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    } else {
+                        fields.get(field).is_some()
+                    };
+                    if present {
+                        settings.insert(
+                            field.into(),
+                            fields.get(field).cloned().unwrap_or(Value::Null),
+                        );
+                    } else {
+                        settings.remove(field);
+                    }
+                }
+                restored_key = if snapshot
+                    .get("openAIKeyPresent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    snapshot
+                        .get("openAIKey")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                } else {
+                    None
+                };
             }
-        }
-        // 无快照(非本产品托管/快照已清)→ 只摘除「指向网关」的本产品托管痕迹
-        // (用户手配的 useOpenAIKey=true + 第三方地址不碰;还原后的原始 false 值也不碰)
-        None => {
-            let mut ai = read_ai_settings(&db)?;
-            if let Ok(settings) = ai_settings_mut(&mut ai) {
+            None => {
+                let settings = ai_settings_mut(&mut current)?;
                 let base = settings
                     .get("openAIBaseUrl")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .unwrap_or("");
-                let ours = settings
-                    .get("useOpenAIKey")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                    && base.contains(crate::desktop::GATEWAY_ADDR);
+                let ours = marker.is_some()
+                    || (settings
+                        .get("useOpenAIKey")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        && base.contains(crate::desktop::GATEWAY_ADDR));
                 if ours {
                     settings.remove("useOpenAIKey");
                     settings.remove("openAIBaseUrl");
-                    write_ai_settings(&db, &ai)?;
-                    changed = true;
+                    if before_key.as_deref() == Some("2xapi-gateway-managed") || marker.is_some() {
+                        restored_key = None;
+                    }
                 }
             }
         }
-    }
-    if read_item(&db, OPENAI_KEY_KEY)?.is_some() {
-        delete_item(&db, OPENAI_KEY_KEY)?;
-        changed = true;
-    }
-    // 快照使命完成:删除,下次 host 重新记录
-    let _ = std::fs::remove_file(snapshot_path(backup_dir));
-    Ok(json!({ "hosted": false, "changed": changed }))
+        let changed = before != current || before_key != restored_key || marker.is_some();
+        if changed {
+            write_managed_transaction(&db, &current, restored_key.as_deref(), None)?;
+        }
+        crate::desktop::clear_active_checked(&providers_path, "cursor")?;
+        if snapshot_file.exists() {
+            std::fs::remove_file(&snapshot_file)
+                .map_err(|error| (500, "E_IO".into(), error.to_string()))?;
+        }
+        Ok(json!({ "hosted": false, "changed": changed }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 // ── 单测(隔离 tempdir 构造 vscdb;真实 Cursor 零触碰)─────────
@@ -302,10 +486,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
-            rusqlite::params![
-                "cursorAuth/cachedEmail",
-                "user@example.com"
-            ],
+            rusqlite::params!["cursorAuth/cachedEmail", "user@example.com"],
         )
         .unwrap();
         let ai = json!({
@@ -357,20 +538,31 @@ mod tests {
         // ① aiSettings 两字段
         let ai = load_provider_json(&db);
         assert_eq!(ai["aiSettings"]["useOpenAIKey"], true);
-        assert_eq!(ai["aiSettings"]["openAIBaseUrl"], "http://127.0.0.1:8787/v1");
+        assert_eq!(
+            ai["aiSettings"]["openAIBaseUrl"],
+            "http://127.0.0.1:8787/v1"
+        );
         // ② 用户数据段零触碰
         assert_eq!(ai["globalState"]["theme"], "dark");
         assert_eq!(ai["misc"]["onboardingDone"], true);
         assert_eq!(ai["aiSettings"]["model"], "gpt-4o-mini");
         // ③ Key 明文键 + ④ 用户登录键零触碰
-        assert_eq!(read_item(&db, OPENAI_KEY_KEY).unwrap().as_deref(), Some("2xapi-gateway-managed"));
-        assert_eq!(read_item(&db, "cursorAuth/accessToken").unwrap().as_deref(), Some("sk-user-access-token"));
+        assert_eq!(
+            read_item(&db, OPENAI_KEY_KEY).unwrap().as_deref(),
+            Some("2xapi-gateway-managed")
+        );
+        assert_eq!(
+            read_item(&db, "cursorAuth/accessToken").unwrap().as_deref(),
+            Some("sk-user-access-token")
+        );
         // ⑤ 快照与备份在
         assert!(snapshot_path(&bk).exists());
         assert!(
-            std::fs::read_dir(&bk)
+            std::fs::read_dir(&bk).unwrap().any(|e| e
                 .unwrap()
-                .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("cursor-vscdb-")),
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cursor-vscdb-")),
             "vscdb 整体备份应在"
         );
         // ⑥ set_active
@@ -392,7 +584,10 @@ mod tests {
         host(&root, &bk, &pv, "cur-p", "direct").unwrap();
         let ai = load_provider_json(&db);
         assert_eq!(ai["aiSettings"]["openAIBaseUrl"], "https://2xa.cc.cd/v1");
-        assert_eq!(read_item(&db, OPENAI_KEY_KEY).unwrap().as_deref(), Some("sk-test-key"));
+        assert_eq!(
+            read_item(&db, OPENAI_KEY_KEY).unwrap().as_deref(),
+            Some("sk-test-key")
+        );
         // 裸域带 /v1 尾不双叠
         provider_json(&pv, "https://2xa.cc.cd/v1");
         let root2 = root.join("h2");
@@ -429,7 +624,10 @@ mod tests {
         assert_eq!(load_provider_json(&db), original);
         assert!(read_item(&db, OPENAI_KEY_KEY).unwrap().is_none());
         // 用户登录键仍在
-        assert_eq!(read_item(&db, "cursorAuth/accessToken").unwrap().as_deref(), Some("sk-user-access-token"));
+        assert_eq!(
+            read_item(&db, "cursorAuth/accessToken").unwrap().as_deref(),
+            Some("sk-user-access-token")
+        );
 
         // 再 unhost = no-op
         let r2 = unhost(&root, &bk).unwrap();
@@ -458,6 +656,41 @@ mod tests {
         assert!(after["aiSettings"].get("openAIBaseUrl").is_none());
         assert!(read_item(&db, OPENAI_KEY_KEY).unwrap().is_none());
         assert_eq!(after["globalState"]["theme"], "dark");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unhost_preserves_later_unrelated_changes_and_restores_original_key() {
+        let root =
+            std::env::temp_dir().join(format!("2xapi-cursor-surgical-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = spec_db(&root);
+        upsert_item(&db, OPENAI_KEY_KEY, "user-original-key").unwrap();
+        let backup = root.join("bk");
+        let providers = root.join("providers.json");
+        provider_json(&providers, "https://2xa.cc.cd");
+
+        host(&root, &backup, &providers, "cur-p", "gateway").unwrap();
+        let mut changed = read_ai_settings(&db).unwrap();
+        changed["globalState"]["theme"] = json!("light");
+        write_ai_settings(&db, &changed).unwrap();
+
+        unhost(&root, &backup).unwrap();
+        let restored = read_ai_settings(&db).unwrap();
+        assert_eq!(restored["globalState"]["theme"], "light");
+        assert_eq!(
+            restored["aiSettings"]["openAIBaseUrl"],
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            read_item(&db, OPENAI_KEY_KEY).unwrap().as_deref(),
+            Some("user-original-key")
+        );
+        assert!(
+            crate::providers::get_active_for_agent(&providers, "cursor").is_none(),
+            "unhost 必须清理 Cursor active"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -503,6 +736,29 @@ mod tests {
     }
 
     #[test]
+    fn host_rejects_foreign_agent_without_db_changes() {
+        let root =
+            std::env::temp_dir().join(format!("2xapi-cursor-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = spec_db(&root);
+        let providers = root.join("providers.json");
+        provider_json(&providers, "https://2xa.cc.cd");
+        let mut data: Value =
+            serde_json::from_str(&std::fs::read_to_string(&providers).unwrap()).unwrap();
+        data["providers"][0]["agent"] = json!("codex");
+        std::fs::write(&providers, data.to_string()).unwrap();
+        let before = read_ai_settings(&db).unwrap();
+
+        let error = host(&root, &root.join("bk"), &providers, "cur-p", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_PROVIDER_AGENT_MISMATCH");
+        assert_eq!(read_ai_settings(&db).unwrap(), before);
+        assert!(read_item(&db, MANAGED_KEY).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn snapshot_file_roundtrip() {
         // 快照写读往返(防路径拼接错)
         let root = std::env::temp_dir().join(format!("2xapi-cursor-snap-{}", std::process::id()));
@@ -514,7 +770,8 @@ mod tests {
         let mut f = std::fs::File::create(&snap).unwrap();
         f.write_all(br#"{"aiSettings":{"x":1}}"#).unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&std::fs::read_to_string(&snap).unwrap()).unwrap()["aiSettings"]["x"],
+            serde_json::from_str::<Value>(&std::fs::read_to_string(&snap).unwrap()).unwrap()
+                ["aiSettings"]["x"],
             1
         );
         let _ = std::fs::remove_dir_all(&root);

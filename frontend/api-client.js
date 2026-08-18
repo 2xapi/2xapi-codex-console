@@ -3,6 +3,17 @@
 (function (global) {
   "use strict";
 
+  function errorMessage(payload, fallback) {
+    const error = payload && payload.error;
+    if (typeof error === "string" && error) return error;
+    if (error && typeof error === "object") {
+      if (typeof error.human === "string" && error.human) return error.human;
+      if (typeof error.message === "string" && error.message) return error.message;
+    }
+    if (payload && typeof payload.message === "string" && payload.message) return payload.message;
+    return fallback;
+  }
+
   async function request(method, path, { body } = {}) {
     const opts = {
       method,
@@ -22,7 +33,7 @@
     if (payload && payload.ok === true) return payload.data;
     // 错误信封兼容形态:{error:{code,message,fields}} / {error:"人话"} / {error:{code}, message:"人话"}
     const e = (payload && payload.error) || null;
-    const errMsg = typeof e === "string" ? e : ((e && e.message) || payload.message || "");
+    const errMsg = errorMessage(payload, "");
     const err = new Error(errMsg || "请求失败 (" + resp.status + ")");
     err.code = (e && typeof e === "object" && e.code) || "E_UNKNOWN";
     err.fields = (e && e.fields) || null;
@@ -34,14 +45,88 @@
   async function rawJson(method, path, body) {
     const opts = { method, headers: { "Content-Type": "application/json" }, credentials: "same-origin" };
     if (body !== undefined) opts.body = JSON.stringify(body);
-    const resp = await fetch(path, opts);
+    let resp;
+    try {
+      resp = await fetch(path, opts);
+    } catch (error) {
+      const networkError = new Error("网络请求失败：" + (error && error.message ? error.message : error));
+      networkError.code = "E_NETWORK";
+      throw networkError;
+    }
     const payload = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      const e = new Error((payload && (payload.error || payload.message)) || "请求失败 (" + resp.status + ")");
+      const detail = payload && payload.error;
+      const e = new Error(errorMessage(payload, "请求失败 (" + resp.status + ")"));
+      e.code = (detail && typeof detail === "object" && detail.code) || "E_UNKNOWN";
       e.status = resp.status;
       throw e;
     }
     return payload;
+  }
+
+  async function removePluginSource(id) {
+    const listed = await rawJson("GET", "/api/plugins");
+    const installed = ((listed && listed.plugins) || []).filter((entry) => {
+      const meta = (entry && entry.meta) || {};
+      return meta.source_id === id || entry.source === id;
+    });
+    const removedPlugins = [];
+    for (const entry of installed) {
+      try {
+        await rawJson("DELETE", "/api/plugins/" + encodeURIComponent(entry.id));
+        removedPlugins.push(entry.id);
+      } catch (error) {
+        const partial = removedPlugins.length ? "；已卸载 " + removedPlugins.length + " 个插件" : "";
+        throw new Error("远程源未删除" + partial + "，插件 " + entry.id + " 卸载失败：" + (error.message || "未知错误"));
+      }
+    }
+    let sourceDeleted = false;
+    try {
+      const result = await rawJson("DELETE", "/api/plugin-market/sources/" + encodeURIComponent(id));
+      if (!result || result.removed !== true) throw new Error("源不存在或删除结果未持久化");
+      sourceDeleted = true;
+      const market = await rawJson("GET", "/api/plugin-market");
+      if (((market && market.sources) || []).some((source) => source && source.id === id)) {
+        throw new Error("后端未持久化删除结果");
+      }
+      return Object.assign({}, result, { removedPlugins });
+    } catch (error) {
+      const partial = removedPlugins.length ? "；已卸载 " + removedPlugins.length + " 个关联插件" : "";
+      throw new Error((sourceDeleted ? "远程源已提交删除但结果验证失败" : "远程源删除失败") + partial + "：" + (error.message || "未知错误"));
+    }
+  }
+
+  async function claudeDesktopAction(path, way, providerId, fallbackMessage) {
+    let resp;
+    try {
+      resp = await fetch(path, {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
+        body: JSON.stringify({ way: way || "", providerId: providerId || "" }),
+      });
+    } catch (error) {
+      const networkError = new Error("网络请求失败：" + (error && error.message ? error.message : error));
+      networkError.code = "E_NETWORK";
+      throw networkError;
+    }
+    const payload = await resp.json().catch(() => ({}));
+    const data = payload && payload.data && typeof payload.data === "object" ? payload.data : payload;
+    if (resp.ok && payload && payload.ok === true) {
+      return {
+        command: data.command || "",
+        env: data.env || {},
+        launched: data.launched === true,
+        terminal: data.terminal || "",
+        way: data.way || "",
+        providerId: data.providerId || "",
+        providerName: data.providerName || "",
+        model: data.model || "",
+      };
+    }
+    const detail = payload && payload.error;
+    const error = new Error(errorMessage(payload, fallbackMessage + "(" + resp.status + ")"));
+    error.code = (detail && typeof detail === "object" && detail.code) || "E_UNKNOWN";
+    error.status = resp.status;
+    throw error;
   }
 
   global.api = {
@@ -64,32 +149,21 @@
     fetchBalance: (id) => request("POST", "/api/providers/fetch-balance", { body: { id } }),
     // ── 健康（不走信封，04 §2）──
     health: async () => (await fetch("/health")).json(),
-    // ── 关于:版本(后端 /api/version 不存在时回退 1.0.0);检查更新(优先后端路由,否则直连 GitHub,容错)──
-    version: async () => {
-      try { return await request("GET", "/api/version"); }
-      catch (e) { return { version: "1.0.0" }; }
-    },
-    checkUpdate: async () => {
-      try { return await request("GET", "/api/check-update"); }
-      catch (e) {
-        // 后端无 /api/check-update 路由 → 直连 GitHub Releases(可能被 CSP 拦,失败上抛给调用方容错)
-        const r = await fetch("https://api.github.com/repos/2xapi/2xapi-codex-console/releases/latest", { credentials: "omit" });
-        const v = await r.json().catch(function () { return {}; });
-        if (!r.ok || !v.tag_name) throw new Error("GitHub Releases 不可达");
-        return { latest: String(v.tag_name).replace(/^v/, "") };
-      }
-    },
+    // ── 关于:版本与更新检查统一走后端信封，避免 CSP 跨域与假版本回退──
+    version: () => request("GET", "/api/version"),
+    checkUpdate: () => request("GET", "/api/check-update"),
 
     // ── 2xapi 登录子系统（契约外，key 获取入口；这些路由是 raw 响应，不走 04 信封）──
     session: async () => rawJson("GET", "/api/session"),
     // 用系统浏览器打开外链(官网);CSP 下 window.open 不走系统浏览器,经后端 spawn
     openUrl: (url) => request("POST", "/api/open-url", { body: { url } }),
     captchaSettings: async () => rawJson("GET", "/api/auth/captcha"),
-    login: async (email, password, captchaTicket, captchaRandstr) =>
+    login: async (email, password, captchaTicket, captchaRandstr, remember) =>
       rawJson("POST", "/api/auth/login", {
         email, password,
         captchaTicket: captchaTicket || "",
         captchaRandstr: captchaRandstr || "",
+        remember: remember !== false,
       }),
     logout: async () => rawJson("POST", "/api/auth/logout", {}),
     remembered: async () => rawJson("GET", "/api/auth/remembered"),
@@ -120,10 +194,11 @@
   plugList: () => rawJson("GET", "/api/plugins"),
   plugMarket: () => rawJson("GET", "/api/plugin-market"),
   plugInstall: (sourceId, pluginId) => rawJson("POST", "/api/plugin-market/install", { sourceId, pluginId }),
+  plugInvoke: (id, body) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/invoke", body),
   plugToggle: (id, enabled) => rawJson("POST", "/api/plugins/" + encodeURIComponent(id) + "/toggle", { enabled }),
   plugRemove: (id) => rawJson("DELETE", "/api/plugins/" + encodeURIComponent(id)),
   plugSrcAdd: (id, name, url) => rawJson("POST", "/api/plugin-market/sources", { id, name, url }),
-  plugSrcDel: (id) => rawJson("DELETE", "/api/plugin-market/sources/" + encodeURIComponent(id)),
+  plugSrcDel: (id) => removePluginSource(id),
   plugSrcList: (id) => rawJson("GET", "/api/plugin-market/sources/" + encodeURIComponent(id) + "/plugins"),
   // ── 插件市场 v3(插件市场开发文档 §四):详情/本地添加/配置/启停/更新/安装 ──
   plugDetail: (id) => rawJson("GET", "/api/plugins/" + encodeURIComponent(id)),
@@ -191,33 +266,18 @@
       return v && v.data !== undefined ? v.data : v;
     },
 
-    // ── Claude 注入式托管(Claude 批次:后端返回注入信息,前端展示/复制;停用=前端本地态)──
-    // claude-start 契约:成功 {ok:true, command, env:{ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN}, way, providerId, providerName, model}
-    //   —— 字段在顶层(不走 data 信封);失败 {ok:false, error:{code,message}}(4xx)。Key 只在响应,不落盘。
-    claudeStart: async (way, providerId) => {
-      const resp = await fetch("/api/desktop/claude-start", {
-        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
-        body: JSON.stringify({ way: way || "", providerId: providerId || "" }),
-      });
-      const payload = await resp.json().catch(() => ({}));
-      if (payload && payload.ok === true) {
-        return {
-          command: payload.command || "",
-          env: payload.env || {},
-          way: payload.way || "",
-          providerId: payload.providerId || "",
-          providerName: payload.providerName || "",
-          model: payload.model || "",
-        };
-      }
-      const e = payload && payload.error;
-      const err = new Error((e && e.message) || "Claude 注入失败(" + resp.status + ")");
-      err.code = (e && e.code) || "E_UNKNOWN";
-      err.status = resp.status;
-      throw err;
-    },
-    // 后端无 claude-stop 接口(注入式无常驻进程):停用 = 前端清除注入态,本地即刻完成
-    claudeStop: async () => ({ restored: true }),
+    // ── Claude Code 托管:写入 ~/.claude/settings.json 并启动裸 claude ──
+    // claude-state:成功 {hosting:null|{providerId,providerName,model,way,...}}
+    claudeState: () => request("GET", "/api/desktop/claude-state"),
+    claudeHost: (way, providerId) => request("POST", "/api/desktop/claude-host", {
+      body: { way: way || "gateway", providerId: providerId || "" },
+    }),
+    claudeUnhost: () => request("POST", "/api/desktop/claude-unhost", { body: {} }),
+
+    // claude-launch 契约:配置已写入后打开裸 CLI，不返回命令、环境变量或真实 Key。
+    claudeLaunch: (way, providerId) => claudeDesktopAction(
+      "/api/desktop/claude-launch", way, providerId, "Claude Code 自动启动失败"
+    ),
 
     // ── 加速(阶段 4,任务书 §…):mode off|official|custom;customNode 仅本机保存 ──
     // GET /api/accel/state 返回非信封 {mode,customNode,lines[],scopeNote}(字段在顶层),失败时可能 {ok:false,error};用 rawJson 解顶层字段

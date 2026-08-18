@@ -156,14 +156,20 @@ fn build_tray_menu(
                         MenuItem::with_id(app, format!("provider:{id}"), name, true, None::<&str>)
                     })
                     .collect::<Result<_, _>>()?;
-                let sub_refs: Vec<&dyn IsMenuItem<tauri::Wry>> =
-                    sub_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
-                refs.push(Box::new(Submenu::with_items(app, &spec.label, true, &sub_refs)?));
+                let sub_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = sub_items
+                    .iter()
+                    .map(|i| i as &dyn IsMenuItem<tauri::Wry>)
+                    .collect();
+                refs.push(Box::new(Submenu::with_items(
+                    app,
+                    &spec.label,
+                    true,
+                    &sub_refs,
+                )?));
             }
         }
     }
-    let menu_refs: Vec<&dyn IsMenuItem<tauri::Wry>> =
-        refs.iter().map(|b| b.as_ref()).collect();
+    let menu_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = refs.iter().map(|b| b.as_ref()).collect();
     Menu::with_items(app, &menu_refs)
 }
 
@@ -222,11 +228,12 @@ fn parse_import_url(url: &str) -> Result<ImportParams, String> {
     if host != "import" {
         return Err("未知 2xapi 操作(仅支持 import)".into());
     }
-    let (mut name, mut base_url, mut api_key, mut model, mut wire) =
-        (None, None, None, None, None);
+    let (mut name, mut base_url, mut api_key, mut model, mut wire) = (None, None, None, None, None);
     if let Some(q) = query {
         for pair in q.split('&') {
-            let Some((k, v)) = pair.split_once('=') else { continue };
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
             let v = percent_decode(v);
             match k {
                 "name" => name = Some(v),
@@ -303,7 +310,10 @@ fn handle_deeplink(app: &AppHandle, url: &tauri::Url) -> Result<(), String> {
     };
     match crate::providers::create(&st.providers_path, input) {
         Ok(provider) => {
-            eprintln!("[deeplink] 导入成功: {} ({}), imported:true", provider.name, provider.id);
+            eprintln!(
+                "[deeplink] 导入成功: {} ({}), imported:true",
+                provider.name, provider.id
+            );
             show_main_window(app);
             Ok(())
         }
@@ -386,28 +396,28 @@ fn main() {
                 .unwrap_or_default();
             std::path::PathBuf::from(home).join(".openclaw")
         },
-        // Claude Desktop(macOS):~/Library/Application Support(Claude/ 与 Claude-3p/ 的父;
-        // Windows 的 APPDATA 路径未实证,首版 macOS 为主)
+        // Claude Desktop 配置父目录:macOS=~/Library/Application Support,Windows=%APPDATA%。
         cd_home: {
-            let home = std::env::var("HOME")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| std::env::var("USERPROFILE").ok())
-                .unwrap_or_default();
-            std::path::PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
+            if cfg!(windows) {
+                std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| {
+                    std::env::var("USERPROFILE")
+                        .map(|home| format!(r"{home}\AppData\Roaming"))
+                        .unwrap_or_default()
+                }))
+            } else if cfg!(target_os = "macos") {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                    .join("Library")
+                    .join("Application Support")
+            } else {
+                std::path::PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+                    std::env::var("HOME")
+                        .map(|home| format!("{home}/.config"))
+                        .unwrap_or_default()
+                }))
+            }
         },
         // Cursor 生态管理(A 段):~/.cursor 所在根(eco adapter join(".cursor/mcp.json"))
         cursor_home: std::path::PathBuf::from(
-            std::env::var("HOME")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| std::env::var("USERPROFILE").ok())
-                .unwrap_or_default(),
-        ),
-        // TRAE 生态管理(B 段):~/.trae 所在根(eco adapter join(".trae/mcp.json"))
-        trae_home: std::path::PathBuf::from(
             std::env::var("HOME")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -562,7 +572,10 @@ mod tests {
         match &items[1].kind {
             TraySpecKind::Submenu(e) => assert_eq!(
                 e,
-                &vec![("a".to_string(), "供应商A".to_string()), ("b".to_string(), "供应商B".to_string())]
+                &vec![
+                    ("a".to_string(), "供应商A".to_string()),
+                    ("b".to_string(), "供应商B".to_string())
+                ]
             ),
             _ => panic!("切换供应商应为子菜单"),
         }

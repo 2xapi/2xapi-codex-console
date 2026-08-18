@@ -282,24 +282,56 @@ fn client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-fn chat_url(base_url: &str) -> String {
+fn wire_url(base_url: &str, wire_api: crate::providers::WireApi, model: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{base}/chat/completions")
-    } else {
-        format!("{base}/v1/chat/completions")
+    match wire_api {
+        crate::providers::WireApi::Responses => {
+            if base.ends_with("/v1") {
+                format!("{base}/responses")
+            } else {
+                format!("{base}/v1/responses")
+            }
+        }
+        crate::providers::WireApi::ChatCompletions => {
+            if base.ends_with("/v1") {
+                format!("{base}/chat/completions")
+            } else {
+                format!("{base}/v1/chat/completions")
+            }
+        }
+        crate::providers::WireApi::Anthropic => {
+            if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            }
+        }
+        crate::providers::WireApi::Gemini => {
+            if base.ends_with("/v1beta") {
+                format!("{base}/models/{model}:generateContent")
+            } else {
+                format!("{base}/v1beta/models/{model}:generateContent")
+            }
+        }
     }
 }
 
-async fn post_chat(
+async fn post_wire(
     c: &reqwest::Client,
     url: &str,
     api_key: &str,
+    wire_api: crate::providers::WireApi,
     body: Value,
 ) -> Result<Value, String> {
-    let resp = c
-        .post(url)
-        .header("Authorization", format!("Bearer {api_key}"))
+    let request = match wire_api {
+        crate::providers::WireApi::Anthropic => c
+            .post(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        crate::providers::WireApi::Gemini => c.post(url).header("x-goog-api-key", api_key),
+        _ => c.post(url).bearer_auth(api_key),
+    };
+    let resp = request
         .json(&body)
         .send()
         .await
@@ -312,14 +344,186 @@ async fn post_chat(
     Ok(v)
 }
 
-fn content_text(v: &Value) -> String {
-    v.get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_lowercase()
+fn content_text(wire_api: crate::providers::WireApi, value: &Value) -> String {
+    let parts = match wire_api {
+        crate::providers::WireApi::ChatCompletions => value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(|text| vec![text.to_string()])
+            .unwrap_or_default(),
+        crate::providers::WireApi::Responses => {
+            if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+                vec![text.to_string()]
+            } else {
+                value
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|item| {
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .map(String::from)
+                    .collect()
+            }
+        }
+        crate::providers::WireApi::Anthropic => value
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(String::from)
+            .collect(),
+        crate::providers::WireApi::Gemini => value
+            .get("candidates")
+            .and_then(|candidates| candidates.get(0))
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(String::from)
+            .collect(),
+    };
+    parts.join(" ").to_lowercase()
+}
+
+fn has_tool_call(wire_api: crate::providers::WireApi, value: &Value) -> bool {
+    match wire_api {
+        crate::providers::WireApi::ChatCompletions => value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("tool_calls"))
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty()),
+        crate::providers::WireApi::Responses => value
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            }),
+        crate::providers::WireApi::Anthropic => value
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_use"))
+            }),
+        crate::providers::WireApi::Gemini => value
+            .get("candidates")
+            .and_then(|candidates| candidates.get(0))
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .is_some_and(|parts| parts.iter().any(|part| part.get("functionCall").is_some())),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProbeKind {
+    Text,
+    Tools,
+    Image,
+}
+
+fn probe_body(wire_api: crate::providers::WireApi, model: &str, kind: ProbeKind) -> Value {
+    let text = match kind {
+        ProbeKind::Text => "回复:OK",
+        ProbeKind::Tools => "北京今天天气怎么样?请调用工具查询。",
+        ProbeKind::Image => "这张图是什么颜色?只回答颜色词。",
+    };
+    match wire_api {
+        crate::providers::WireApi::ChatCompletions => {
+            let content = match kind {
+                ProbeKind::Image => json!([
+                    { "type": "text", "text": text },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{RED_PNG_B64}") } }
+                ]),
+                _ => json!(text),
+            };
+            let mut body = json!({
+                "model": model, "max_tokens": if matches!(kind, ProbeKind::Tools) { 200 } else { 60 },
+                "stream": false, "messages": [{ "role": "user", "content": content }]
+            });
+            if matches!(kind, ProbeKind::Tools) {
+                body["tools"] = json!([{ "type": "function", "function": {
+                    "name": "get_weather", "description": "查询城市天气",
+                    "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] }
+                }}]);
+            }
+            body
+        }
+        crate::providers::WireApi::Responses => {
+            let input = match kind {
+                ProbeKind::Image => json!([{ "role": "user", "content": [
+                    { "type": "input_text", "text": text },
+                    { "type": "input_image", "image_url": format!("data:image/png;base64,{RED_PNG_B64}") }
+                ] }]),
+                _ => json!(text),
+            };
+            let mut body = json!({
+                "model": model, "max_output_tokens": if matches!(kind, ProbeKind::Tools) { 200 } else { 60 },
+                "stream": false, "input": input
+            });
+            if matches!(kind, ProbeKind::Tools) {
+                body["tools"] = json!([{ "type": "function", "name": "get_weather",
+                    "description": "查询城市天气",
+                    "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] }
+                }]);
+            }
+            body
+        }
+        crate::providers::WireApi::Anthropic => {
+            let content = match kind {
+                ProbeKind::Image => json!([
+                    { "type": "text", "text": text },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": RED_PNG_B64 } }
+                ]),
+                _ => json!(text),
+            };
+            let mut body = json!({
+                "model": model, "max_tokens": if matches!(kind, ProbeKind::Tools) { 200 } else { 60 },
+                "messages": [{ "role": "user", "content": content }]
+            });
+            if matches!(kind, ProbeKind::Tools) {
+                body["tools"] = json!([{ "name": "get_weather", "description": "查询城市天气",
+                    "input_schema": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] }
+                }]);
+            }
+            body
+        }
+        crate::providers::WireApi::Gemini => {
+            let parts = match kind {
+                ProbeKind::Image => json!([
+                    { "text": text },
+                    { "inlineData": { "mimeType": "image/png", "data": RED_PNG_B64 } }
+                ]),
+                _ => json!([{ "text": text }]),
+            };
+            let mut body = json!({ "contents": [{ "role": "user", "parts": parts }] });
+            if matches!(kind, ProbeKind::Tools) {
+                body["tools"] = json!([{ "functionDeclarations": [{
+                    "name": "get_weather", "description": "查询城市天气",
+                    "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] }
+                }] }]);
+            }
+            body
+        }
+    }
 }
 
 /// 前四维探测(text/tools/image_in 发请求;reasoning 由调用方以 reasoning_levels 产物合入)。
@@ -327,69 +531,61 @@ pub async fn probe_caps(
     base_url: &str,
     api_key: &str,
     model: &str,
-    reasoning_levels: &[String],
+    wire_api: crate::providers::WireApi,
+    reasoning_levels: Option<&[String]>,
 ) -> Caps {
     let mut caps = Caps {
         text: Tri::Unknown,
         tools: Tri::Unknown,
-        reasoning: if reasoning_levels.is_empty() {
-            Tri::No
-        } else {
-            Tri::Yes
+        reasoning: match reasoning_levels {
+            Some(levels) if !levels.is_empty() => Tri::Yes,
+            _ => Tri::Unknown,
         },
         image_in: Tri::Unknown,
     };
     let c = client();
-    let url = chat_url(base_url);
+    let url = wire_url(base_url, wire_api, model);
 
-    // 文本:1 token 级小请求
-    if let Ok(v) = post_chat(
+    if let Ok(v) = post_wire(
         &c,
         &url,
         api_key,
-        json!({
-            "model": model, "max_tokens": 16, "stream": false,
-            "messages": [{ "role": "user", "content": "回复:OK" }]
-        }),
+        wire_api,
+        probe_body(wire_api, model, ProbeKind::Text),
     )
     .await
     {
-        if !content_text(&v).is_empty() {
+        if !content_text(wire_api, &v).is_empty() {
             caps.text = Tri::Yes;
         }
     }
 
-    // 工具调用:tools 数组问天气 → finish_reason==tool_calls 且列表非空(内容验证,非状态码)
-    if let Ok(v) = post_chat(&c, &url, api_key, json!({
-        "model": model, "max_tokens": 200, "stream": false,
-        "tools": [{ "type": "function", "function": {
-            "name": "get_weather", "description": "查询城市天气",
-            "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] }
-        }}],
-        "messages": [{ "role": "user", "content": "北京今天天气怎么样?请调用工具查询。" }]
-    }))
+    if let Ok(v) = post_wire(
+        &c,
+        &url,
+        api_key,
+        wire_api,
+        probe_body(wire_api, model, ProbeKind::Tools),
+    )
     .await
     {
-        let fr = v.get("choices").and_then(|ch| ch.get(0)).and_then(|ch| ch.get("finish_reason")).and_then(|f| f.as_str()).unwrap_or("");
-        let calls = v.get("choices").and_then(|ch| ch.get(0)).and_then(|ch| ch.get("message")).and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
-        if fr == "tool_calls" && calls > 0 {
+        if has_tool_call(wire_api, &v) {
             caps.tools = Tri::Yes;
-        } else if !content_text(&v).is_empty() && fr == "stop" {
+        } else if !content_text(wire_api, &v).is_empty() {
             caps.tools = Tri::No;
         }
     }
 
-    // 图像输入:固定红色 1x1 PNG 提问 → 内容验证(期望色词=支持;否认词表=不支持)
-    if let Ok(v) = post_chat(&c, &url, api_key, json!({
-        "model": model, "max_tokens": 60, "stream": false,
-        "messages": [{ "role": "user", "content": [
-            { "type": "text", "text": "这张图是什么颜色?只回答颜色词。" },
-            { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{RED_PNG_B64}") } }
-        ]}]
-    }))
+    if let Ok(v) = post_wire(
+        &c,
+        &url,
+        api_key,
+        wire_api,
+        probe_body(wire_api, model, ProbeKind::Image),
+    )
     .await
     {
-        let t = content_text(&v);
+        let t = content_text(wire_api, &v);
         if t.is_empty() {
             // 无文本内容(可能纯 reasoning 输出)→ unknown
         } else if IMAGE_DENY_WORDS.iter().any(|w| t.contains(w)) {
@@ -581,7 +777,14 @@ mod real {
         std::fs::create_dir_all(&tmp).unwrap();
 
         let levels = gpt.reasoning_levels.clone().unwrap_or_default();
-        let caps = probe_caps(&gpt.base_url, &gpt.api_key, &gpt.model, &levels).await;
+        let caps = probe_caps(
+            &gpt.base_url,
+            &gpt.api_key,
+            &gpt.model,
+            gpt.wire_api,
+            Some(&levels),
+        )
+        .await;
         println!(
             "[gpt-5.6] text={:?} tools={:?} reasoning={:?} image_in={:?}",
             caps.text, caps.tools, caps.reasoning, caps.image_in
@@ -595,7 +798,14 @@ mod real {
         // 上游行为变化/Key 组不同——这正是能力标签需持续重探的产品论据)。仅断言二值产出。
         if let Some(cl) = pick("claude-fable-5") {
             let levels = cl.reasoning_levels.clone().unwrap_or_default();
-            let caps = probe_caps(&cl.base_url, &cl.api_key, &cl.model, &levels).await;
+            let caps = probe_caps(
+                &cl.base_url,
+                &cl.api_key,
+                &cl.model,
+                cl.wire_api,
+                Some(&levels),
+            )
+            .await;
             println!(
                 "[claude-fable-5] text={:?} tools={:?} reasoning={:?} image_in={:?}",
                 caps.text, caps.tools, caps.reasoning, caps.image_in

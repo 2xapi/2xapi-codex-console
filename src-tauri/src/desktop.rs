@@ -19,7 +19,9 @@
 //! (token/bearer 优先级待阶段 5 实测后再放开)。
 
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::{io::Write, process::Stdio};
 
 use crate::config::{
     backup_file, build_model_catalog, config_to_toml_string, read_auth_json, read_toml,
@@ -29,8 +31,154 @@ use crate::providers::Provider;
 
 pub const GATEWAY_ADDR: &str = "127.0.0.1:8787";
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// host/unhost 的错误:(HTTP 状态码, 错误码, 人话信息)。handler 层转 {"error": code, "message": msg}。
 pub type OpError = (u16, String, String);
+
+#[derive(Clone)]
+pub(crate) struct FileSnapshot {
+    pub(crate) bytes: Option<Vec<u8>>,
+    pub(crate) permissions: Option<std::fs::Permissions>,
+}
+
+pub(crate) fn snapshot_file(path: &Path) -> Result<FileSnapshot, OpError> {
+    let (bytes, permissions) = if path.exists() {
+        let bytes = std::fs::read(path).map_err(|e| {
+            (
+                500,
+                "E_IO".into(),
+                format!("读取回滚快照 {} 失败: {e}", path.display()),
+            )
+        })?;
+        let permissions = std::fs::metadata(path)
+            .map_err(|e| {
+                (
+                    500,
+                    "E_IO".into(),
+                    format!("读取回滚快照权限 {} 失败: {e}", path.display()),
+                )
+            })?
+            .permissions();
+        (Some(bytes), Some(permissions))
+    } else {
+        (None, None)
+    };
+    Ok(FileSnapshot { bytes, permissions })
+}
+
+pub(crate) fn restore_file_snapshot(path: &Path, snapshot: &FileSnapshot) -> Result<(), String> {
+    match &snapshot.bytes {
+        Some(bytes) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("重建 {} 的父目录失败: {e}", path.display()))?;
+            }
+            let tmp = path.with_extension("2xapi-rollback.tmp");
+            std::fs::write(&tmp, bytes)
+                .map_err(|e| format!("回写临时文件 {} 失败: {e}", tmp.display()))?;
+            if let Some(permissions) = &snapshot.permissions {
+                std::fs::set_permissions(&tmp, permissions.clone())
+                    .map_err(|e| format!("恢复 {} 权限失败: {e}", path.display()))?;
+            }
+            std::fs::rename(&tmp, path).map_err(|e| format!("恢复 {} 失败: {e}", path.display()))
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("删除事务中新建文件 {} 失败: {e}", path.display())),
+        },
+    }
+}
+
+pub(crate) fn rollback_files(error: OpError, snapshots: &[(PathBuf, FileSnapshot)]) -> OpError {
+    let failures: Vec<String> = snapshots
+        .iter()
+        .filter_map(|(path, snapshot)| restore_file_snapshot(path, snapshot).err())
+        .collect();
+    if failures.is_empty() {
+        error
+    } else {
+        (
+            error.0,
+            error.1,
+            format!("{}；回滚失败: {}", error.2, failures.join("；")),
+        )
+    }
+}
+
+pub(crate) fn validate_provider_agent(
+    provider: &Provider,
+    expected_agent: &str,
+) -> Result<(), OpError> {
+    if provider.agent == expected_agent {
+        Ok(())
+    } else {
+        Err((
+            409,
+            "E_PROVIDER_AGENT_MISMATCH".into(),
+            format!(
+                "供应商 {} 属于平台 {},不能用于 {}",
+                provider.id, provider.agent, expected_agent
+            ),
+        ))
+    }
+}
+
+pub(crate) fn set_active_checked(
+    providers_path: &Path,
+    provider: &Provider,
+    expected_agent: &str,
+) -> Result<(), OpError> {
+    validate_provider_agent(provider, expected_agent)?;
+    crate::providers::set_active(providers_path, &provider.id);
+    if crate::providers::get_active_for_agent(providers_path, expected_agent)
+        .is_some_and(|active| active.id == provider.id)
+    {
+        Ok(())
+    } else {
+        Err((
+            500,
+            "E_ACTIVE_WRITE".into(),
+            format!("保存 {expected_agent} 当前供应商失败"),
+        ))
+    }
+}
+
+pub(crate) fn clear_active_checked(
+    providers_path: &Path,
+    expected_agent: &str,
+) -> Result<(), OpError> {
+    if !providers_path.exists() {
+        return Ok(());
+    }
+    crate::providers::clear_active_for_agent(providers_path, expected_agent);
+    if crate::providers::get_active_for_agent(providers_path, expected_agent).is_none() {
+        Ok(())
+    } else {
+        Err((
+            500,
+            "E_ACTIVE_WRITE".into(),
+            format!("清理 {expected_agent} 当前供应商失败"),
+        ))
+    }
+}
+
+pub(crate) fn providers_path_from_backup_dir(backup_dir: &Path) -> PathBuf {
+    backup_dir
+        .parent()
+        .unwrap_or(backup_dir)
+        .join("providers.json")
+}
+
+fn live_snapshots(paths: &[PathBuf]) -> Result<Vec<(PathBuf, FileSnapshot)>, OpError> {
+    paths
+        .iter()
+        .map(|path| snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect()
+}
 
 // ── hasOfficial 判定 ─────────────────────────────────────────
 
@@ -101,16 +249,9 @@ pub fn detect_hosting(config_path: &Path, providers_path: &Path) -> Value {
     if data.providers.is_empty() {
         return Value::Null;
     }
-    let (id, name) = match &data.active_provider_id {
-        Some(id) => {
-            let name = data
-                .providers
-                .iter()
-                .find(|p| &p.id == id)
-                .map(|p| json!(p.name))
-                .unwrap_or(Value::Null);
-            (json!(id), name)
-        }
+    let active = crate::providers::get_active_for_agent(providers_path, "codex");
+    let (id, name) = match active {
+        Some(provider) => (json!(provider.id), json!(provider.name)),
         None => (Value::Null, Value::Null),
     };
     json!({ "providerId": id, "providerName": name, "way": way })
@@ -256,6 +397,7 @@ pub fn host(
                 "找不到该供应商".to_string(),
             )
         })?;
+    validate_provider_agent(&provider, "codex")?;
     // catalog 最小目录以默认模型生成:无默认模型则无从生成(见 build_hosted_config 注释)
     if provider.model.is_empty() {
         return Err((
@@ -272,30 +414,34 @@ pub fn host(
     // 换路(gateway↔direct)/换供应商 → 重写 custom 段;备份 purpose 用 pre-switch
     // (不新增 pre-host 快照,保住最初 pre-host 供 unhost 还原到首次托管前)。
     if way == "direct" {
-        let already = detect_hosting(config_path, providers_path);
-        let current = read_toml(config_path);
-        let merged = build_direct_hosted_config(&current, &provider);
-        let new_toml = config_to_toml_string(&merged).map_err(io)?;
-        let current_toml = config_to_toml_string(&current).unwrap_or_default();
-        let config_written = if new_toml != current_toml {
-            let purpose = if already.is_null() {
-                "pre-host"
+        let snapshots = live_snapshots(&[config_path.to_path_buf(), providers_path.to_path_buf()])?;
+        let outcome = (|| {
+            let already = detect_hosting(config_path, providers_path);
+            let current = read_toml(config_path);
+            let merged = build_direct_hosted_config(&current, &provider);
+            let new_toml = config_to_toml_string(&merged).map_err(io)?;
+            let current_toml = config_to_toml_string(&current).unwrap_or_default();
+            let config_written = if new_toml != current_toml {
+                let purpose = if already.is_null() {
+                    "pre-host"
+                } else {
+                    "pre-switch"
+                };
+                backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
+                write_toml(config_path, &merged).map_err(io)?;
+                true
             } else {
-                "pre-switch"
+                false
             };
-            backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
-            write_toml(config_path, &merged).map_err(io)?;
-            true
-        } else {
-            false
-        };
-        crate::providers::set_active(providers_path, &provider.id);
-        return Ok(json!({
-            "hosted": true, "switched": !already.is_null(),
-            "hasOfficial": false,
-            "hosting": detect_hosting(config_path, providers_path),
-            "changed": { "config": config_written, "auth": false },
-        }));
+            set_active_checked(providers_path, &provider, "codex")?;
+            Ok(json!({
+                "hosted": true, "switched": !already.is_null(),
+                "hasOfficial": false,
+                "hosting": detect_hosting(config_path, providers_path),
+                "changed": { "config": config_written, "auth": false },
+            }))
+        })();
+        return outcome.map_err(|error| rollback_files(error, &snapshots));
     }
 
     // 已处于 gateway 托管(含换供应商):custom 段不动(网关热切换),set_active;
@@ -303,57 +449,68 @@ pub fn host(
     // 收到旧模型名/读到旧 catalog,桌面版与 CLI 均实测故障。决策本意(custom 稳定+热切换)保留。
     let already = detect_hosting(config_path, providers_path);
     if already.get("way").and_then(|v| v.as_str()) == Some("gateway") {
-        crate::providers::set_active(providers_path, &provider.id);
-        let mut config_written = false;
-
-        let current = read_toml(config_path);
-        let model_differs =
-            current.get("model").and_then(|v| v.as_str()) != Some(provider.model.as_str());
-        let catalog_missing = !codex_home.join(MODEL_CATALOG_FILENAME).exists();
-        if (model_differs || catalog_missing) && !provider.model.is_empty() {
-            let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
-            let mut merged = current.clone();
-            if let Some(obj) = merged.as_object_mut() {
-                obj.insert("model".into(), json!(provider.model));
+        let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
+        let snapshots = live_snapshots(&[
+            config_path.to_path_buf(),
+            catalog_path.clone(),
+            codex_home.join("auth.json"),
+            codex_home.join(AUTH_OFFICIAL_BAK),
+            providers_path.to_path_buf(),
+        ])?;
+        let outcome = (|| {
+            let mut config_written = false;
+            let current = read_toml(config_path);
+            let model_differs =
+                current.get("model").and_then(|v| v.as_str()) != Some(provider.model.as_str());
+            let catalog_missing = !catalog_path.exists();
+            if (model_differs || catalog_missing) && !provider.model.is_empty() {
+                let mut merged = current.clone();
+                if let Some(obj) = merged.as_object_mut() {
+                    obj.insert("model".into(), json!(provider.model));
+                }
+                let new_toml = config_to_toml_string(&merged).map_err(io)?;
+                let current_toml = config_to_toml_string(&current).unwrap_or_default();
+                if new_toml != current_toml {
+                    backup_file(config_path, backup_dir, "config-apply", "pre-switch")
+                        .map_err(io)?;
+                    write_toml(config_path, &merged).map_err(io)?;
+                    config_written = true;
+                }
+                let catalog_models: Vec<crate::providers::ModelConfig> =
+                    if provider.models.is_empty() {
+                        vec![crate::providers::ModelConfig {
+                            name: provider.model.clone(),
+                            display_name: None,
+                            context_window: None,
+                            is_multimodal: false,
+                            send_as_is: false,
+                        }]
+                    } else {
+                        provider.models.clone()
+                    };
+                let catalog = build_model_catalog(
+                    &catalog_models,
+                    provider.reasoning_levels.as_deref().unwrap_or(&[]),
+                );
+                let raw = serde_json::to_string_pretty(&catalog).map_err(|e| io(e.to_string()))?;
+                std::fs::write(&catalog_path, format!("{raw}\n")).map_err(|e| io(e.to_string()))?;
             }
-            let new_toml = config_to_toml_string(&merged).map_err(io)?;
-            let current_toml = config_to_toml_string(&current).unwrap_or_default();
-            if new_toml != current_toml {
-                backup_file(config_path, backup_dir, "config-apply", "pre-switch").map_err(io)?;
-                write_toml(config_path, &merged).map_err(io)?;
-            }
-            let catalog_models: Vec<crate::providers::ModelConfig> = if provider.models.is_empty() {
-                vec![crate::providers::ModelConfig {
-                    name: provider.model.clone(),
-                    display_name: None,
-                    context_window: None,
-                    is_multimodal: false,
-                    send_as_is: false,
-                }]
-            } else {
-                provider.models.clone()
-            };
-            let catalog = build_model_catalog(
-                &catalog_models,
-                provider.reasoning_levels.as_deref().unwrap_or(&[]),
-            );
-            let raw = serde_json::to_string_pretty(&catalog).unwrap_or_default();
-            let _ = std::fs::write(&catalog_path, format!("{raw}\n"));
-            config_written = true;
-        }
 
-        let mut auth_changed = false;
-        if !has_official(codex_home) {
-            auth_changed = ensure_auth_key(codex_home, &provider.api_key)
-                .map_err(io)?
-                .0;
-        }
-        return Ok(json!({
-            "hosted": true, "switched": true,
-            "hasOfficial": has_official(codex_home),
-            "hosting": detect_hosting(config_path, providers_path),
-            "changed": { "config": config_written, "auth": auth_changed },
-        }));
+            let mut auth_changed = false;
+            if !has_official(codex_home) {
+                auth_changed = ensure_auth_key(codex_home, &provider.api_key)
+                    .map_err(io)?
+                    .0;
+            }
+            set_active_checked(providers_path, &provider, "codex")?;
+            Ok(json!({
+                "hosted": true, "switched": true,
+                "hasOfficial": has_official(codex_home),
+                "hosting": detect_hosting(config_path, providers_path),
+                "changed": { "config": config_written, "auth": auth_changed },
+            }))
+        })();
+        return outcome.map_err(|error| rollback_files(error, &snapshots));
     }
 
     // 全量托管写(字段级合并 + 备份)
@@ -368,60 +525,65 @@ pub fn host(
     );
     let new_toml = config_to_toml_string(&merged).map_err(io)?;
     let current_toml = config_to_toml_string(&current).unwrap_or_default();
-    let config_written = if new_toml != current_toml {
-        // 直连批前 already 在此恒为 null;direct 出现后可能为 direct(换路 gateway),
-        // 此时用 pre-switch,不新增 pre-host 快照(保住最初 pre-host 供 unhost 还原)
-        let purpose = if already.is_null() {
-            "pre-host"
+    let snapshots = live_snapshots(&[
+        config_path.to_path_buf(),
+        catalog_path.clone(),
+        codex_home.join("auth.json"),
+        codex_home.join(AUTH_OFFICIAL_BAK),
+        providers_path.to_path_buf(),
+    ])?;
+    let outcome = (|| {
+        let config_written = if new_toml != current_toml {
+            let purpose = if already.is_null() {
+                "pre-host"
+            } else {
+                "pre-switch"
+            };
+            backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
+            write_toml(config_path, &merged).map_err(io)?;
+            true
         } else {
-            "pre-switch"
+            false
         };
-        backup_file(config_path, backup_dir, "config-apply", purpose).map_err(io)?;
-        write_toml(config_path, &merged).map_err(io)?;
-        true
-    } else {
-        false
-    };
 
-    // catalog 恒写:有模型用全量;无模型用默认模型生成最小目录(保证 config 指向的文件存在,
-    // 且模型名对桌面版/CLI 可解析——真机教训,缺文件 = fatal error)
-    let catalog_models: Vec<crate::providers::ModelConfig> = if provider.models.is_empty() {
-        vec![crate::providers::ModelConfig {
-            name: provider.model.clone(),
-            display_name: None,
-            context_window: None,
-            is_multimodal: false,
-            send_as_is: false,
-        }]
-    } else {
-        provider.models.clone()
-    };
-    let catalog = build_model_catalog(
-        &catalog_models,
-        provider.reasoning_levels.as_deref().unwrap_or(&[]),
-    );
-    let raw = serde_json::to_string_pretty(&catalog)
-        .map_err(|e| e.to_string())
-        .map_err(io)?;
-    std::fs::write(&catalog_path, format!("{raw}\n"))
-        .map_err(|e| e.to_string())
-        .map_err(io)?;
+        let catalog_models: Vec<crate::providers::ModelConfig> = if provider.models.is_empty() {
+            vec![crate::providers::ModelConfig {
+                name: provider.model.clone(),
+                display_name: None,
+                context_window: None,
+                is_multimodal: false,
+                send_as_is: false,
+            }]
+        } else {
+            provider.models.clone()
+        };
+        let catalog = build_model_catalog(
+            &catalog_models,
+            provider.reasoning_levels.as_deref().unwrap_or(&[]),
+        );
+        let raw = serde_json::to_string_pretty(&catalog)
+            .map_err(|e| e.to_string())
+            .map_err(io)?;
+        std::fs::write(&catalog_path, format!("{raw}\n"))
+            .map_err(|e| e.to_string())
+            .map_err(io)?;
 
-    // 无官方账号:auth.json 写供应商 key(先备份)
-    let (auth_changed, backup_created) = if has_off {
-        (false, false)
-    } else {
-        ensure_auth_key(codex_home, &provider.api_key).map_err(io)?
-    };
+        let (auth_changed, backup_created) = if has_off {
+            (false, false)
+        } else {
+            ensure_auth_key(codex_home, &provider.api_key).map_err(io)?
+        };
 
-    crate::providers::set_active(providers_path, &provider.id);
+        set_active_checked(providers_path, &provider, "codex")?;
 
-    Ok(json!({
-        "hosted": true, "switched": false,
-        "hasOfficial": has_off,
-        "hosting": detect_hosting(config_path, providers_path),
-        "changed": { "config": config_written, "auth": auth_changed, "authBackup": backup_created },
-    }))
+        Ok(json!({
+            "hosted": true, "switched": false,
+            "hasOfficial": has_off,
+            "hosting": detect_hosting(config_path, providers_path),
+            "changed": { "config": config_written, "auth": auth_changed, "authBackup": backup_created },
+        }))
+    })();
+    outcome.map_err(|error| rollback_files(error, &snapshots))
 }
 
 // ── unhost ───────────────────────────────────────────────────
@@ -482,7 +644,7 @@ fn restore_controlled_from_snapshot(current: &Value, snapshot: &Value) -> Value 
 }
 
 /// 找 backup_dir 里用途为 pre-host 的最新快照(host 前 config)。无则 None。
-fn find_pre_host_snapshot(backup_dir: &Path) -> Option<Value> {
+fn find_pre_host_snapshot(backup_dir: &Path, config_path: &Path) -> Option<Value> {
     let mut candidates: Vec<(Option<std::time::SystemTime>, Value)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(backup_dir) {
         for e in rd.flatten() {
@@ -496,8 +658,17 @@ fn find_pre_host_snapshot(backup_dir: &Path) -> Option<Value> {
             if meta.get("purpose").and_then(|v| v.as_str()) != Some("pre-host") {
                 continue;
             }
+            if !crate::config::backup_matches_target(&manifest, config_path) {
+                continue;
+            }
             let toml_path = manifest.with_file_name(name.trim_end_matches(".manifest.json"));
-            let v = crate::config::read_toml(&toml_path); // 失败返回空对象,无害
+            let v = match crate::config::read_verified_backup(&toml_path, config_path) {
+                Ok(Some(data)) => toml::from_str::<toml::Value>(&String::from_utf8_lossy(&data))
+                    .map(|value| serde_json::to_value(value).unwrap_or_else(|_| json!({})))
+                    .unwrap_or_else(|_| json!({})),
+                Ok(None) => json!({}),
+                Err(_) => continue,
+            };
             candidates.push((e.metadata().and_then(|m| m.modified()).ok(), v));
         }
     }
@@ -506,19 +677,18 @@ fn find_pre_host_snapshot(backup_dir: &Path) -> Option<Value> {
 }
 
 /// auth.json 里移除我们写入的 OPENAI_API_KEY(仅当值匹配最后一次托管供应商的 key;无 .bak 时的兜底)。
-fn remove_auth_key_if_ours(codex_home: &Path, api_key: &str) -> bool {
+fn remove_auth_key_if_ours(codex_home: &Path, api_key: &str) -> Result<bool, String> {
     let auth_p = codex_home.join("auth.json");
     let mut existing = read_auth_json(&auth_p);
     let matches = existing.get("OPENAI_API_KEY").and_then(|v| v.as_str()) == Some(api_key);
     if matches {
         if let Some(o) = existing.as_object_mut() {
             o.remove("OPENAI_API_KEY");
-            if write_auth_json(&auth_p, &existing).is_ok() {
-                return true;
-            }
+            write_auth_json(&auth_p, &existing)?;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// POST /api/desktop/unhost
@@ -537,120 +707,251 @@ pub fn unhost(
     }
 
     if has_official(codex_home) {
-        // 有官方账号:还原官方登录态(复用 M2 activate-official:恢复 .bak + config→official + 清 active)
-        crate::config::activate_official(config_path, backup_dir, providers_path, codex_home)
+        let snapshots = live_snapshots(&[
+            config_path.to_path_buf(),
+            codex_home.join("auth.json"),
+            codex_home.join(MODEL_CATALOG_FILENAME),
+            providers_path.to_path_buf(),
+        ])?;
+        let outcome = (|| {
+            backup_file(
+                config_path,
+                backup_dir,
+                "config-apply",
+                "pre-activate-official",
+            )
             .map_err(|e| (500, "E_IO".to_string(), e))?;
-        return Ok(json!({ "restored": true, "way": "official" }));
+            crate::config::activate_official(config_path, backup_dir, providers_path, codex_home)
+                .map_err(|e| (500, "E_IO".to_string(), e))?;
+            let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
+            if catalog_path.exists() {
+                std::fs::remove_file(&catalog_path)
+                    .map_err(|e| (500, "E_IO".to_string(), e.to_string()))?;
+            }
+            clear_active_checked(providers_path, "codex")?;
+            Ok(json!({ "restored": true, "way": "official" }))
+        })();
+        return outcome.map_err(|error| rollback_files(error, &snapshots));
     }
 
     // 无官方账号:移除托管痕迹。优先从 pre-host 快照恢复受控字段(§1.5-1,opencode 等手写
     // 用户的配置得以还原);无快照才清除。
-    let active = crate::providers::get_active(providers_path);
+    let active = crate::providers::get_active_for_agent(providers_path, "codex");
     let current = read_toml(config_path);
-    let merged = match find_pre_host_snapshot(backup_dir) {
+    let merged = match find_pre_host_snapshot(backup_dir, config_path) {
         Some(snapshot) => restore_controlled_from_snapshot(&current, &snapshot),
         None => build_unhosted_config(&current),
     };
     let new_toml = config_to_toml_string(&merged).map_err(io)?;
     let current_toml = config_to_toml_string(&current).unwrap_or_default();
-    let config_written = if new_toml != current_toml {
-        backup_file(config_path, backup_dir, "config-apply", "pre-unhost").map_err(io)?;
-        write_toml(config_path, &merged).map_err(io)?;
-        true
-    } else {
-        false
-    };
-    let _ = std::fs::remove_file(codex_home.join(MODEL_CATALOG_FILENAME));
+    let catalog_path = codex_home.join(MODEL_CATALOG_FILENAME);
+    let snapshots = live_snapshots(&[
+        config_path.to_path_buf(),
+        catalog_path.clone(),
+        codex_home.join("auth.json"),
+        providers_path.to_path_buf(),
+    ])?;
+    let outcome = (|| {
+        let config_written = if new_toml != current_toml {
+            backup_file(config_path, backup_dir, "config-apply", "pre-unhost").map_err(io)?;
+            write_toml(config_path, &merged).map_err(io)?;
+            true
+        } else {
+            false
+        };
+        if catalog_path.exists() {
+            std::fs::remove_file(&catalog_path).map_err(|e| io(e.to_string()))?;
+        }
 
-    // auth 恢复:有 .bak → 恢复 host 前状态;无 .bak → 仅移除我们写的 key(host 前本无 auth.json)
-    let auth_restored = if codex_home.join(AUTH_OFFICIAL_BAK).exists() {
-        let data =
-            std::fs::read(codex_home.join(AUTH_OFFICIAL_BAK)).map_err(|e| io(e.to_string()))?;
-        std::fs::write(codex_home.join("auth.json"), &data).map_err(|e| io(e.to_string()))?;
-        true
-    } else if let Some(p) = &active {
-        remove_auth_key_if_ours(codex_home, &p.api_key)
-    } else {
-        false
-    };
+        let auth_restored = if codex_home.join(AUTH_OFFICIAL_BAK).exists() {
+            let data =
+                std::fs::read(codex_home.join(AUTH_OFFICIAL_BAK)).map_err(|e| io(e.to_string()))?;
+            std::fs::write(codex_home.join("auth.json"), &data).map_err(|e| io(e.to_string()))?;
+            true
+        } else if let Some(p) = &active {
+            remove_auth_key_if_ours(codex_home, &p.api_key).map_err(io)?
+        } else {
+            false
+        };
 
-    crate::providers::clear_active(providers_path);
+        clear_active_checked(providers_path, "codex")?;
+
+        Ok(json!({
+            "restored": true, "way": "clean",
+            "changed": { "config": config_written, "auth": auth_restored },
+        }))
+    })();
+    outcome.map_err(|error| rollback_files(error, &snapshots))
+}
+
+// ── Claude Code 配置托管与启动 ───────────────────────────────
+
+/// 兼容旧接口：把 Claude Code 网关设置写入 `~/.claude/settings.json`。
+/// 返回托管元数据，不返回环境变量、启动命令或真实上游 Key。
+pub fn claude_start(providers_path: &Path, way: &str, provider_id: &str) -> Result<Value, OpError> {
+    let parent = providers_path.parent().unwrap_or_else(|| Path::new("."));
+    let home = if parent.file_name().and_then(|name| name.to_str()) == Some(".codex") {
+        parent.parent().unwrap_or(parent).to_path_buf()
+    } else {
+        parent.to_path_buf()
+    };
+    let backup_dir = parent.join("config-backups");
+    crate::agents::claude_code::host(&home, &backup_dir, providers_path, provider_id, way)
+}
+
+fn claude_launch_with<LocateCli, LaunchTerminal>(
+    providers_path: &Path,
+    way: &str,
+    provider_id: &str,
+    macos_supported: bool,
+    locate_cli: LocateCli,
+    launch_terminal: LaunchTerminal,
+) -> Result<Value, OpError>
+where
+    LocateCli: FnOnce() -> Result<PathBuf, String>,
+    LaunchTerminal: FnOnce(&str) -> Result<(), String>,
+{
+    let start = claude_start(providers_path, way, provider_id)?;
+    if !macos_supported {
+        return Err((
+            501,
+            "E_PLATFORM_UNSUPPORTED".into(),
+            "Claude Code 一键启动目前仅支持 macOS Terminal".into(),
+        ));
+    }
+
+    let cli_path = locate_cli().map_err(|_| {
+        (
+            400,
+            "E_CLAUDE_CLI_NOT_FOUND".into(),
+            "未找到 Claude Code CLI。请先安装 Claude Code，然后重新打开 2xapi 再试。".into(),
+        )
+    })?;
+    let cli = cli_path.to_str().filter(|value| !value.is_empty()).ok_or((
+        400,
+        "E_CLAUDE_CLI_NOT_FOUND".into(),
+        "Claude Code CLI 路径无法识别，请重新安装 Claude Code 后再试。".into(),
+    ))?;
+    let command = shell_quote(cli);
+    launch_terminal(&command).map_err(|reason| {
+        (
+            500,
+            "E_CLAUDE_LAUNCH_FAILED".into(),
+            format!("无法打开 macOS Terminal 启动 Claude Code：{reason}"),
+        )
+    })?;
 
     Ok(json!({
-        "restored": true, "way": "clean",
-        "changed": { "config": config_written, "auth": auth_restored },
+        "launched": true,
+        "terminal": "Terminal",
+        "way": start["way"].clone(),
+        "providerId": start["providerId"].clone(),
+        "providerName": start["providerName"].clone(),
+        "model": start["model"].clone(),
+        "modelOptions": start["modelOptions"].clone(),
     }))
 }
 
-// ── Claude 注入式启动(批「Claude 接入」§3)──────────────────────
-
-/// Claude 注入式启动信息:`POST /api/desktop/claude-start`(handler 在 server.rs)。
-/// 返回可直接粘贴进终端的启动命令 + 结构化 env;本批**只生成信息,不真正 spawn claude**
-/// (避免长驻进程的 UX 复杂度)。校验:存在 agent=claude 的供应商(取数规则与网关
-/// `/anthropic/*` 一致 = `providers::get_provider_for_agent`)。
-///
-/// - `way="direct"` → `ANTHROPIC_BASE_URL` 直指供应商 base_url(不经网关、无加速、app 关闭也能用);
-/// - 其余(默认 `"gateway"`)→ `ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic`(经网关注入)。
-///
-/// Key 取自供应商 `api_key`,**仅在返回的 command/env 里**:不落盘、不进 ~/.claude、
-/// 不进日志(调用方/前端不得把它写文件)。
-///
-/// ⚠️ 环境变量名「待罗盘实测校准」(探索子任务,交接日志 Claude 接入):本机 claude 2.1.232
-/// 计划注入 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`(开发任务书 §2,前者指向网关 /anthropic,
-/// 后者令 claude 发 `Authorization: Bearer <key>` 与本网关认法一致)。若罗盘实测
-/// `ANTHROPIC_BASE_URL` 不生效而 `ANTHROPIC_API_KEY` 生效,则改用 `ANTHROPIC_API_KEY`
-/// (网关 /anthropic 路由不变,需同步校准并记入交接日志)。
-pub fn claude_start(providers_path: &Path, way: &str, provider_id: &str) -> Result<Value, OpError> {
-    // 指定 providerId → 用选中的供应商(前端传当前选中);缺省回退该 agent 第一个
-    let p = if !provider_id.trim().is_empty() {
-        let data = crate::providers::load(providers_path);
-        data.providers
-            .iter()
-            .find(|p| p.id == provider_id)
-            .cloned()
-            .ok_or((
-                400u16,
-                "E_NO_PROVIDER".to_string(),
-                "供应商不存在".to_string(),
-            ))?
-    } else {
-        crate::providers::get_provider_for_agent(providers_path, "claude").ok_or((
-            503u16,
-            "E_NO_CLAUDE_PROVIDER".to_string(),
-            "请先选择 Claude 供应商".to_string(),
-        ))?
-    };
-    if p.api_key.trim().is_empty() {
-        return Err((
-            400u16,
-            "E_NO_KEY".to_string(),
-            "该 Claude 供应商缺少 api_key".to_string(),
-        ));
+#[cfg(target_os = "macos")]
+fn locate_claude_cli_macos() -> Result<PathBuf, String> {
+    let output = std::process::Command::new("/bin/zsh")
+        .args(["-lic", "whence -p claude"])
+        .env("TERM", "dumb")
+        .output()
+        .map_err(|error| format!("无法检查 Claude Code CLI：{error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    let base_url = if way == "direct" {
-        p.base_url.trim_end_matches('/').to_string()
-    } else {
-        format!("http://{}/anthropic", GATEWAY_ADDR)
-    };
-    // Key 只在返回值里;command 供前端一键复制到终端(行内 env 前缀)
-    // ANTHROPIC_MODEL:claude CLI 认的有效变量——启动即用该供应商默认模型,免手动 /model
-    let env = json!({
-        "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_AUTH_TOKEN": p.api_key,
-        "ANTHROPIC_MODEL": p.model,
-    });
-    let command = format!(
-        "ANTHROPIC_BASE_URL={} ANTHROPIC_AUTH_TOKEN={} ANTHROPIC_MODEL={} claude",
-        base_url, p.api_key, p.model
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('/') && Path::new(line).is_file())
+        .map(PathBuf::from)
+        .ok_or_else(|| "PATH 中没有可执行的 claude".into())
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+#[cfg(target_os = "macos")]
+fn launch_claude_in_terminal_macos(command: &str) -> Result<(), String> {
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script {}\nend tell\n",
+        applescript_string(command)
     );
-    Ok(json!({
-        "command": command,
-        "env": env,
-        "way": if way == "direct" { "direct" } else { "gateway" },
-        "providerId": p.id,
-        "providerName": p.name,
-        "model": p.model,
-    }))
+    let mut child = std::process::Command::new("/usr/bin/osascript")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法调用系统自动化工具：{error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法写入 Terminal 启动指令".to_string())?
+        .write_all(script.as_bytes())
+        .map_err(|error| format!("写入 Terminal 启动指令失败：{error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("等待 Terminal 响应失败：{error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if detail.is_empty() {
+            "系统拒绝打开 Terminal，请检查自动化权限".into()
+        } else {
+            detail
+        })
+    }
+}
+
+/// 在 macOS Terminal 中一键启动 Claude Code。响应仅返回启动结果与供应商元数据，
+/// 不返回 command/env；网关模式始终使用本机占位 token，不暴露真实上游 Key。
+pub fn claude_launch(
+    providers_path: &Path,
+    way: &str,
+    provider_id: &str,
+) -> Result<Value, OpError> {
+    #[cfg(target_os = "macos")]
+    {
+        claude_launch_with(
+            providers_path,
+            way,
+            provider_id,
+            true,
+            locate_claude_cli_macos,
+            launch_claude_in_terminal_macos,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        claude_launch_with(
+            providers_path,
+            way,
+            provider_id,
+            false,
+            || unreachable!(),
+            |_| unreachable!(),
+        )
+    }
 }
 
 // ── 单测(任务书 §1.3)────────────────────────────────────────
@@ -703,6 +1004,7 @@ mod tests {
             serde_json::to_string(&ProviderData {
                 schema_version: 1,
                 active_provider_id: None,
+                active_provider_ids: Default::default(),
                 providers,
             })
             .unwrap(),
@@ -842,6 +1144,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn host_rejects_foreign_agent_without_writes() {
+        let (root, cfg, bk, home, prov) = sandbox("host-foreign-agent");
+        let original = "user_setting = \"keep\"\n";
+        std::fs::write(&cfg, original).unwrap();
+        let mut foreign = provider("p1", "Gemini");
+        foreign.agent = "gemini".into();
+        write_providers(&prov, vec![foreign]);
+
+        let error = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_PROVIDER_AGENT_MISMATCH");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        assert!(!home.join(MODEL_CATALOG_FILENAME).exists());
+        assert!(crate::providers::get_active_for_agent(&prov, "codex").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_rolls_back_live_files_when_active_write_fails() {
+        let (root, cfg, bk, home, prov) = sandbox("host-active-rollback");
+        let original = "user_setting = \"keep\"\n";
+        std::fs::write(&cfg, original).unwrap();
+        write_providers(&prov, vec![provider("p1", "2xapi")]);
+        std::fs::create_dir(prov.with_extension("json.tmp")).unwrap();
+
+        let error = host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_ACTIVE_WRITE");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        assert!(!home.join(MODEL_CATALOG_FILENAME).exists());
+        assert!(!home.join("auth.json").exists());
+        assert!(crate::providers::get_active_for_agent(&prov, "codex").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── host(direct,UI 对齐批放开:仅无官方账号)──
 
     /// ① 无账号 host direct:custom 直指供应商,key 以 experimental_bearer_token 落盘
@@ -890,7 +1228,7 @@ mod tests {
         assert!(!home.join("auth.json").exists());
         assert!(!home.join(AUTH_OFFICIAL_BAK).exists());
         // 首次 direct 托管留 pre-host 快照(unhost 据此还原)
-        assert!(find_pre_host_snapshot(&bk).is_some());
+        assert!(find_pre_host_snapshot(&bk, &cfg).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1357,7 +1695,7 @@ mod tests {
         // host 产生 pre-host 快照
         host(&cfg, &bk, &home, &prov, "p1", "gateway").unwrap();
         assert!(
-            find_pre_host_snapshot(&bk).is_some(),
+            find_pre_host_snapshot(&bk, &cfg).is_some(),
             "host 应留下 pre-host 快照"
         );
 
@@ -1383,7 +1721,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── Claude 接入:claude_start(注入式启动信息)──
+    // ── Claude Code 配置托管 ─────────────────────────────────
 
     fn claude_provider(id: &str, name: &str) -> Provider {
         Provider {
@@ -1398,72 +1736,134 @@ mod tests {
         }
     }
 
-    /// 缺省 way → 网关注入:base 指向 8787/anthropic,env 含 ANTHROPIC_BASE_URL + AUTH_TOKEN,command 可复制。
     #[test]
-    fn claude_start_gateway_returns_command_and_env() {
-        let (root, _c, _b, _h, prov) = sandbox("claude-start");
+    fn claude_start_writes_gateway_settings_without_returning_key() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-start-config");
         write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
         let out = claude_start(&prov, "", "").unwrap();
         assert_eq!(out["way"], "gateway");
-        assert_eq!(
-            out["env"]["ANTHROPIC_BASE_URL"],
-            "http://127.0.0.1:8787/anthropic"
-        );
-        assert_eq!(out["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
         assert_eq!(out["providerId"], "p1");
-        let cmd = out["command"].as_str().unwrap();
-        assert!(cmd.starts_with("ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic ANTHROPIC_AUTH_TOKEN=sk-claude-test-secret "));
-        assert!(cmd.ends_with(" claude"));
+        assert!(out.get("env").is_none());
+        assert!(out.get("command").is_none());
+        let settings = root.join(".claude/settings.json");
+        let written = std::fs::read_to_string(settings).unwrap();
+        assert!(written.contains("http://127.0.0.1:8787/anthropic"));
+        assert!(written.contains("ANTHROPIC_MODEL"));
+        assert!(!written.contains("sk-claude-test-secret"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 指定 providerId → 用选中的供应商(而非第一个);env 含 ANTHROPIC_MODEL
     #[test]
-    fn claude_start_uses_selected_provider_id() {
-        let (_root, _c, _b, _h, prov) = sandbox("claude-start-sel");
-        write_providers(
-            &prov,
-            vec![
-                claude_provider("c1", "First"),
-                claude_provider("c2", "Second"),
-            ],
-        );
-        let out = claude_start(&prov, "", "c2").unwrap();
+    fn claude_start_uses_selected_provider_id_and_model_options() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-start-selected");
+        let mut first = claude_provider("c1", "First");
+        first.model = "first-model".into();
+        let mut second = claude_provider("c2", "Second");
+        second.model = "second-model".into();
+        write_providers(&prov, vec![first, second]);
+        let out = claude_start(&prov, "gateway", "c2").unwrap();
         assert_eq!(out["providerId"], "c2");
         assert_eq!(out["providerName"], "Second");
-        // 指定的 id 用其凭证与模型,而非第一个
-        assert_eq!(
-            out["env"]["ANTHROPIC_AUTH_TOKEN"],
-            out["env"]["ANTHROPIC_AUTH_TOKEN"]
-        );
-        assert!(out["env"]["ANTHROPIC_MODEL"].is_string());
-        // 不存在的 id → 报错
-        assert!(claude_start(&prov, "", "no-such-id").is_err());
-    }
-
-    /// way=direct → base_url 直指供应商,不经网关。
-    #[test]
-    fn claude_start_direct_uses_provider_base_url() {
-        let (root, _c, _b, _h, prov) = sandbox("claude-direct");
-        write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
-        let out = claude_start(&prov, "direct", "").unwrap();
-        assert_eq!(out["way"], "direct");
-        assert_eq!(
-            out["env"]["ANTHROPIC_BASE_URL"],
-            "https://up.claude.example.com"
-        );
-        assert_eq!(out["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "second-model");
+        assert!(claude_start(&prov, "gateway", "no-such-id").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 无 claude 供应商(只有 codex)→ 503 E_NO_CLAUDE_PROVIDER。
+    #[test]
+    fn claude_start_rejects_direct_and_foreign_provider() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-direct");
+        write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
+        let direct = claude_start(&prov, "direct", "").unwrap_err();
+        assert_eq!(direct.1, "E_CLAUDE_DIRECT_UNSUPPORTED");
+        assert!(!root.join(".claude/settings.json").exists());
+
+        let mut foreign = claude_provider("p2", "Foreign");
+        foreign.agent = "gemini".into();
+        write_providers(&prov, vec![foreign]);
+        let err = claude_start(&prov, "gateway", "p2").unwrap_err();
+        assert_eq!(err.1, "E_PROVIDER_AGENT_MISMATCH");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn claude_start_no_claude_provider_errs() {
         let (root, _c, _b, _h, prov) = sandbox("claude-noprov");
-        write_providers(&prov, vec![provider("p1", "Cx")]); // agent 默认空 → codex
+        write_providers(&prov, vec![provider("p1", "Cx")]);
         let err = claude_start(&prov, "", "").unwrap_err();
         assert_eq!(err.0, 503);
         assert_eq!(err.1, "E_NO_CLAUDE_PROVIDER");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_launch_applescript_string_escapes_script_boundaries() {
+        let encoded = applescript_string("echo \"safe\"\nend tell\nsay \"unsafe\"\\tail");
+        assert!(encoded.starts_with('"') && encoded.ends_with('"'));
+        assert!(!encoded[1..encoded.len() - 1].contains('\n'));
+        assert!(encoded.contains("\\\"safe\\\""));
+        assert!(encoded.contains("\\nend tell\\n"));
+        assert!(encoded.contains("\\\"unsafe\\\"\\\\tail"));
+    }
+
+    #[test]
+    fn claude_launch_reports_missing_cli_in_plain_language() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-launch-no-cli");
+        write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
+        let err = claude_launch_with(
+            &prov,
+            "gateway",
+            "p1",
+            true,
+            || Err("not found".into()),
+            |_| panic!("CLI 不存在时不应尝试打开 Terminal"),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 400);
+        assert_eq!(err.1, "E_CLAUDE_CLI_NOT_FOUND");
+        assert!(err.2.contains("未找到 Claude Code CLI"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_launch_reports_terminal_failure_in_plain_language() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-launch-terminal-fail");
+        write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
+        let err = claude_launch_with(
+            &prov,
+            "gateway",
+            "p1",
+            true,
+            || Ok(PathBuf::from("/usr/local/bin/claude")),
+            |_| Err("Terminal automation denied".into()),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 500);
+        assert_eq!(err.1, "E_CLAUDE_LAUNCH_FAILED");
+        assert!(err.2.contains("无法打开 macOS Terminal"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_launch_rejects_non_macos_explicitly() {
+        let (root, _c, _b, _h, prov) = sandbox("claude-launch-platform");
+        write_providers(&prov, vec![claude_provider("p1", "ClaudeT")]);
+        let err = claude_launch_with(
+            &prov,
+            "gateway",
+            "p1",
+            false,
+            || panic!("非 macOS 不应查找 CLI"),
+            |_| panic!("非 macOS 不应打开 Terminal"),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 501);
+        assert_eq!(err.1, "E_PLATFORM_UNSUPPORTED");
+        assert!(err.2.contains("仅支持 macOS"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

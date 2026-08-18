@@ -16,6 +16,11 @@ use std::path::{Path, PathBuf};
 use crate::providers::{AccessMode, Provider};
 use crate::server::AppState;
 
+const MAX_IMAGE_INPUT_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_IMAGE_OUTPUT_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_RESPONSE_BYTES: usize = 30 * 1024 * 1024;
+const MAX_TEXT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
 fn ok_data(data: Value) -> Response {
     (
         StatusCode::OK,
@@ -44,22 +49,50 @@ fn api_url(base_url: &str, path: &str) -> String {
     }
 }
 
-/// 端点覆盖:body.api(内置工具故障转移链注入的备用端点)优先,否则供应商 base_url。
-fn api_base<'a>(p: &'a Provider, body: &'a Value) -> &'a str {
-    body.get("api")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(&p.base_url)
+/// 媒体工具始终使用所选供应商端点，禁止请求体覆盖接收供应商 Key 的目标地址。
+fn api_base(p: &Provider) -> &str {
+    &p.base_url
 }
 
-/// 供应商解析:body.provider_id 指定,否则 active。
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_keyed_endpoint(base_url: &str) -> Result<(), Box<Response>> {
+    let parsed = reqwest::Url::parse(base_url).map_err(|error| {
+        Box::new(tool_err(
+            "E_PROVIDER_URL",
+            &error.to_string(),
+            "供应商地址无效,请检查 base URL",
+        ))
+    })?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if parsed.host_str().is_some_and(is_loopback_host) => Ok(()),
+        "http" => Err(Box::new(tool_err(
+            "E_INSECURE_ENDPOINT",
+            "refuse non-loopback plain HTTP",
+            "为保护 API Key,远程供应商必须使用 HTTPS；仅本机回环地址允许 HTTP",
+        ))),
+        _ => Err(Box::new(tool_err(
+            "E_PROVIDER_URL",
+            "unsupported URL scheme",
+            "供应商地址仅支持 HTTPS，或本机回环 HTTP",
+        ))),
+    }
+}
+
+/// 供应商解析:body.provider_id 指定,否则取 Codex 平台 active，避免被其他平台切换串台。
 fn resolve_provider(s: &AppState, body: &Value) -> Result<Provider, Box<Response>> {
     let pid = body
         .get("provider_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let p = if pid.is_empty() {
-        crate::providers::get_active(&s.providers_path)
+        crate::providers::get_provider_for_agent(&s.providers_path, "codex")
     } else {
         crate::providers::list(&s.providers_path)
             .into_iter()
@@ -79,6 +112,7 @@ fn resolve_provider(s: &AppState, body: &Value) -> Result<Provider, Box<Response
             "Official 模式供应商不走上游多模态能力,请切换为网关模式供应商",
         )));
     }
+    validate_keyed_endpoint(&p.base_url)?;
     Ok(p)
 }
 
@@ -89,10 +123,15 @@ fn provider_key(p: &Provider) -> Result<String, Box<Response>> {
         .ok_or_else(|| Box::new(tool_err("E_NO_KEY", "no api key", "该供应商未配置 API Key")))
 }
 
-/// 暂存定位:网关暂存 URL(尾段 {hex}.{ext})或本机绝对路径;id 限 hex 防穿越(与抽帧同款)。
-fn media_path(codex_home: &Path, media_url: &str) -> Result<PathBuf, Box<Response>> {
+/// 暂存定位:只允许网关媒体暂存目录内的普通文件，并拒绝符号链接越界与超大输入。
+fn media_path(
+    codex_home: &Path,
+    media_url: &str,
+    max_bytes: u64,
+) -> Result<PathBuf, Box<Response>> {
     let media_url = media_url.trim();
-    match media_url.rsplit('/').next() {
+    let media_root = crate::media::media_root(codex_home);
+    let candidate = match media_url.rsplit('/').next() {
         Some(tail)
             if tail.contains('.')
                 && tail
@@ -102,26 +141,84 @@ fn media_path(codex_home: &Path, media_url: &str) -> Result<PathBuf, Box<Respons
                     .chars()
                     .all(|c| c.is_ascii_hexdigit()) =>
         {
-            let p = crate::media::media_root(codex_home).join(tail);
-            if p.exists() {
-                Ok(p)
-            } else {
-                Err(Box::new(tool_err(
-                    "E_MEDIA_NOT_FOUND",
-                    "media_url 不在暂存",
-                    "该媒体不在本机暂存,请先上传",
-                )))
-            }
+            media_root.join(tail)
         }
-        _ if media_url.starts_with('/') && !media_url.contains("..") => {
-            Ok(PathBuf::from(media_url))
-        }
-        _ => Err(Box::new(tool_err(
+        _ => PathBuf::from(media_url),
+    };
+    if !candidate.is_absolute() {
+        return Err(Box::new(tool_err(
             "E_ARGS",
             "media_url 形态不支持",
-            "支持网关暂存地址(/media/{id}.{ext})或本机绝对路径",
-        ))),
+            "请先上传媒体并使用网关暂存地址",
+        )));
     }
+    let root = std::fs::canonicalize(&media_root).map_err(|_| {
+        Box::new(tool_err(
+            "E_MEDIA_NOT_FOUND",
+            "媒体暂存目录不存在",
+            "请先上传媒体文件",
+        ))
+    })?;
+    let path = std::fs::canonicalize(&candidate).map_err(|_| {
+        Box::new(tool_err(
+            "E_MEDIA_NOT_FOUND",
+            "媒体文件不存在",
+            "该媒体不在本机暂存,请先上传",
+        ))
+    })?;
+    if !path.starts_with(&root) {
+        return Err(Box::new(tool_err(
+            "E_MEDIA_SCOPE",
+            "media path outside staging directory",
+            "仅允许读取应用媒体暂存目录中的文件,请先上传",
+        )));
+    }
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        Box::new(tool_err(
+            "E_MEDIA_READ",
+            &error.to_string(),
+            "读取媒体元数据失败",
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(Box::new(tool_err(
+            "E_MEDIA_READ",
+            "media path is not a file",
+            "媒体地址必须指向普通文件",
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(Box::new(tool_err(
+            "E_MEDIA_TOO_LARGE",
+            &format!("media size {} exceeds {max_bytes}", metadata.len()),
+            &format!("媒体文件过大,上限为 {}MB", max_bytes / 1024 / 1024),
+        )));
+    }
+    Ok(path)
+}
+
+async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("响应超过大小上限 {max_bytes} bytes"));
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("响应读取失败: {error}"))?
+    {
+        if data.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("响应超过大小上限 {max_bytes} bytes"));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }
 
 fn mime_of(path: &Path) -> &'static str {
@@ -220,7 +317,7 @@ pub async fn image_describe(s: &AppState, body: &Value) -> Response {
             "该模型经探测不支持识图(看不到图片),请换多模态模型,或在供应商详情卡手动更正能力标签后重试",
         );
     }
-    let path = match media_path(&s.codex_home, media_url) {
+    let path = match media_path(&s.codex_home, media_url, MAX_IMAGE_INPUT_BYTES) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -243,7 +340,7 @@ pub async fn image_describe(s: &AppState, body: &Value) -> Response {
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap_or_default();
-    let url = api_url(api_base(&p, body), "/chat/completions");
+    let url = api_url(api_base(&p), "/chat/completions");
     let resp = client
         .post(&url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
@@ -267,7 +364,17 @@ pub async fn image_describe(s: &AppState, body: &Value) -> Response {
         }
     };
     let status = resp.status();
-    let v: Value = match resp.json().await {
+    let response_bytes = match response_bytes_limited(resp, MAX_TEXT_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return tool_err(
+                "E_UPSTREAM",
+                &e.to_string(),
+                "上游响应读取失败或超过大小上限",
+            )
+        }
+    };
+    let v: Value = match serde_json::from_slice(&response_bytes) {
         Ok(v) => v,
         Err(e) => {
             return tool_err(
@@ -311,8 +418,22 @@ async fn store_image_out(
         .unwrap_or_default();
     for item in items {
         let bytes: Vec<u8> = if let Some(b64) = item.get("b64_json").and_then(|x| x.as_str()) {
+            if b64.len() > MAX_IMAGE_OUTPUT_BYTES.saturating_mul(4).div_ceil(3) + 4 {
+                return Err(Box::new(tool_err(
+                    "E_MEDIA_TOO_LARGE",
+                    "base64 image exceeds size limit",
+                    "上游返回图片过大,已拒绝写入暂存",
+                )));
+            }
             match crate::media::b64_decode(b64) {
-                Ok(b) => b,
+                Ok(b) if b.len() <= MAX_IMAGE_OUTPUT_BYTES => b,
+                Ok(_) => {
+                    return Err(Box::new(tool_err(
+                        "E_MEDIA_TOO_LARGE",
+                        "decoded image exceeds size limit",
+                        "上游返回图片过大,已拒绝写入暂存",
+                    )))
+                }
                 Err(e) => {
                     return Err(Box::new(tool_err(
                         "E_MEDIA_B64",
@@ -323,16 +444,18 @@ async fn store_image_out(
             }
         } else if let Some(u) = item.get("url").and_then(|x| x.as_str()) {
             match client.get(u).send().await {
-                Ok(r) if r.status().is_success() => match r.bytes().await {
-                    Ok(b) => b.to_vec(),
-                    Err(e) => {
-                        return Err(Box::new(tool_err(
-                            "E_UPSTREAM",
-                            &e.to_string(),
-                            "下载上游图片失败",
-                        )))
+                Ok(r) if r.status().is_success() => {
+                    match response_bytes_limited(r, MAX_IMAGE_OUTPUT_BYTES).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Err(Box::new(tool_err(
+                                "E_MEDIA_TOO_LARGE",
+                                &e,
+                                "下载上游图片失败或图片超过大小上限",
+                            )))
+                        }
                     }
-                },
+                }
                 Ok(r) => {
                     return Err(Box::new(tool_err(
                         "E_UPSTREAM",
@@ -404,7 +527,7 @@ pub async fn image_generate(s: &AppState, body: &Value) -> Response {
         .build()
         .unwrap_or_default();
     let resp = match client
-        .post(api_url(api_base(&p, body), "/images/generations"))
+        .post(api_url(api_base(&p), "/images/generations"))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
         .json(&req_body)
         .send()
@@ -420,7 +543,11 @@ pub async fn image_generate(s: &AppState, body: &Value) -> Response {
         }
     };
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let response_bytes = match response_bytes_limited(resp, MAX_IMAGE_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => return tool_err("E_MEDIA_TOO_LARGE", &error, "上游图片响应超过大小上限"),
+    };
+    let text = String::from_utf8_lossy(&response_bytes).into_owned();
     if !status.is_success() {
         return tool_err(
             "E_UPSTREAM",
@@ -478,7 +605,7 @@ pub async fn image_edit(s: &AppState, body: &Value) -> Response {
         Ok(k) => k,
         Err(r) => return *r,
     };
-    let path = match media_path(&s.codex_home, media_url) {
+    let path = match media_path(&s.codex_home, media_url, MAX_IMAGE_INPUT_BYTES) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -517,7 +644,7 @@ pub async fn image_edit(s: &AppState, body: &Value) -> Response {
         .build()
         .unwrap_or_default();
     let resp = match client
-        .post(api_url(api_base(&p, body), "/images/edits"))
+        .post(api_url(api_base(&p), "/images/edits"))
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
         .multipart(form)
         .send()
@@ -533,7 +660,11 @@ pub async fn image_edit(s: &AppState, body: &Value) -> Response {
         }
     };
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let response_bytes = match response_bytes_limited(resp, MAX_IMAGE_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => return tool_err("E_MEDIA_TOO_LARGE", &error, "上游图片响应超过大小上限"),
+    };
+    let text = String::from_utf8_lossy(&response_bytes).into_owned();
     if !status.is_success() {
         return tool_err(
             "E_UPSTREAM",
@@ -663,7 +794,6 @@ mod tests {
             oclaw_home: root.join("oclaw"),
             cd_home: root.join("cdsupport"),
             cursor_home: root.join("cursorhome"),
-            trae_home: root.join("traehome"),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
             tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             launcher: Default::default(),
@@ -690,6 +820,66 @@ mod tests {
     }
 
     #[test]
+    fn default_provider_is_scoped_to_codex() {
+        let root = temp_root("provider-scope");
+        let state = mk_state(&root, "https://codex.example/v1");
+        std::fs::write(
+            &state.providers_path,
+            json!({
+                "schema_version": 3,
+                "active_provider_id": "gemini-p",
+                "active_provider_ids": { "codex": "codex-p", "gemini": "gemini-p" },
+                "providers": [
+                    { "id": "codex-p", "name": "Codex", "agent": "codex", "base_url": "https://codex.example/v1", "api_key": "sk-c", "model": "c" },
+                    { "id": "gemini-p", "name": "Gemini", "agent": "gemini", "base_url": "https://gemini.example/v1", "api_key": "sk-g", "model": "g" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let provider = resolve_provider(&state, &json!({})).unwrap();
+        assert_eq!(provider.id, "codex-p");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keyed_endpoint_requires_https_except_loopback() {
+        assert!(validate_keyed_endpoint("https://api.example.com/v1").is_ok());
+        assert!(validate_keyed_endpoint("http://127.0.0.1:8787/v1").is_ok());
+        assert!(validate_keyed_endpoint("http://localhost:8787/v1").is_ok());
+        assert!(validate_keyed_endpoint("http://api.example.com/v1").is_err());
+    }
+
+    #[test]
+    fn media_input_must_stay_in_staging_and_within_size_limit() {
+        let root = temp_root("media-scope");
+        let item = crate::media::store_upload(&root, PNG_BYTES, "image/png", "test").unwrap();
+        let managed_url = format!("/media/{}.{}", item.id, item.ext);
+        assert!(media_path(&root, &managed_url, MAX_IMAGE_INPUT_BYTES).is_ok());
+
+        let outside = root.join("outside.png");
+        std::fs::write(&outside, PNG_BYTES).unwrap();
+        assert!(
+            media_path(
+                &root,
+                outside.to_string_lossy().as_ref(),
+                MAX_IMAGE_INPUT_BYTES
+            )
+            .is_err(),
+            "暂存目录外的绝对路径必须拒绝"
+        );
+
+        let oversized = crate::media::media_root(&root).join("deadbeef.png");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_IMAGE_INPUT_BYTES + 1).unwrap();
+        let error = media_path(&root, "/media/deadbeef.png", MAX_IMAGE_INPUT_BYTES)
+            .expect_err("超限媒体必须拒绝");
+        drop(error);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn b64_known_vectors() {
         assert_eq!(b64_encode(b"hi"), "aGk=");
         assert_eq!(b64_encode(b"hi!"), "aGkh");
@@ -703,14 +893,15 @@ mod tests {
             r#"{"choices":[{"message":{"content":"红色"},"finish_reason":"stop"}]}"#.to_string();
         let (base, _seen) = mock_upstream(vec![("/chat/completions".into(), 200, chat)]).await;
         let s = mk_state(&root, &base);
-        let img = root.join("pic.png");
-        std::fs::write(&img, PNG_BYTES).unwrap();
+        let image =
+            crate::media::store_upload(&s.codex_home, PNG_BYTES, "image/png", "test").unwrap();
+        let media_url = format!("/media/{}.{}", image.id, image.ext);
 
-        // 通:绝对路径形态 + 默认 active 供应商/默认模型
+        // 通:受控暂存地址 + 默认 active 供应商/默认模型
         let v = body_of(
             image_describe(
                 &s,
-                &json!({ "media_url": img.to_str().unwrap(), "prompt": "什么颜色?" }),
+                &json!({ "media_url": media_url, "prompt": "什么颜色?" }),
             )
             .await,
         )
@@ -723,8 +914,7 @@ mod tests {
         let mut caps = crate::capprobe::Caps::unknown();
         caps.image_in = crate::capprobe::Tri::No;
         crate::capprobe::store_probe(&s.codex_home, "p1", "m1", &caps);
-        let v =
-            body_of(image_describe(&s, &json!({ "media_url": img.to_str().unwrap() })).await).await;
+        let v = body_of(image_describe(&s, &json!({ "media_url": media_url })).await).await;
         assert_eq!(v["ok"], false);
         assert!(v["error"]["code"] == "E_CAP_IMAGE_IN", "应走识图关卡: {v}");
         assert!(v["error"]["human"].as_str().unwrap().contains("识图"));
@@ -841,7 +1031,6 @@ mod tests {
             oclaw_home: home.parent().unwrap().join(".openclaw"),
             cd_home: home.parent().unwrap().to_path_buf(),
             cursor_home: home.parent().unwrap().to_path_buf(),
-            trae_home: home.parent().unwrap().to_path_buf(),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
             tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             launcher: Default::default(),
@@ -856,10 +1045,15 @@ mod tests {
             std::path::Path::new(img).exists(),
             "真机资产 /tmp/red64.png 缺失"
         );
+        let image_bytes = std::fs::read(img).unwrap();
+        let image =
+            crate::media::store_upload(&home, &image_bytes, "image/png", "media-tools-real")
+                .expect("真机图片应能进入受控暂存");
+        let media_url = format!("/media/{}.{}", image.id, image.ext);
         // describe:真实供应商+gpt-5.6(已实证识图)
         let prov = crate::providers::get_active(&providers_path).expect("须有 active 供应商");
         let v = body_of(
-            image_describe(&s, &json!({ "media_url": img, "model": "gpt-5.6", "provider_id": prov.id, "prompt": "这张图是什么颜色?只回答颜色词。" })).await,
+            image_describe(&s, &json!({ "media_url": media_url, "model": "gpt-5.6", "provider_id": prov.id, "prompt": "这张图是什么颜色?只回答颜色词。" })).await,
         )
         .await;
         assert_eq!(v["ok"], true, "识图应真通: {v}");

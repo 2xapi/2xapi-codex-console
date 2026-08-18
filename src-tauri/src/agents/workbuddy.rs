@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 pub const VENDOR: &str = "2xapi-gateway";
 /// 网关 Chat 入口(gateway.rs 根路径直收 /chat/completions)。
 const GATEWAY_CHAT_URL: &str = "http://127.0.0.1:8787/workbuddy/v1/chat/completions";
+const PLACEHOLDER_KEY: &str = "2xapi-gateway-managed";
 
 type OpError = (u16, String, String);
 
@@ -84,7 +85,7 @@ fn build_entry(provider: &crate::providers::Provider, way: &str) -> Value {
         "id": provider.model,
         "name": format!("2xapi 网关({})", provider.name),
         "vendor": VENDOR,
-        "apiKey": provider.api_key,
+        "apiKey": if way == "gateway" { PLACEHOLDER_KEY } else { &provider.api_key },
         "url": url,
         "maxInputTokens": 128000,
         "maxOutputTokens": 16384,
@@ -108,13 +109,14 @@ fn write_models_atomic(root: &Path, cfg: &Value) -> Result<(), OpError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| (500, "E_IO".into(), e.to_string()))?;
     }
     std::fs::rename(&tmp, &p).map_err(|e| (500, "E_IO".into(), e.to_string()))
 }
 
-/// host 单载体:已含本产品条目且内容一致→no-op;否则备份后写入(幂等由 diff 保证)。
-fn host_root(root: &Path, entry: &Value, backup_dir: &Path) -> Result<bool, OpError> {
+/// host 单载体计划:返回合并结果与是否需要写入，不在计划阶段改盘。
+fn plan_host_root(root: &Path, entry: &Value) -> Result<(Value, bool), OpError> {
     let cfg = read_models(root)?;
     let (mut merged, _) = strip_ours(&cfg); // 先清旧条目(同 id 覆盖语义)
     if let Some(obj) = merged.as_object_mut() {
@@ -124,17 +126,19 @@ fn host_root(root: &Path, entry: &Value, backup_dir: &Path) -> Result<bool, OpEr
         }
     }
     if serde_json::to_string_pretty(&merged).ok() == serde_json::to_string_pretty(&cfg).ok() {
-        return Ok(false); // 内容一致(幂等):不写盘不备份
+        return Ok((merged, false)); // 内容一致(幂等):不写盘不备份
     }
+    Ok((merged, true))
+}
+
+fn backup_models(root: &Path, backup_dir: &Path, purpose: &str) -> Result<(), OpError> {
     let p = models_path(root);
     if p.exists() {
-        // backup_file 不自建目录(main.rs 生产路径建过);adapter 自愈,测试与直调同安全
         std::fs::create_dir_all(backup_dir).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
-        crate::config::backup_file(&p, backup_dir, "workbuddy-models", "pre-host")
+        crate::config::backup_file(&p, backup_dir, "workbuddy-models", purpose)
             .map_err(|e| (500, "E_IO".into(), e))?;
     }
-    write_models_atomic(root, &merged)?;
-    Ok(true)
+    Ok(())
 }
 
 /// POST /api/desktop/workbuddy/host {providerId, way}
@@ -165,6 +169,7 @@ pub fn host(
                 "找不到该供应商".to_string(),
             )
         })?;
+    crate::desktop::validate_provider_agent(&provider, "workbuddy")?;
     if provider.model.is_empty() {
         return Err((
             422,
@@ -173,40 +178,83 @@ pub fn host(
         ));
     }
     let entry = build_entry(&provider, way);
-    let mut changed = serde_json::Map::new();
+    let mut plans = Vec::new();
     for (key, root) in config_roots(wb_home) {
-        let wrote = host_root(&root, &entry, backup_dir)?;
-        changed.insert(key.into(), json!(wrote));
+        let (merged, wrote) = plan_host_root(&root, &entry)?;
+        plans.push((key, root, merged, wrote));
     }
-    crate::providers::set_active(providers_path, &provider.id);
-    Ok(json!({
-        "hosted": true,
-        "way": way,
-        "entryId": provider.model,
-        "entryName": format!("2xapi 网关({})", provider.name),
-        "changed": Value::Object(changed),
-        "hint": "叠加平台:模型条目已写入,请在 CodeBuddy/WorkBuddy 模型列表选择「2xapi 网关」",
-    }))
+    let mut paths: Vec<PathBuf> = plans
+        .iter()
+        .filter(|(_, _, _, wrote)| *wrote)
+        .map(|(_, root, _, _)| models_path(root))
+        .collect();
+    paths.push(providers_path.to_path_buf());
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (_, root, _, wrote) in &plans {
+        if *wrote {
+            backup_models(root, backup_dir, "pre-host")?;
+        }
+    }
+    let outcome = (|| {
+        let mut changed = serde_json::Map::new();
+        for (key, root, merged, wrote) in &plans {
+            if *wrote {
+                write_models_atomic(root, merged)?;
+            }
+            changed.insert((*key).into(), json!(wrote));
+        }
+        crate::desktop::set_active_checked(providers_path, &provider, "workbuddy")?;
+        Ok(json!({
+            "hosted": true,
+            "way": way,
+            "entryId": provider.model,
+            "entryName": format!("2xapi 网关({})", provider.name),
+            "changed": Value::Object(changed),
+            "hint": "叠加平台:模型条目已写入,请在 CodeBuddy/WorkBuddy 模型列表选择「2xapi 网关」",
+        }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// POST /api/desktop/workbuddy/unhost —— 仅移除本产品条目集;用户条目与 availableModels 不动。
 pub fn unhost(wb_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
-    let mut changed = serde_json::Map::new();
+    let providers_path = crate::desktop::providers_path_from_backup_dir(backup_dir);
+    let mut plans = Vec::new();
     for (key, root) in config_roots(wb_home) {
         let cfg = read_models(&root)?;
         let (merged, removed) = strip_ours(&cfg);
-        if !removed {
-            changed.insert(key.into(), json!(false));
-            continue;
-        }
-        let p = models_path(&root);
-        std::fs::create_dir_all(backup_dir).map_err(|e| (500, "E_IO".into(), e.to_string()))?;
-        crate::config::backup_file(&p, backup_dir, "workbuddy-models", "pre-unhost")
-            .map_err(|e| (500, "E_IO".into(), e))?;
-        write_models_atomic(&root, &merged)?;
-        changed.insert(key.into(), json!(true));
+        plans.push((key, root, merged, removed));
     }
-    Ok(json!({ "hosted": false, "changed": Value::Object(changed) }))
+    let mut paths: Vec<PathBuf> = plans
+        .iter()
+        .filter(|(_, _, _, removed)| *removed)
+        .map(|(_, root, _, _)| models_path(root))
+        .collect();
+    paths.push(providers_path.clone());
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (_, root, _, removed) in &plans {
+        if *removed {
+            backup_models(root, backup_dir, "pre-unhost")?;
+        }
+    }
+    let outcome = (|| {
+        let mut changed = serde_json::Map::new();
+        for (key, root, merged, removed) in &plans {
+            if *removed {
+                write_models_atomic(root, merged)?;
+            }
+            changed.insert((*key).into(), json!(removed));
+        }
+        crate::desktop::clear_active_checked(&providers_path, "workbuddy")?;
+        Ok(json!({ "hosted": false, "changed": Value::Object(changed) }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// GET /api/desktop/workbuddy/state —— 托管态 + 安装检测(安装是验收/UX 提示用,不门控)。
@@ -406,7 +454,10 @@ mod tests {
             );
             let ours = models.iter().find(|m| m["vendor"] == VENDOR).unwrap();
             assert_eq!(ours["url"], GATEWAY_CHAT_URL);
-            assert_eq!(ours["apiKey"], "sk-test-key");
+            assert_eq!(
+                ours["apiKey"], PLACEHOLDER_KEY,
+                "网关托管不得落真实上游 Key"
+            );
             assert_eq!(
                 ours["id"], "gpt-test",
                 "条目 id 必须是真实模型名(CLI 以之作请求 model)"
@@ -478,9 +529,51 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(home.join(".codebuddy/models.json")).unwrap())
                 .unwrap();
         assert!(cfg["models"].as_array().unwrap().is_empty());
+        assert!(
+            crate::providers::get_active_for_agent(&pp, "workbuddy").is_none(),
+            "unhost 必须清理 WorkBuddy active"
+        );
 
         let v2 = unhost(&home, &backup).unwrap();
         assert_eq!(v2["changed"]["cli"], json!(false), "二次 unhost no-op");
+    }
+
+    #[test]
+    fn host_rejects_foreign_agent_without_writes() {
+        let home = tmp("foreign-agent");
+        let pp = write_provider_file(&home);
+        let mut data: Value = serde_json::from_str(&fs::read_to_string(&pp).unwrap()).unwrap();
+        data["providers"][0]["agent"] = json!("codex");
+        fs::write(&pp, data.to_string()).unwrap();
+
+        let error = host(&home, &home.join("backups"), &pp, "pv1", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_PROVIDER_AGENT_MISMATCH");
+        assert!(!home.join(".codebuddy/models.json").exists());
+        assert!(!home.join(".workbuddy/models.json").exists());
+    }
+
+    #[test]
+    fn host_rolls_back_cli_when_desktop_write_fails() {
+        let home = tmp("host-rollback");
+        let backup = home.join("backups");
+        fs::create_dir_all(&backup).unwrap();
+        let pp = write_provider_file(&home);
+        fs::create_dir_all(home.join(".codebuddy")).unwrap();
+        let original = json!({ "models": [{ "id": "user", "vendor": "user" }] }).to_string();
+        fs::write(home.join(".codebuddy/models.json"), &original).unwrap();
+        fs::create_dir_all(home.join(".workbuddy")).unwrap();
+        fs::create_dir(home.join(".workbuddy/models.json.tmp")).unwrap();
+
+        let error = host(&home, &backup, &pp, "pv1", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_IO");
+        assert_eq!(
+            fs::read_to_string(home.join(".codebuddy/models.json")).unwrap(),
+            original
+        );
+        assert!(!home.join(".workbuddy/models.json").exists());
+        assert!(crate::providers::get_active_for_agent(&pp, "workbuddy").is_none());
     }
 
     /// 坏 JSON 拒碰:E_PARSE 且文件原样。

@@ -43,6 +43,35 @@ fn slug(name: &str) -> String {
     }
 }
 
+fn reasoning_levels_for(provider: &crate::providers::Provider, model: &str) -> Vec<String> {
+    let configured = provider
+        .reasoning_levels
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|level| level.trim().to_ascii_lowercase())
+        .filter(|level| !level.is_empty())
+        .collect::<Vec<_>>();
+    if !configured.is_empty() {
+        return configured;
+    }
+
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.contains("codex")
+    {
+        return ["none", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+
+    Vec::new()
+}
+
 fn read_root(oclaw_home: &Path) -> Result<Map<String, Value>, OpError> {
     let path = config_path(oclaw_home);
     if !path.exists() {
@@ -81,7 +110,7 @@ fn find_provider(
     providers_path: &Path,
     provider_id: &str,
 ) -> Result<crate::providers::Provider, OpError> {
-    crate::providers::load(providers_path)
+    let provider = crate::providers::load(providers_path)
         .providers
         .into_iter()
         .find(|p| p.id == provider_id)
@@ -91,7 +120,9 @@ fn find_provider(
                 "E_NO_PROVIDER".into(),
                 format!("供应商不存在: {provider_id}"),
             )
-        })
+        })?;
+    crate::desktop::validate_provider_agent(&provider, "openclaw")?;
+    Ok(provider)
 }
 
 /// 托管态:条目存在性 + 默认指针归属。
@@ -214,6 +245,23 @@ pub fn host(
             if let Some(c) = cw {
                 o["contextWindow"] = json!(c);
             }
+            let reasoning_levels = reasoning_levels_for(&provider, name);
+            if !reasoning_levels.is_empty() {
+                o["reasoning"] = json!(true);
+                o["thinkingLevelMap"] = json!({
+                    "off": "none",
+                    "minimal": "low",
+                    "xhigh": "xhigh",
+                    "max": "max"
+                });
+                o["compat"] = json!({
+                    "supportsReasoningEffort": true,
+                    "supportedReasoningEfforts": reasoning_levels,
+                    "reasoningEffortMap": {
+                        "minimal": "low"
+                    }
+                });
+            }
             o
         })
         .collect();
@@ -270,22 +318,32 @@ pub fn host(
         switched = true;
     }
 
-    let written = write_root(
-        oclaw_home,
-        backup_dir,
-        &root,
-        if switched { "pre-host" } else { "pre-switch" },
-    )?;
-    Ok(json!({
-        "hosted": true, "way": way, "api": api_kind, "switched": !existing.is_empty(),
-        "defaultModelSwitched": switched,
-        "suggested": !switched,
-        "changed": { "config": written },
-        "keyNote": key_note,
-    }))
+    let paths = [config_path(oclaw_home), providers_path.to_path_buf()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let written = write_root(
+            oclaw_home,
+            backup_dir,
+            &root,
+            if switched { "pre-host" } else { "pre-switch" },
+        )?;
+        crate::desktop::set_active_checked(providers_path, &provider, "openclaw")?;
+        Ok(json!({
+            "hosted": true, "way": way, "api": api_kind, "switched": !existing.is_empty(),
+            "defaultModelSwitched": switched,
+            "suggested": !switched,
+            "changed": { "config": written },
+            "keyNote": key_note,
+        }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 pub fn unhost(oclaw_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
+    let providers_path = crate::desktop::providers_path_from_backup_dir(backup_dir);
     let mut root = read_root(oclaw_home)?;
     let ours_prefix = format!("{PROVIDER_ID}/");
     let removed = root
@@ -295,6 +353,7 @@ pub fn unhost(oclaw_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
         .map(|m| m.remove(PROVIDER_ID).is_some())
         .unwrap_or(false);
     if !removed {
+        crate::desktop::clear_active_checked(&providers_path, "openclaw")?;
         return Ok(json!({ "restored": false, "alreadyClean": true }));
     }
     let pointer_removed = root
@@ -313,10 +372,19 @@ pub fn unhost(oclaw_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
             is_ours
         })
         .unwrap_or(false);
-    let written = write_root(oclaw_home, backup_dir, &root, "pre-unhost")?;
-    Ok(
-        json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }),
-    )
+    let paths = [config_path(oclaw_home), providers_path.clone()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let written = write_root(oclaw_home, backup_dir, &root, "pre-unhost")?;
+        crate::desktop::clear_active_checked(&providers_path, "openclaw")?;
+        Ok(
+            json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }),
+        )
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// POST /api/desktop/openclaw/start —— 未托管 409;托管后返回直接运行提示
@@ -430,6 +498,37 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_models_write_openclaw_capabilities() {
+        let (home, backup, root) = setup("reasoning-model");
+        let path = root.join("providers.json");
+        std::fs::write(
+            &path,
+            json!({
+                "providers": [{
+                    "id": "p1", "name": "t", "agent": "openclaw",
+                    "base_url": "https://go.example/v1", "api_key": "sk-real",
+                    "model": "gpt-5.6", "wire_api": "chat_completions",
+                    "sort_index": 0, "created_at": 1
+                }],
+                "active_provider_id": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        host(&home, &backup, &path, "p1", "gateway").unwrap();
+        let model = &read_entry(&home)["models"][0];
+        assert_eq!(model["reasoning"], json!(true));
+        assert_eq!(model["compat"]["supportsReasoningEffort"], json!(true));
+        assert_eq!(
+            model["compat"]["reasoningEffortMap"]["minimal"],
+            json!("low")
+        );
+        assert_eq!(model["thinkingLevelMap"]["off"], json!("none"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn gateway_rejects_anthropic_provider() {
         let (home, backup, root) = setup("gw-reject");
         let prov = fixture(&root, "anthropic", "https://2xa.cc.cd");
@@ -455,8 +554,25 @@ mod tests {
         let u = unhost(&home, &backup).unwrap();
         assert_eq!(u["restored"], json!(true));
         assert_eq!(u["defaultModelRemoved"], json!(true));
+        assert!(crate::providers::get_active_for_agent(&prov, "openclaw").is_none());
         let s2 = state(&home);
         assert!(s2["hosting"].is_null());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_rejects_foreign_agent_without_writes() {
+        let (home, backup, root) = setup("foreign-agent");
+        let providers = fixture(&root, "chat_completions", "https://x.example");
+        let mut data: Value =
+            serde_json::from_str(&std::fs::read_to_string(&providers).unwrap()).unwrap();
+        data["providers"][0]["agent"] = json!("codex");
+        std::fs::write(&providers, data.to_string()).unwrap();
+
+        let error = host(&home, &backup, &providers, "p1", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_PROVIDER_AGENT_MISMATCH");
+        assert!(!config_path(&home).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

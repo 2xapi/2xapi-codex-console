@@ -164,6 +164,10 @@ button { font-family: inherit; }
 .mtable th { font: 600 9.5px var(--mono); color: var(--muted); text-align: left; padding: 4px; }
 .mtable td { border-top: 1px solid var(--hair); padding: 4px; }
 .mtable input { width: 100%; padding: 4px 6px; background: var(--raised); border: 1px solid var(--hair); border-radius: 5px; color: var(--text); font: 11px var(--mono); }
+.mtable input[type="checkbox"] { width: auto; accent-color: var(--c-gw); }
+.claude-route-table th:last-child, .claude-route-table td:last-child { width: 96px; text-align: center; white-space: nowrap; }
+.claude-route-role { min-width: 108px; font-weight: 600; }
+.claude-route-id { display: block; margin-top: 2px; color: var(--muted); font: 9px var(--mono); font-weight: 400; }
 
 /* ── toast(页面内轻提示,替换原生 alert)── */
 .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); z-index: 120; padding: 9px 18px; border-radius: 999px; background: var(--raised); border: 1px solid var(--hair); box-shadow: 0 8px 28px rgba(0,0,0,.5); font-size: 12.5px; animation: toastIn .18s ease-out; }

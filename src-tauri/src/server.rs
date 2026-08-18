@@ -57,8 +57,6 @@ pub struct AppState {
     pub cd_home: PathBuf,
     /// Cursor 配置根(用户 HOME;eco adapter 内 join(".cursor/mcp.json");测试传 tempdir)。
     pub cursor_home: PathBuf,
-    /// TRAE 配置根(用户 HOME;eco adapter 内 join(".trae/mcp.json");测试传 tempdir)。
-    pub trae_home: PathBuf,
     pub launcher: std::sync::Arc<crate::launcher::LauncherState>,
     /// 加速线路健康状态(启动时由 load_lines 填充;健康循环每 30s 刷新)。
     pub health: std::sync::Arc<crate::acclines::HealthState>,
@@ -95,6 +93,22 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::gateway::proxy_anthropic),
         )
         .route("/anthropic/messages", post(crate::gateway::proxy_anthropic))
+        .route(
+            "/anthropic/v1/models",
+            get(crate::gateway::proxy_anthropic_models),
+        )
+        .route(
+            "/anthropic/models",
+            get(crate::gateway::proxy_anthropic_models),
+        )
+        .route(
+            "/anthropic/v1/models/:model_id",
+            get(crate::gateway::proxy_anthropic_model),
+        )
+        .route(
+            "/anthropic/models/:model_id",
+            get(crate::gateway::proxy_anthropic_model),
+        )
         // --- 网关代理 /hermes/*（Hermes 接入;hermes 条目 base_url=网关+/hermes,SDK 追加 /chat/completions）---
         .route(
             "/hermes/v1/chat/completions",
@@ -117,7 +131,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/opencode/v1/chat/completions",
             post(crate::gateway::proxy_opencode_chat),
-        )        .route(
+        )
+        .route(
             "/opencode/chat/completions",
             post(crate::gateway::proxy_opencode_chat),
         )
@@ -212,10 +227,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/desktop/state", get(handle_desktop_state))
         .route("/api/desktop/host", post(handle_desktop_host))
         .route("/api/desktop/unhost", post(handle_desktop_unhost))
-        // --- Claude 注入式启动(批「Claude 接入」§3;返回启动命令+env,不真正 spawn)---
+        // --- Claude Code 配置托管与裸 CLI 启动 ---
         .route(
             "/api/desktop/claude-start",
             post(handle_desktop_claude_start),
+        )
+        // --- Claude Code 配置写入后的 macOS 一键启动 ---
+        .route(
+            "/api/desktop/claude-launch",
+            post(handle_desktop_claude_launch),
+        )
+        .route(
+            "/api/desktop/claude-state",
+            get(handle_desktop_claude_state),
+        )
+        .route("/api/desktop/claude-host", post(handle_desktop_claude_host))
+        .route(
+            "/api/desktop/claude-unhost",
+            post(handle_desktop_claude_unhost),
         )
         // --- 多平台 agent 注册表 + 泛化路由(方案 §2.1,A 阶段;具名路由保留为别名,B 阶段新平台挂 :agent 段)---
         .route("/api/desktop/agents", get(handle_desktop_agents))
@@ -235,6 +264,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/history/inspect", get(handle_history))
         // --- 开机自启(竞品吸收 1.1-3):launchd plist 写/删;读=文件存在 ---
         .route("/api/version", get(handle_version))
+        .route("/api/check-update", get(handle_check_update))
         .route(
             "/api/autostart",
             get(handle_autostart).post(handle_autostart_set),
@@ -403,13 +433,14 @@ async fn handle_health(State(s): State<Arc<AppState>>) -> Response {
 // 注意：`/health` 不走统一响应信封；按 04 §2 直接返回 {status, active_provider_id, access_mode}。
 // 动态读 active provider（供前端顶栏同步：active 状态变更后刷新 /health）。
 async fn handle_gateway_health(State(s): State<Arc<AppState>>) -> Response {
-    let (active_id, access_mode) = match crate::providers::get_active(&s.providers_path) {
-        Some(p) => (
-            json!(p.id),
-            serde_json::to_value(p.access_mode).unwrap_or(json!(null)),
-        ),
-        None => (json!(null), json!(null)),
-    };
+    let (active_id, access_mode) =
+        match crate::providers::get_active_for_agent(&s.providers_path, "codex") {
+            Some(p) => (
+                json!(p.id),
+                serde_json::to_value(p.access_mode).unwrap_or(json!(null)),
+            ),
+            None => (json!(null), json!(null)),
+        };
     ok_json(json!({
         "status": "ok",
         "active_provider_id": active_id,
@@ -482,6 +513,10 @@ async fn handle_auth_login(State(s): State<Arc<AppState>>, Json(body): Json<Valu
         .get("captchaTicket")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let remember = body
+        .get("remember")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let randstr = body
         .get("captchaRandstr")
         .and_then(|v| v.as_str())
@@ -491,7 +526,7 @@ async fn handle_auth_login(State(s): State<Arc<AppState>>, Json(body): Json<Valu
     }
     match crate::auth::login(email, password, ticket, randstr).await {
         Ok(result) => {
-            crate::auth::save_session(&s.codex_home, &result);
+            crate::auth::save_session(&s.codex_home, &result, remember);
             ok_json(json!({ "authenticated": true, "user": result.user }))
         }
         Err(e) => err_json(StatusCode::UNAUTHORIZED, &format!("登录失败: {}", e)),
@@ -505,9 +540,7 @@ async fn handle_auth_logout(State(s): State<Arc<AppState>>) -> Response {
 
 async fn handle_auth_remembered(State(s): State<Arc<AppState>>) -> Response {
     match crate::auth::load_remembered(&s.codex_home) {
-        Some((email, password)) => {
-            ok_json(json!({ "remembered": true, "email": email, "password": password }))
-        }
+        Some((email, _)) => ok_json(json!({ "remembered": true, "email": email, "password": "" })),
         None => ok_json(json!({ "remembered": false, "email": "", "password": "" })),
     }
 }
@@ -595,7 +628,11 @@ async fn handle_providers_list(State(s): State<Arc<AppState>>) -> Response {
         .iter()
         .map(crate::providers::public_provider)
         .collect();
-    ok_env(json!({ "providers": providers, "active_provider_id": data.active_provider_id }))
+    ok_env(json!({
+        "providers": providers,
+        "active_provider_id": data.active_provider_id,
+        "active_provider_ids": data.active_provider_ids,
+    }))
 }
 
 // POST /api/providers
@@ -634,21 +671,72 @@ async fn handle_providers_delete(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    // 托管守卫(镜像前端 hostedBy):该供应商正被托管时禁止删除,须先还原官方。
-    // 后端可见的托管态 = codex desktop hosting(hosting.providerId=active,host 时置 active);
-    // claude 注入态为前端本地(后端无 claude-state 接口,前端 hostedBy 已先行拦截);
-    // gemini/grok/opencode/openclaw/claude-desktop/cursor/hermes 为整平台托管(providerId 常量/无),
-    // 与前端 hostedBy 一致不归因单个供应商。
-    let hosting = crate::desktop::detect_hosting(&s.config_path, &s.providers_path);
-    let codex_pid = hosting
-        .get("providerId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !codex_pid.is_empty() && codex_pid == id {
+    // 持久化托管平台按「平台托管态 + 平台 active provider」双重判断，避免删除后磁盘仍引用旧供应商。
+    // Claude Code 的托管快照位于 backup_dir，状态由配置托管模块统一判断。
+    let hosted_agents = [
+        (
+            "codex",
+            !crate::desktop::detect_hosting(&s.config_path, &s.providers_path).is_null(),
+        ),
+        (
+            "hermes",
+            !crate::agents::hermes::detect_state(&s.hermes_home.join("config.yaml"))["hosting"]
+                .is_null(),
+        ),
+        (
+            "gemini",
+            !crate::agents::gemini::state(&s.gem_home)["hosting"].is_null(),
+        ),
+        (
+            "claude",
+            crate::agents::claude_code::state(
+                claude_home(&s.codex_home),
+                &s.backup_dir,
+                &s.providers_path,
+            )["hosted"]
+                .as_bool()
+                .unwrap_or(false),
+        ),
+        (
+            "grokbuild",
+            !crate::agents::grok::state(&s.grok_home)["hosting"].is_null(),
+        ),
+        (
+            "opencode",
+            !crate::agents::opencode::state(&s.oc_home)["hosting"].is_null(),
+        ),
+        (
+            "openclaw",
+            !crate::agents::openclaw::state(&s.oclaw_home)["hosting"].is_null(),
+        ),
+        (
+            "claude-desktop",
+            !crate::agents::claude_desktop::state(&s.cd_home)["hosting"].is_null(),
+        ),
+        (
+            "workbuddy",
+            !crate::agents::workbuddy::state(&s.wb_home)["hosting"].is_null(),
+        ),
+        (
+            "cursor",
+            !crate::agents::cursor::state(&s.cursor_home)["hosting"].is_null(),
+        ),
+    ];
+    let hosted_by = hosted_agents.iter().find_map(|(agent, hosted)| {
+        if *hosted
+            && crate::providers::get_active_for_agent(&s.providers_path, agent)
+                .is_some_and(|provider| provider.id == id)
+        {
+            Some(*agent)
+        } else {
+            None
+        }
+    });
+    if let Some(agent) = hosted_by {
         return err_env(
             StatusCode::BAD_REQUEST,
             "E_PROVIDER_HOSTED",
-            "托管中的供应商不能删除,请先在「Codex」还原官方",
+            &format!("托管中的供应商不能删除,请先在「{agent}」还原官方"),
             None,
         );
     }
@@ -877,13 +965,201 @@ async fn handle_history(State(s): State<Arc<AppState>>) -> Response {
 
 // ── 开机自启(竞品吸收 1.1-3):launchd plist 写/删 ──────────
 
-// GET /api/version → { version }(构建版本,与 Cargo.toml 对齐;前端关于页/检查更新用)
+// GET /api/version → {ok:true,data:{version}}(构建版本,与 Cargo.toml 对齐)
 async fn handle_version() -> Response {
-    (axum::http::StatusCode::OK, axum::Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))).into_response()
+    ok_env(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+const LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/2xapi/2xapi-codex-console/releases/latest";
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum SemverIdentifier {
+    Numeric(String),
+    Text(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ParsedSemver {
+    core: [u64; 3],
+    prerelease: Option<Vec<SemverIdentifier>>,
+}
+
+fn parse_semver(version: &str) -> Option<ParsedSemver> {
+    let version = version.trim().trim_start_matches(['v', 'V']);
+    let without_build = version
+        .split_once('+')
+        .map(|(head, _)| head)
+        .unwrap_or(version);
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map(|(core, pre)| (core, Some(pre)))
+        .unwrap_or((without_build, None));
+    let parts = core.split('.').collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut core_values = [0; 3];
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+            return None;
+        }
+        core_values[index] = part.parse().ok()?;
+    }
+    let prerelease = match prerelease {
+        Some(value) => Some({
+            if value.is_empty() {
+                return None;
+            }
+            value
+                .split('.')
+                .map(|identifier| {
+                    if identifier.is_empty()
+                        || !identifier
+                            .chars()
+                            .all(|char| char.is_ascii_alphanumeric() || char == '-')
+                    {
+                        return None;
+                    }
+                    if identifier.chars().all(|char| char.is_ascii_digit()) {
+                        if identifier.len() > 1 && identifier.starts_with('0') {
+                            return None;
+                        }
+                        Some(SemverIdentifier::Numeric(identifier.to_string()))
+                    } else {
+                        Some(SemverIdentifier::Text(identifier.to_string()))
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?
+        }),
+        None => None,
+    };
+    Some(ParsedSemver {
+        core: core_values,
+        prerelease,
+    })
+}
+
+fn compare_prerelease(
+    latest: &Option<Vec<SemverIdentifier>>,
+    current: &Option<Vec<SemverIdentifier>>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let (Some(latest), Some(current)) = (latest, current) else {
+        return match (latest, current) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(_), Some(_)) => unreachable!(),
+        };
+    };
+    for (latest, current) in latest.iter().zip(current.iter()) {
+        let ordering = match (latest, current) {
+            (SemverIdentifier::Numeric(latest), SemverIdentifier::Numeric(current)) => latest
+                .len()
+                .cmp(&current.len())
+                .then_with(|| latest.cmp(current)),
+            (SemverIdentifier::Numeric(_), SemverIdentifier::Text(_)) => Ordering::Less,
+            (SemverIdentifier::Text(_), SemverIdentifier::Numeric(_)) => Ordering::Greater,
+            (SemverIdentifier::Text(latest), SemverIdentifier::Text(current)) => {
+                latest.cmp(current)
+            }
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    latest.len().cmp(&current.len())
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let (Some(latest), Some(current)) = (parse_semver(latest), parse_semver(current)) else {
+        return false;
+    };
+    latest.core > current.core
+        || (latest.core == current.core
+            && compare_prerelease(&latest.prerelease, &current.prerelease).is_gt())
+}
+
+// GET /api/check-update → 后端访问 GitHub Releases，避免前端 CSP 跨域限制。
+async fn handle_check_update() -> Response {
+    let current = env!("CARGO_PKG_VERSION");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(format!("2xapi-codex-console/{current}"))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return err_env(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "E_UPDATE_CLIENT",
+                &format!("创建更新检查客户端失败: {error}"),
+                None,
+            )
+        }
+    };
+    let response = match client.get(LATEST_RELEASE_URL).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return err_env(
+                StatusCode::BAD_GATEWAY,
+                "E_UPDATE_CHECK",
+                &format!("GitHub Releases 不可达: {error}"),
+                None,
+            )
+        }
+    };
+    if !response.status().is_success() {
+        return err_env(
+            StatusCode::BAD_GATEWAY,
+            "E_UPDATE_CHECK",
+            &format!("GitHub Releases 返回 HTTP {}", response.status()),
+            None,
+        );
+    }
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            return err_env(
+                StatusCode::BAD_GATEWAY,
+                "E_UPDATE_RESPONSE",
+                &format!("GitHub Releases 响应无效: {error}"),
+                None,
+            )
+        }
+    };
+    let Some(latest) = payload
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(|value| value.trim_start_matches(['v', 'V']).to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return err_env(
+            StatusCode::BAD_GATEWAY,
+            "E_UPDATE_RESPONSE",
+            "GitHub Releases 响应缺少 tag_name",
+            None,
+        );
+    };
+    ok_env(json!({
+        "latest": latest,
+        "current": current,
+        "updateAvailable": version_is_newer(&latest, current),
+    }))
 }
 
 // GET /api/autostart → { enabled }
 async fn handle_autostart() -> Response {
+    if !crate::autostart::supported() {
+        return err_env(
+            StatusCode::NOT_IMPLEMENTED,
+            "E_UNSUPPORTED_PLATFORM",
+            "当前平台不支持 macOS launchd 自启",
+            None,
+        );
+    }
     ok_env(json!({
         "enabled": crate::autostart::enabled(&crate::autostart::launch_agents_dir())
     }))
@@ -891,7 +1167,18 @@ async fn handle_autostart() -> Response {
 
 // POST /api/autostart { enabled: bool } → { enabled }
 async fn handle_autostart_set(Json(body): Json<Value>) -> Response {
-    let enable = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !crate::autostart::supported() {
+        return err_env(
+            StatusCode::NOT_IMPLEMENTED,
+            "E_UNSUPPORTED_PLATFORM",
+            "当前平台不支持 macOS launchd 自启",
+            None,
+        );
+    }
+    let enable = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let dir = crate::autostart::launch_agents_dir();
     match crate::autostart::set(&dir, enable) {
         Ok(()) => ok_env(json!({ "enabled": enable })),
@@ -915,21 +1202,45 @@ pub fn load_accel_cfg(codex_home: &std::path::Path) -> AccelCfg {
         .unwrap_or_default()
 }
 
-/// 写 `accel` 段(保留文件其余段)。
-pub fn save_accel_cfg(codex_home: &std::path::Path, cfg: &AccelCfg) {
-    std::fs::create_dir_all(codex_home).ok();
-    let raw = std::fs::read_to_string(accel_settings_path(codex_home)).unwrap_or_default();
-    let mut v: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
-    if let Some(o) = v.as_object_mut() {
-        o.insert(
-            "accel".into(),
-            serde_json::to_value(cfg).unwrap_or(json!({})),
-        );
-    }
-    let _ = std::fs::write(
-        accel_settings_path(codex_home),
-        serde_json::to_string_pretty(&v).unwrap_or_default(),
+/// 写 `accel` 段(保留文件其余段);失败时返回错误,避免接口误报成功。
+pub fn save_accel_cfg(codex_home: &std::path::Path, cfg: &AccelCfg) -> Result<(), String> {
+    std::fs::create_dir_all(codex_home).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let path = accel_settings_path(codex_home);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取配置失败: {e}")),
+    };
+    let mut value: Value = if raw.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&raw).map_err(|e| format!("配置文件格式错误: {e}"))?
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "配置文件根节点须为对象".to_string())?;
+    object.insert(
+        "accel".into(),
+        serde_json::to_value(cfg).map_err(|e| format!("序列化加速配置失败: {e}"))?,
     );
+    let encoded =
+        serde_json::to_string_pretty(&value).map_err(|e| format!("序列化配置失败: {e}"))?;
+    std::fs::write(path, encoded).map_err(|e| format!("写入配置失败: {e}"))
+}
+
+fn validate_accel_endpoint(endpoint: &str) -> Result<String, &'static str> {
+    let endpoint = endpoint.trim();
+    let parsed = reqwest::Url::parse(endpoint).map_err(|_| "节点地址格式无效")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("节点地址须为 http(s):// 开头");
+    }
+    if parsed.host_str().is_none() {
+        return Err("节点地址缺少有效主机");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("节点地址不得包含用户名或密码");
+    }
+    Ok(endpoint.to_string())
 }
 
 /// scopeNote 纯函数(供单测):mode=official 且 active 供应商 base_url 未被任何线路命中
@@ -1037,7 +1348,7 @@ fn usage_for_state(state: &AppState, mode: &str) -> Value {
     if mode != "official" {
         return usage_none();
     }
-    let Some(p) = crate::providers::get_active(&state.providers_path) else {
+    let Some(p) = crate::providers::get_active_for_agent(&state.providers_path, "codex") else {
         return usage_none();
     };
     if p.api_key.trim().is_empty() {
@@ -1083,7 +1394,8 @@ async fn handle_accel_state(State(s): State<Arc<AppState>>) -> Response {
             })
             .collect()
     };
-    let active_base = crate::providers::get_active(&s.providers_path).map(|p| p.base_url);
+    let active_base =
+        crate::providers::get_active_for_agent(&s.providers_path, "codex").map(|p| p.base_url);
     let scope_note = {
         let ls = s.health.lines.lock().unwrap();
         compute_scope_note(&mode, active_base.as_deref(), &ls)
@@ -1117,11 +1429,16 @@ async fn handle_accel_mode(State(s): State<Arc<AppState>>, Json(body): Json<Valu
         if mode == "custom" && cfg.custom_node.trim().is_empty() {
             return err_accel(StatusCode::BAD_REQUEST, "请先配置自定义加速节点");
         }
-        cfg.mode = mode.clone();
-        save_accel_cfg(&s.codex_home, &cfg);
+        let mut next = cfg.clone();
+        next.mode = mode.clone();
+        if let Err(e) = save_accel_cfg(&s.codex_home, &next) {
+            eprintln!("[accel] 保存 mode 失败: {e}");
+            return err_accel(StatusCode::INTERNAL_SERVER_ERROR, "加速配置保存失败");
+        }
+        *cfg = next;
     } // 锁在 await 前释放(async fn 的后续 await 需要非阻塞占有)
     if mode == "official" {
-        if let Some(p) = crate::providers::get_active(&s.providers_path) {
+        if let Some(p) = crate::providers::get_active_for_agent(&s.providers_path, "codex") {
             if !p.api_key.trim().is_empty() {
                 match crate::nodecreds::issue_node_cred(&issue_base(), &p.api_key).await {
                     Ok(cred) => {
@@ -1143,7 +1460,7 @@ async fn handle_accel_mode(State(s): State<Arc<AppState>>, Json(body): Json<Valu
 // POST /api/accel/refresh-cred —— 手动重签每账号节点凭证(星图 任务 B 契约)。
 // 200 {ok:true,usage} / 400 未配供应商 / 401 Key 无效 / 403 配额满 / 502 节点不可达。
 async fn handle_accel_refresh_cred(State(s): State<Arc<AppState>>) -> Response {
-    let provider = match crate::providers::get_active(&s.providers_path) {
+    let provider = match crate::providers::get_active_for_agent(&s.providers_path, "codex") {
         Some(p) => p,
         None => return err_accel(StatusCode::BAD_REQUEST, "请先配置供应商"),
     };
@@ -1194,40 +1511,55 @@ async fn handle_accel_custom_node(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let endpoint = body
-        .get("endpoint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-        return err_accel(StatusCode::BAD_REQUEST, "节点地址须为 http(s):// 开头");
+    let Some(endpoint) = body.get("endpoint").and_then(|v| v.as_str()) else {
+        return err_accel(StatusCode::BAD_REQUEST, "endpoint 须为字符串");
+    };
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        let mut cfg = s.accel.lock().unwrap();
+        let mut next = cfg.clone();
+        next.custom_node.clear();
+        if next.mode == "custom" {
+            next.mode = "off".into();
+        }
+        if let Err(e) = save_accel_cfg(&s.codex_home, &next) {
+            eprintln!("[accel] 清空 custom-node 失败: {e}");
+            return err_accel(StatusCode::INTERNAL_SERVER_ERROR, "加速配置保存失败");
+        }
+        *cfg = next;
+        return ok_json(json!({ "ok": true, "mode": cfg.mode }));
     }
+    let endpoint = match validate_accel_endpoint(endpoint) {
+        Ok(endpoint) => endpoint,
+        Err(message) => return err_accel(StatusCode::BAD_REQUEST, message),
+    };
     let mut cfg = s.accel.lock().unwrap();
-    cfg.custom_node = endpoint;
-    save_accel_cfg(&s.codex_home, &cfg);
+    let mut next = cfg.clone();
+    next.custom_node = endpoint;
+    if let Err(e) = save_accel_cfg(&s.codex_home, &next) {
+        eprintln!("[accel] 保存 custom-node 失败: {e}");
+        return err_accel(StatusCode::INTERNAL_SERVER_ERROR, "加速配置保存失败");
+    }
+    *cfg = next;
     ok_json(json!({ "ok": true }))
 }
 
 // POST /api/accel/test-node {endpoint}
 async fn handle_accel_test_node(
-    State(s): State<Arc<AppState>>,
+    State(_s): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let endpoint = body
-        .get("endpoint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-        return err_accel(StatusCode::BAD_REQUEST, "节点地址须为 http(s):// 开头");
-    }
-    let cred = crate::acclines::load_credentials(&s.codex_home);
+    let Some(endpoint) = body.get("endpoint").and_then(|v| v.as_str()) else {
+        return err_accel(StatusCode::BAD_REQUEST, "endpoint 须为字符串");
+    };
+    let endpoint = match validate_accel_endpoint(endpoint) {
+        Ok(endpoint) => endpoint,
+        Err(message) => return err_accel(StatusCode::BAD_REQUEST, message),
+    };
     let outcome = crate::gateway::test_node_via(
         &endpoint,
         "https://api.2xa.cc.cd/models",
-        cred.as_ref(),
+        None,
         std::time::Duration::from_secs(5),
     )
     .await;
@@ -1313,10 +1645,21 @@ async fn handle_config_restore(
         .get("backupPath")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if !backup_path.ends_with(".toml") {
-        return err_json(StatusCode::BAD_REQUEST, "只能恢复 TOML 配置备份");
+    if backup_path.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "缺少备份路径");
     }
-    match crate::config::restore(&s.config_path, backup_path) {
+    if let Err(e) = crate::config::backup_file(
+        &s.config_path,
+        &s.backup_dir,
+        "config-restore",
+        "pre-restore",
+    ) {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("恢复前快照失败,已取消恢复: {e}"),
+        );
+    }
+    match crate::config::restore_from_dir(&s.config_path, &s.backup_dir, backup_path) {
         Ok(_) => ok_json(json!({ "written": true, "restored": backup_path })),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
@@ -1362,7 +1705,7 @@ pub fn test_node_cred(user: &str, pass: &str) -> crate::nodecreds::NodeCred {
         pass: pass.into(),
         quota_total_bytes: 10_737_418_240,
         quota_used_bytes: 1_073_741_824,
-        proxy_endpoint: crate::nodecreds::DEFAULT_ISSUE_BASE.into(),
+        proxy_endpoint: crate::nodecreds::DEFAULT_PROXY_ENDPOINT.into(),
         issued_at: chrono::Utc::now().timestamp(),
         degraded_to_direct: false,
     }
@@ -1390,13 +1733,60 @@ async fn handle_desktop_unhost(State(s): State<Arc<AppState>>) -> Response {
 }
 
 // POST /api/desktop/claude-start { way? }
-// 返回 Claude 注入式启动信息(契约:成功 {ok:true, command, env:{...}, ...} 供前端展示/复制;
-// 失败 {ok:false, error:{code,message}})。Key 只在响应里,不落盘、不进 ~/.claude、不进日志。
+// 内部兼容入口：只写入 Claude Code settings.json，不生成、不返回启动命令或终端环境变量。
 async fn handle_desktop_claude_start(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
     desktop_claude_start_impl(&s, &body)
+}
+
+// POST /api/desktop/claude-launch { way?, providerId? }
+// 配置写入成功后校验 Claude CLI 并打开 macOS Terminal；成功响应不返回命令、环境变量或上游 Key。
+async fn handle_desktop_claude_launch(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    desktop_claude_launch_impl(&s, &body)
+}
+
+async fn handle_desktop_claude_state(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(crate::agents::claude_code::state(
+        claude_home(&s.codex_home),
+        &s.backup_dir,
+        &s.providers_path,
+    ))
+}
+
+async fn handle_desktop_claude_host(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let way = body
+        .get("way")
+        .and_then(|value| value.as_str())
+        .unwrap_or("gateway")
+        .trim();
+    let provider_id = body
+        .get("providerId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    agent_op_response(crate::agents::claude_code::host(
+        claude_home(&s.codex_home),
+        &s.backup_dir,
+        &s.providers_path,
+        provider_id,
+        way,
+    ))
+}
+
+async fn handle_desktop_claude_unhost(State(s): State<Arc<AppState>>) -> Response {
+    agent_op_response(crate::agents::claude_code::unhost(
+        claude_home(&s.codex_home),
+        &s.backup_dir,
+        &s.providers_path,
+    ))
 }
 
 // ── 多平台 agent 注册表与泛化路由(方案 §2.1,A 阶段;具名路由保留为别名,B 阶段各平台 adapter 挂 :agent 段)──
@@ -1486,6 +1876,33 @@ fn desktop_claude_start_impl(s: &AppState, body: &Value) -> Response {
     }
 }
 
+fn desktop_claude_launch_impl(s: &AppState, body: &Value) -> Response {
+    let way = body
+        .get("way")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let pid = body
+        .get("providerId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    match crate::desktop::claude_launch(&s.providers_path, way, pid) {
+        Ok(data) => {
+            let mut value = data;
+            if let Value::Object(object) = &mut value {
+                object.insert("ok".into(), Value::Bool(true));
+            }
+            Json(value).into_response()
+        }
+        Err((status, code, message)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "ok": false, "error": { "code": code, "message": message } })),
+        )
+            .into_response(),
+    }
+}
+
 /// 泛化路由 agent 段校验:Some = 拒绝应答(未知 404 / 未实现 501);None = 已实现平台,继续分发。
 fn reject_agent(agent: &str) -> Option<(StatusCode, &'static str, String)> {
     match crate::agents::find(agent) {
@@ -1527,8 +1944,11 @@ fn agent_op_response(r: Result<Value, (u16, String, String)>) -> Response {
     }
 }
 
-// GET /api/desktop/:agent/state —— agent=codex 与旧 /api/desktop/state 等价;
-// claude 托管态为前端本地(注入式),无 state 接口。
+fn claude_home(codex_home: &std::path::Path) -> &std::path::Path {
+    codex_home.parent().unwrap_or(codex_home)
+}
+
+// GET /api/desktop/:agent/state —— agent=codex 与旧 /api/desktop/state 等价。
 async fn handle_agent_state(
     State(s): State<Arc<AppState>>,
     axum::extract::Path(agent): axum::extract::Path<String>,
@@ -1541,6 +1961,11 @@ async fn handle_agent_state(
             &s.config_path,
             &s.providers_path,
             &s.codex_home,
+        )),
+        "claude" => ok_env(crate::agents::claude_code::state(
+            claude_home(&s.codex_home),
+            &s.backup_dir,
+            &s.providers_path,
         )),
         "workbuddy" => ok_env(crate::agents::workbuddy::state(&s.wb_home)),
         "hermes" => ok_env(crate::agents::hermes::detect_state(
@@ -1567,6 +1992,19 @@ async fn handle_agent_host(
     }
     match agent.as_str() {
         "codex" => desktop_host_impl(&s, &body),
+        "claude" => agent_op_response(crate::agents::claude_code::host(
+            claude_home(&s.codex_home),
+            &s.backup_dir,
+            &s.providers_path,
+            body.get("providerId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim(),
+            body.get("way")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gateway")
+                .trim(),
+        )),
         "workbuddy" => agent_op_response(crate::agents::workbuddy::host(
             &s.wb_home,
             &s.backup_dir,
@@ -1684,6 +2122,11 @@ async fn handle_agent_unhost(
     }
     match agent.as_str() {
         "codex" => desktop_unhost_impl(&s),
+        "claude" => agent_op_response(crate::agents::claude_code::unhost(
+            claude_home(&s.codex_home),
+            &s.backup_dir,
+            &s.providers_path,
+        )),
         "workbuddy" => {
             agent_op_response(crate::agents::workbuddy::unhost(&s.wb_home, &s.backup_dir))
         }
@@ -1700,10 +2143,7 @@ async fn handle_agent_unhost(
             &s.backup_dir,
         )),
         "claude-desktop" => agent_op_response(crate::agents::claude_desktop::unhost(&s.cd_home)),
-        "cursor" => agent_op_response(crate::agents::cursor::unhost(
-            &s.cursor_home,
-            &s.backup_dir,
-        )),
+        "cursor" => agent_op_response(crate::agents::cursor::unhost(&s.cursor_home, &s.backup_dir)),
         _ => agent_unsupported_response(),
     }
 }
@@ -1810,9 +2250,14 @@ async fn handle_probe_capabilities(
         );
     }
     let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let levels = provider.reasoning_levels.clone().unwrap_or_default();
-    let caps =
-        crate::capprobe::probe_caps(&provider.base_url, &provider.api_key, &model, &levels).await;
+    let caps = crate::capprobe::probe_caps(
+        &provider.base_url,
+        &provider.api_key,
+        &model,
+        provider.wire_api,
+        provider.reasoning_levels.as_deref(),
+    )
+    .await;
     let entry = if force {
         crate::capprobe::store_probe_force(&s.codex_home, &provider.id, &model, &caps)
     } else {
@@ -1870,7 +2315,12 @@ async fn handle_launcher_preflight(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (base_url, api_key, model_hint): (String, String, String) = {
+    let (base_url, api_key, model_hint, wire_api): (
+        String,
+        String,
+        String,
+        crate::providers::WireApi,
+    ) = {
         let id = body
             .get("providerId")
             .and_then(|v| v.as_str())
@@ -1878,7 +2328,12 @@ async fn handle_launcher_preflight(
         if !id.is_empty() {
             let data = crate::providers::load(&s.providers_path);
             match data.providers.iter().find(|p| p.id == id) {
-                Some(p) => (p.base_url.clone(), p.api_key.clone(), p.model.clone()),
+                Some(p) => (
+                    p.base_url.clone(),
+                    p.api_key.clone(),
+                    p.model.clone(),
+                    p.wire_api,
+                ),
                 None => return err_env(StatusCode::NOT_FOUND, "E_NOT_FOUND", "供应商不存在", None),
             }
         } else {
@@ -1901,11 +2356,17 @@ async fn handle_launcher_preflight(
                     None,
                 );
             }
-            (b.to_string(), k.to_string(), m.to_string())
+            let wire_api = body
+                .get("wireApi")
+                .or_else(|| body.get("wire_api"))
+                .and_then(|value| value.as_str())
+                .and_then(crate::providers::WireApi::parse)
+                .unwrap_or_default();
+            (b.to_string(), k.to_string(), m.to_string(), wire_api)
         }
     };
 
-    let r = crate::probe::preflight(&base_url, &api_key, &model_hint).await;
+    let r = crate::probe::preflight(&base_url, &api_key, &model_hint, wire_api).await;
 
     // 人话错误映射(任务书 §三):timeout/auth/notfound
     let human_error: Option<&str> = match r.error {
@@ -1920,6 +2381,10 @@ async fn handle_launcher_preflight(
         "models": r.models.iter().map(|(n, c)| json!({ "name": n, "contextWindow": c })).collect::<Vec<_>>(),
         "responsesCompat": r.responses_compat,
         "chatOk": r.chat_ok,
+        "anthropicOk": r.anthropic_ok,
+        "geminiOk": r.gemini_ok,
+        "nativeOk": r.responses_compat || r.chat_ok || r.anthropic_ok || r.gemini_ok,
+        "wireApi": r.wire_api,
         "latencyMs": r.latency_ms,
         "suggest": r.suggest,
         "error": r.error,          // 机器码:timeout|auth|notfound|null
@@ -1973,9 +2438,9 @@ fn eco_store_for(
             "workbuddy",
             &s.wb_home.join(".workbuddy").join(".mcp.json"),
         ))),
-        Some("trae") => Ok(Box::new(eco::cursor::JsonStore::at(
-            "trae",
-            &s.trae_home.join(".trae").join("mcp.json"),
+        Some("gemini") => Ok(Box::new(eco::cursor::JsonStore::at(
+            "gemini",
+            &s.gem_home.join(".gemini").join("settings.json"),
         ))),
         Some("claude-desktop") => Ok(Box::new(eco::cursor::JsonStore::at(
             "claude-desktop",
@@ -2116,7 +2581,6 @@ mod tests {
             oclaw_home: PathBuf::from("/tmp/2xapi-m0-oclaw-home"),
             cd_home: PathBuf::from("/tmp/2xapi-m0-cd-home"),
             cursor_home: PathBuf::from("/tmp/2xapi-m0-cursor-home"),
-            trae_home: PathBuf::from("/tmp/2xapi-m0-trae-home"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -2573,7 +3037,7 @@ mod tests {
         assert_eq!(lv, gv, "泛化路由与旧路由响应必须一致");
     }
 
-    /// A 阶段:泛化路由拒绝规则——未知平台 404 / 未实现平台 501 / claude 无 host 400
+    /// 泛化路由拒绝规则：未知平台 404；Claude host 已实现，缺少供应商时返回业务错误。
     #[tokio::test]
     async fn agent_routes_reject_rules() {
         let app = build_router(dummy_state());
@@ -2609,7 +3073,7 @@ mod tests {
             .await
             .unwrap();
         let nv: Value = serde_json::from_slice(&nb).unwrap();
-        assert_eq!(nv["error"], "E_AGENT_UNSUPPORTED");
+        assert_eq!(nv["error"], "E_NO_PROVIDER");
     }
 
     /// M0 DoD③ 证据：GET /health 返回 200 + {status:"ok", active_provider_id:null, access_mode:null}
@@ -2684,7 +3148,6 @@ mod tests {
             oclaw_home: root.join("oclaw"),
             cd_home: root.join("cdsupport"),
             cursor_home: root.join("cursorhome"),
-            trae_home: root.join("traehome"),
             launcher: Default::default(),
             health: std::sync::Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: std::sync::Arc::new(std::sync::Mutex::new(AccelCfg::default())),
@@ -2702,6 +3165,47 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn version_route_uses_unified_envelope_and_cargo_version() {
+        let response = build_router(dummy_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            value.get("version").is_none(),
+            "版本必须位于统一 data 信封内"
+        );
+    }
+
+    #[test]
+    fn version_comparison_handles_prefix_width_and_invalid_values() {
+        assert!(version_is_newer("v1.0.11", "1.0.10"));
+        assert!(version_is_newer("2.0", "1.99.99"));
+        assert!(version_is_newer("1.0.10", "1.0.10-beta.1"));
+        assert!(version_is_newer("1.0.10-beta.2", "1.0.10-beta.1"));
+        assert!(version_is_newer("1.0.10-beta.10", "1.0.10-beta.2"));
+        assert!(version_is_newer("1.0.10-beta", "1.0.10-alpha.9"));
+        assert!(!version_is_newer("1.0.10", "1.0.10"));
+        assert!(!version_is_newer("1.0", "1.0.0"));
+        assert!(!version_is_newer("1.0.10-beta.1", "1.0.10"));
+        assert!(!version_is_newer(
+            "1.0.10-beta.1+build.2",
+            "1.0.10-beta.1+build.1"
+        ));
+        assert!(!version_is_newer("1.0.9", "1.0.10"));
+        assert!(!version_is_newer("1.0.010", "1.0.9"));
+        assert!(!version_is_newer("not-a-version", "1.0.10"));
     }
 
     /// 生态管理 e2e(开发组·生态中心 A 段):codex TOML 段级 + cursor JSON 全链;
@@ -2894,7 +3398,7 @@ mod tests {
         let doc: Value = serde_json::from_str(&mcp).unwrap();
         assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx");
 
-        // 未知平台 404;非法 op 400
+        // Gemini 属于产品十平台生态集合;非法 op 400
         let resp = app
             .clone()
             .oneshot(
@@ -2905,7 +3409,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let gemini = body_json(resp).await;
+        assert!(gemini["data"]["servers"].is_array());
         let resp = app
             .clone()
             .oneshot(
@@ -2987,16 +3493,38 @@ mod tests {
         // ── grokbuild:[models]/[cli] 段零触碰 ──
         let grok_cfg = root.join("grok").join("config.toml");
         std::fs::create_dir_all(root.join("grok")).unwrap();
-        std::fs::write(&grok_cfg, "[models]\ndefault = \"x\"\n[cli]\ntui = true\n").unwrap();
+        std::fs::write(
+            &grok_cfg,
+            "[models]\ndefault = \"x\"\n[cli]\ntui = true\n[mcp_servers.manual]\ncommand = \"manual\"\n",
+        )
+        .unwrap();
         let resp = post!("grokbuild", r#"{"op":"install","presetId":"memory"}"#);
         assert_eq!(resp.status(), StatusCode::OK, "grok install");
         let t: toml::Value = std::fs::read_to_string(&grok_cfg).unwrap().parse().unwrap();
         assert_eq!(t["models"]["default"].as_str(), Some("x"), "models 段保留");
         assert_eq!(t["mcp_servers"]["memory"]["command"].as_str(), Some("npx"));
+        let resp = post!("grokbuild", r#"{"op":"disable","name":"memory"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "grok disable");
+        let t: toml::Value = std::fs::read_to_string(&grok_cfg).unwrap().parse().unwrap();
+        assert!(
+            t["mcp_servers"].get("memory").is_none(),
+            "Grok Build 不支持 enabled=false，disable 必须移除条目"
+        );
+        assert_eq!(
+            t["mcp_servers"]["manual"]["command"].as_str(),
+            Some("manual"),
+            "disable 不得误删手动条目"
+        );
+        let resp = post!("grokbuild", r#"{"op":"enable","name":"memory"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "grok enable");
         let resp = post!("grokbuild", r#"{"op":"uninstall","name":"memory"}"#);
         assert_eq!(resp.status(), StatusCode::OK);
         let t: toml::Value = std::fs::read_to_string(&grok_cfg).unwrap().parse().unwrap();
-        assert!(t.get("mcp_servers").is_none(), "空段移除");
+        assert!(t["mcp_servers"].get("memory").is_none());
+        assert_eq!(
+            t["mcp_servers"]["manual"]["command"].as_str(),
+            Some("manual")
+        );
         assert_eq!(t["models"]["default"].as_str(), Some("x"));
 
         // ── opencode:theme 键保留 + local 形状 ──
@@ -3030,17 +3558,17 @@ mod tests {
         assert!(!raw.contains("mcp-server-fetch"));
         assert!(raw.contains("_config_version: 33"));
 
-        // ── trae:无文件 install 创建 ──
-        let trae_cfg = root.join("traehome").join(".trae").join("mcp.json");
-        let resp = post!("trae", r#"{"op":"install","presetId":"playwright"}"#);
-        assert_eq!(resp.status(), StatusCode::OK, "trae install");
+        // ── gemini:settings.json 无文件 install 创建 ──
+        let gemini_cfg = root.join(".gemini").join("settings.json");
+        let resp = post!("gemini", r#"{"op":"install","presetId":"playwright"}"#);
+        assert_eq!(resp.status(), StatusCode::OK, "gemini install");
         let doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&gemini_cfg).unwrap()).unwrap();
         assert_eq!(doc["mcpServers"]["playwright"]["command"], "npx");
-        let resp = post!("trae", r#"{"op":"uninstall","name":"playwright"}"#);
+        let resp = post!("gemini", r#"{"op":"uninstall","name":"playwright"}"#);
         assert_eq!(resp.status(), StatusCode::OK);
         let doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(&trae_cfg).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&gemini_cfg).unwrap()).unwrap();
         assert!(doc.get("mcpServers").is_none());
 
         // ── 装时填参:filesystem 缺参 400,带参成功 ──
@@ -3978,10 +4506,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── Claude 接入:claude-start 接口(批「Claude 接入」§3)──
+    // ── Claude Code 配置托管接口 ─────────────────────────────
 
     #[tokio::test]
-    async fn e2e_claude_start_returns_command_and_env() {
+    async fn e2e_claude_start_writes_settings_without_returning_key() {
         let (state, root) = unique_state("claude-start");
         std::fs::create_dir_all(&state.codex_home).unwrap();
         let app = build_router(state.clone());
@@ -4014,13 +4542,188 @@ mod tests {
         .await;
         assert_eq!(v["ok"], true, "成功应带 ok:true");
         assert_eq!(v["way"], "gateway");
+        assert_eq!(v["providerId"], id.as_str());
+        assert!(v.get("env").is_none());
+        assert!(v.get("command").is_none());
+        let settings = root.join(".claude/settings.json");
+        let written = std::fs::read_to_string(settings).unwrap();
+        assert!(written.contains("http://127.0.0.1:8787/anthropic"));
+        assert!(!written.contains("sk-claude-test-secret"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn e2e_claude_config_host_state_unhost_roundtrip() {
+        let (state, root) = unique_state("claude-config-host");
+        let settings = root.join(".claude/settings.json");
+        let original = b"{\n  \"theme\": \"dark\",\n  \"env\": {\"CUSTOM\": \"keep\"}\n}\n";
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, original).unwrap();
+
+        let provider = crate::providers::create(
+            &state.providers_path,
+            crate::providers::ProviderInput {
+                name: "Claude Config".into(),
+                agent: "claude".into(),
+                base_url: "https://upstream.invalid".into(),
+                api_key: "sk-server-test-secret".into(),
+                model: "gpt-5.6".into(),
+                sub2api_multiplier: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let app = build_router(state.clone());
+        let hosted = body_json(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/desktop/claude/host")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"providerId": provider.id, "way": "gateway"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(hosted["ok"], true);
+
+        let written = std::fs::read_to_string(&settings).unwrap();
+        let written_json: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(written_json["theme"], "dark");
+        assert_eq!(written_json["env"]["CUSTOM"], "keep");
         assert_eq!(
-            v["env"]["ANTHROPIC_BASE_URL"],
+            written_json["env"]["ANTHROPIC_BASE_URL"],
             "http://127.0.0.1:8787/anthropic"
         );
-        assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-claude-test-secret");
-        assert_eq!(v["providerId"], id.as_str());
-        assert!(v["command"].as_str().unwrap().ends_with(" claude"));
+        assert_eq!(
+            written_json["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
+            "1"
+        );
+        assert!(!written.contains("sk-server-test-secret"));
+
+        let state_value = body_json(
+            build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/desktop/claude/state")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(state_value["ok"], true);
+        assert_eq!(state_value["data"]["hosted"], true);
+
+        let unhosted = body_json(
+            build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/desktop/claude/unhost")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(unhosted["ok"], true);
+        assert_eq!(unhosted["data"]["restored"], true);
+        assert_eq!(std::fs::read(&settings).unwrap(), original);
+        assert!(crate::providers::get_active_for_agent(&state.providers_path, "claude").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn anthropic_models_route_lists_selected_claude_provider_models() {
+        let (state, root) = unique_state("claude-models");
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "Claude Models",
+                            "agent": "claude",
+                            "baseUrl": "https://up.claude.example.com",
+                            "apiKey": "sk-claude-models",
+                            "model": "gpt-5.6",
+                            "models": [
+                                {"name": "gpt-5.6", "display_name": "GPT 5.6"},
+                                {"name": "gpt-5.5", "display_name": "GPT 5.5"}
+                            ],
+                            "accessMode": "pure_api"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let provider_id = body_json(resp).await["data"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 启动选择会把该供应商设为 Claude active，网关后续不能再静默取其他供应商。
+        let app = build_router(state.clone());
+        let start = body_json(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/desktop/claude-start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"providerId": provider_id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(start["ok"], true);
+
+        let models = body_json(
+            build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/anthropic/v1/models")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(models["has_more"], false);
+        assert_eq!(models["data"][0]["id"], "gpt-5.6");
+        assert_eq!(models["data"][0]["display_name"], "GPT 5.6");
+        assert_eq!(models["data"][1]["id"], "gpt-5.5");
+
+        let detail = body_json(
+            build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/anthropic/v1/models/gpt-5.5")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(detail["id"], "gpt-5.5");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4044,6 +4747,28 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"]["code"], "E_NO_CLAUDE_PROVIDER");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn e2e_claude_launch_no_provider_returns_error_envelope() {
+        let (state, root) = unique_state("claude-launch-noprov");
+        std::fs::create_dir_all(&state.codex_home).unwrap();
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/desktop/claude-launch")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let value = body_json(resp).await;
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "E_NO_CLAUDE_PROVIDER");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4123,6 +4848,7 @@ mod tests {
                 key_masked: "sk-…abcd".into(),
                 route: "codex".into(),
                 line: "direct".into(),
+                degraded_to_direct: false,
                 latency_ms: 25,
                 ok: true,
             },
@@ -4220,6 +4946,85 @@ mod tests {
             !v["error"].as_str().unwrap_or("").is_empty(),
             "400 应带人话 error"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_custom_node_rejects_malformed_missing_and_embedded_credentials() {
+        let (state, root) = accel_state("off", "", vec![]);
+        for body in [
+            json!({"endpoint": "http://"}),
+            json!({"endpoint": "http://bad host"}),
+            json!({"endpoint": "http://user:pass@127.0.0.1:8080"}),
+            json!({}),
+            json!({"endpoint": 123}),
+        ] {
+            let (status, value) = accel_post(
+                &build_router(state.clone()),
+                "/api/accel/custom-node",
+                &body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "body={body}, value={value}"
+            );
+            assert_eq!(value["ok"], false, "body={body}, value={value}");
+        }
+        assert_eq!(state.accel.lock().unwrap().custom_node, "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_test_node_rejects_malformed_endpoint_before_network() {
+        let (state, root) = accel_state("off", "", vec![]);
+        let (status, value) = accel_post(
+            &build_router(state),
+            "/api/accel/test-node",
+            &json!({"endpoint": "http://"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["ok"], false);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_mode_write_failure_returns_500_and_keeps_previous_state() {
+        let (mut state, root) = accel_state("off", "", vec![]);
+        let blocked_home = root.join("blocked-home");
+        std::fs::write(&blocked_home, "not a directory").unwrap();
+        state.codex_home = blocked_home;
+
+        let (status, value) = accel_post(
+            &build_router(state.clone()),
+            "/api/accel/mode",
+            &json!({"mode": "official"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(value["ok"], false);
+        assert_eq!(state.accel.lock().unwrap().mode, "off");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_custom_node_write_failure_returns_500_and_keeps_previous_state() {
+        let (mut state, root) = accel_state("off", "", vec![]);
+        let blocked_home = root.join("blocked-home");
+        std::fs::write(&blocked_home, "not a directory").unwrap();
+        state.codex_home = blocked_home;
+
+        let (status, value) = accel_post(
+            &build_router(state.clone()),
+            "/api/accel/custom-node",
+            &json!({"endpoint": "http://127.0.0.1:8080"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(value["ok"], false);
+        assert_eq!(state.accel.lock().unwrap().custom_node, "");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4335,6 +5140,53 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = accel_get(&build_router(state.clone()), "/api/accel/state").await;
         assert_eq!(v["scopeNote"], "该供应商不在官方线路范围,已直连");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn accel_state_scope_note_ignores_other_agents_active_provider() {
+        let (state, root) = accel_state("official", "", vec![accel_line("l1", &["2xa.cc.cd"])]);
+        let codex = crate::providers::create(
+            &state.providers_path,
+            crate::providers::ProviderInput {
+                name: "Codex".into(),
+                agent: "codex".into(),
+                base_url: "https://api.2xa.cc.cd".into(),
+                api_key: "sk-codex".into(),
+                model: "gpt".into(),
+                sub2api_multiplier: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::providers::set_active(&state.providers_path, &codex.id);
+        let workbuddy = crate::providers::create(
+            &state.providers_path,
+            crate::providers::ProviderInput {
+                name: "WorkBuddy".into(),
+                agent: "workbuddy".into(),
+                base_url: "https://outside.example.com".into(),
+                api_key: "sk-workbuddy".into(),
+                model: "workbuddy-model".into(),
+                sub2api_multiplier: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::providers::set_active(&state.providers_path, &workbuddy.id);
+
+        assert_eq!(
+            crate::providers::get_active(&state.providers_path)
+                .unwrap()
+                .id,
+            workbuddy.id,
+            "测试前提：全局 active 已切到其他平台"
+        );
+        let value = accel_get(&build_router(state.clone()), "/api/accel/state").await;
+        assert_eq!(
+            value["scopeNote"], "",
+            "加速 scope 只应读取 Codex active provider"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

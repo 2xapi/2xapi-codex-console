@@ -23,7 +23,8 @@ fn find_provider(
     provider_id: &str,
 ) -> Result<crate::providers::Provider, OpError> {
     let data = crate::providers::load(providers_path);
-    data.providers
+    let provider = data
+        .providers
         .into_iter()
         .find(|p| p.id == provider_id)
         .ok_or_else(|| {
@@ -32,7 +33,9 @@ fn find_provider(
                 "E_NO_PROVIDER".into(),
                 format!("供应商不存在: {provider_id}"),
             )
-        })
+        })?;
+    crate::desktop::validate_provider_agent(&provider, "grokbuild")?;
+    Ok(provider)
 }
 
 pub fn host(
@@ -43,11 +46,34 @@ pub fn host(
     way: &str,
 ) -> Result<Value, OpError> {
     let provider = find_provider(providers_path, provider_id)?;
-    crate::grok_config::host(&config_path(grok_home), backup_dir, &provider, way)
+    let config = config_path(grok_home);
+    let paths = [config.clone(), providers_path.to_path_buf()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let result = crate::grok_config::host(&config, backup_dir, &provider, way)?;
+        crate::desktop::set_active_checked(providers_path, &provider, "grokbuild")?;
+        Ok(result)
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 pub fn unhost(grok_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
-    crate::grok_config::unhost(&config_path(grok_home), backup_dir)
+    let config = config_path(grok_home);
+    let providers_path = crate::desktop::providers_path_from_backup_dir(backup_dir);
+    let paths = [config.clone(), providers_path.clone()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let result = crate::grok_config::unhost(&config, backup_dir)?;
+        crate::desktop::clear_active_checked(&providers_path, "grokbuild")?;
+        Ok(result)
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// 生成启动命令(对齐 gemini/workbuddy 的 start 形态;前端「⌘ 生成启动命令」按钮)。
@@ -172,5 +198,32 @@ mod tests {
         let err = start(&providers_path, "gateway", "no-such-id", &grok_home).unwrap_err();
         assert_eq!(err.0, 404);
         assert_eq!(err.1, "E_NO_PROVIDER");
+    }
+
+    #[test]
+    fn host_rejects_foreign_agent_without_writes() {
+        let (grok_home, bk, providers_path) = sandbox("foreign-agent");
+        let id = create_provider(&providers_path, "T");
+        let mut data: Value =
+            serde_json::from_str(&std::fs::read_to_string(&providers_path).unwrap()).unwrap();
+        data["providers"][0]["agent"] = json!("codex");
+        std::fs::write(&providers_path, data.to_string()).unwrap();
+
+        let error = host(&grok_home, &bk, &providers_path, &id, "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_PROVIDER_AGENT_MISMATCH");
+        assert!(!config_path(&grok_home).exists());
+    }
+
+    #[test]
+    fn unhost_clears_grok_active() {
+        let (grok_home, bk, providers_path) = sandbox("unhost-active");
+        let id = create_provider(&providers_path, "T");
+        host(&grok_home, &bk, &providers_path, &id, "gateway").unwrap();
+        assert!(crate::providers::get_active_for_agent(&providers_path, "grokbuild").is_some());
+
+        unhost(&grok_home, &bk).unwrap();
+
+        assert!(crate::providers::get_active_for_agent(&providers_path, "grokbuild").is_none());
     }
 }

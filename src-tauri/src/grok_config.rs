@@ -392,7 +392,7 @@ pub fn detect_hosting(grok_config_path: &Path) -> Value {
 
 /// backup_dir 里 purpose=pre-host 的最新快照(原始文本,含官方态原文;
 /// backup_file 对「原文件不存在」写的占位注释 parse 后为空表,等价官方态)。
-fn find_pre_host_snapshot_text(backup_dir: &Path) -> Option<String> {
+fn find_pre_host_snapshot_text(backup_dir: &Path, grok_config_path: &Path) -> Option<String> {
     let mut candidates: Vec<(Option<std::time::SystemTime>, String)> = Vec::new();
     let rd = std::fs::read_dir(backup_dir).ok()?;
     for entry in rd.flatten() {
@@ -409,9 +409,15 @@ fn find_pre_host_snapshot_text(backup_dir: &Path) -> Option<String> {
         if meta.get("purpose").and_then(|v| v.as_str()) != Some("pre-host") {
             continue;
         }
+        if !crate::config::backup_matches_target(&manifest, grok_config_path) {
+            continue;
+        }
         let toml_path = manifest.with_file_name(name.trim_end_matches(".manifest.json"));
-        if let Ok(text) = std::fs::read_to_string(&toml_path) {
-            candidates.push((entry.metadata().and_then(|m| m.modified()).ok(), text));
+        if let Ok(Some(data)) = crate::config::read_verified_backup(&toml_path, grok_config_path) {
+            candidates.push((
+                entry.metadata().and_then(|m| m.modified()).ok(),
+                String::from_utf8_lossy(&data).to_string(),
+            ));
         }
     }
     candidates.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts)); // 最新在前
@@ -517,7 +523,7 @@ pub fn unhost(grok_config_path: &Path, backup_dir: &Path) -> Result<Value, OpErr
         return Ok(json!({ "restored": false, "alreadyClean": true }));
     }
     let current = std::fs::read_to_string(grok_config_path).unwrap_or_default();
-    let merged = match find_pre_host_snapshot_text(backup_dir) {
+    let merged = match find_pre_host_snapshot_text(backup_dir, grok_config_path) {
         Some(snapshot) => restore_controlled_sections(&current, &snapshot).map_err(io)?,
         None => build_unhosted_toml(&current).map_err(io)?,
     };

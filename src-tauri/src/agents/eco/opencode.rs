@@ -156,12 +156,22 @@ impl EcoStore for OpencodeStore {
 
     fn write(&self, servers: &BTreeMap<String, Value>) -> Result<(), super::OpError> {
         let mut doc = self.read_doc()?;
+        let existing = doc
+            .get("mcp")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         if servers.is_empty() {
             doc.remove("mcp");
         } else {
             let mut m = Map::new();
             for (k, v) in servers {
-                m.insert(k.clone(), spec_to_entry(v));
+                let entry = existing
+                    .get(k)
+                    .filter(|raw| entry_to_spec(raw) == *v)
+                    .cloned()
+                    .unwrap_or_else(|| spec_to_entry(v));
+                m.insert(k.clone(), entry);
             }
             doc.insert("mcp".into(), Value::Object(m));
         }
@@ -170,6 +180,7 @@ impl EcoStore for OpencodeStore {
 
     fn backup(&self, backup_dir: &Path) -> Result<(), super::OpError> {
         crate::config::backup_file(&self.path, backup_dir, "eco-apply", "pre-eco")
+            .map(|_| ())
             .map_err(|e| (500, "E_IO".to_string(), e))
     }
 }
@@ -244,5 +255,38 @@ mod tests {
         )
         .unwrap();
         assert!(doc.get("mcp").is_none());
+    }
+
+    #[test]
+    fn unchanged_manual_entries_keep_native_shape_and_unknown_fields() {
+        let root = root("preserve-manual");
+        let path = root.join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcp": {
+                    "remote-user": {"type":"remote","url":"https://mcp.example","enabled":false,"x-user":1},
+                    "local-user": {"type":"local","command":["node","server.js"],"enabled":false,"x-user":"keep"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = OpencodeStore::new(&root);
+        let mut servers = store.read().unwrap();
+        servers.insert(
+            "console-new".into(),
+            json!({"command":"npx","args":["mcp-x"]}),
+        );
+        store.write(&servers).unwrap();
+
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(doc["mcp"]["remote-user"]["type"], "remote");
+        assert_eq!(doc["mcp"]["remote-user"]["enabled"], false);
+        assert_eq!(doc["mcp"]["remote-user"]["x-user"], 1);
+        assert_eq!(doc["mcp"]["local-user"]["enabled"], false);
+        assert_eq!(doc["mcp"]["local-user"]["x-user"], "keep");
+        assert_eq!(doc["mcp"]["console-new"]["type"], "local");
     }
 }

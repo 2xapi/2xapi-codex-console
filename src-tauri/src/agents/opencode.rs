@@ -89,7 +89,7 @@ fn find_provider(
     providers_path: &Path,
     provider_id: &str,
 ) -> Result<crate::providers::Provider, OpError> {
-    crate::providers::load(providers_path)
+    let provider = crate::providers::load(providers_path)
         .providers
         .into_iter()
         .find(|p| p.id == provider_id)
@@ -99,7 +99,9 @@ fn find_provider(
                 "E_NO_PROVIDER".into(),
                 format!("供应商不存在: {provider_id}"),
             )
-        })
+        })?;
+    crate::desktop::validate_provider_agent(&provider, "opencode")?;
+    Ok(provider)
 }
 
 /// 托管态:我们条目是否存在 + 指针归属 + jsonc 冲突告警。
@@ -230,22 +232,32 @@ pub fn host(
         switched = true;
     }
 
-    let written = write_root(
-        oc_home,
-        backup_dir,
-        &root,
-        if switched { "pre-host" } else { "pre-switch" },
-    )?;
-    Ok(json!({
-        "hosted": true, "way": way, "switched": !existing_model.is_empty(),
-        "defaultModelSwitched": switched,
-        "suggested": !switched,
-        "changed": { "config": written },
-        "keyNote": key_note,
-    }))
+    let paths = [config_path(oc_home), providers_path.to_path_buf()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let written = write_root(
+            oc_home,
+            backup_dir,
+            &root,
+            if switched { "pre-host" } else { "pre-switch" },
+        )?;
+        crate::desktop::set_active_checked(providers_path, &provider, "opencode")?;
+        Ok(json!({
+            "hosted": true, "way": way, "switched": !existing_model.is_empty(),
+            "defaultModelSwitched": switched,
+            "suggested": !switched,
+            "changed": { "config": written },
+            "keyNote": key_note,
+        }))
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 pub fn unhost(oc_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
+    let providers_path = crate::desktop::providers_path_from_backup_dir(backup_dir);
     let mut root = read_root(oc_home)?;
     let ours_prefix = format!("{PROVIDER_ID}/");
     let removed = root
@@ -254,6 +266,7 @@ pub fn unhost(oc_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
         .map(|m| m.remove(PROVIDER_ID).is_some())
         .unwrap_or(false);
     if !removed {
+        crate::desktop::clear_active_checked(&providers_path, "opencode")?;
         return Ok(json!({ "restored": false, "alreadyClean": true }));
     }
     // 指针仅在原值空/缺失时才会被我们设置 → 指向我们即移除(恢复「未设置」)
@@ -265,10 +278,19 @@ pub fn unhost(oc_home: &Path, backup_dir: &Path) -> Result<Value, OpError> {
     if pointer_removed {
         root.remove("model");
     }
-    let written = write_root(oc_home, backup_dir, &root, "pre-unhost")?;
-    Ok(
-        json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }),
-    )
+    let paths = [config_path(oc_home), providers_path.clone()];
+    let snapshots = paths
+        .iter()
+        .map(|path| crate::desktop::snapshot_file(path).map(|snapshot| (path.clone(), snapshot)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = (|| {
+        let written = write_root(oc_home, backup_dir, &root, "pre-unhost")?;
+        crate::desktop::clear_active_checked(&providers_path, "opencode")?;
+        Ok(
+            json!({ "restored": true, "changed": { "config": written }, "defaultModelRemoved": pointer_removed }),
+        )
+    })();
+    outcome.map_err(|error| crate::desktop::rollback_files(error, &snapshots))
 }
 
 /// POST /api/desktop/opencode/start —— 未托管 409;托管后返回直接运行提示
@@ -278,4 +300,70 @@ pub fn start(oc_home: &Path, providers_path: &Path, provider_id: &str) -> Result
         return Err((409, "E_NOT_HOSTED".into(), "请先托管,再启动".into()));
     }
     super::cli_start_response(providers_path, provider_id, "opencode run")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup(tag: &str, agent: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("2xapi-opencode-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let backup = root.join("backups");
+        let providers = root.join("providers.json");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(
+            &providers,
+            json!({
+                "providers": [{
+                    "id": "p1", "name": "test", "agent": agent,
+                    "base_url": "https://up.example.com/v1", "api_key": "sk-test",
+                    "model": "gpt-test"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (home, backup, providers)
+    }
+
+    #[test]
+    fn host_rejects_foreign_agent_without_writes() {
+        let (home, backup, providers) = setup("foreign", "codex");
+
+        let error = host(&home, &backup, &providers, "p1", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_PROVIDER_AGENT_MISMATCH");
+        assert!(!config_path(&home).exists());
+    }
+
+    #[test]
+    fn host_rolls_back_config_when_active_write_fails() {
+        let (home, backup, providers) = setup("active-rollback", "opencode");
+        let original = json!({ "keep": true });
+        std::fs::create_dir_all(config_path(&home).parent().unwrap()).unwrap();
+        std::fs::write(config_path(&home), original.to_string()).unwrap();
+        std::fs::create_dir(providers.with_extension("json.tmp")).unwrap();
+
+        let error = host(&home, &backup, &providers, "p1", "gateway").unwrap_err();
+
+        assert_eq!(error.1, "E_ACTIVE_WRITE");
+        assert_eq!(
+            read_root(&home).unwrap(),
+            original.as_object().unwrap().clone()
+        );
+    }
+
+    #[test]
+    fn unhost_clears_opencode_active() {
+        let (home, backup, providers) = setup("unhost-active", "opencode");
+        host(&home, &backup, &providers, "p1", "gateway").unwrap();
+        assert!(crate::providers::get_active_for_agent(&providers, "opencode").is_some());
+
+        unhost(&home, &backup).unwrap();
+
+        assert!(crate::providers::get_active_for_agent(&providers, "opencode").is_none());
+    }
 }

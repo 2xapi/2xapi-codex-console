@@ -2,7 +2,7 @@
 //!
 //! - `Provider` 结构逐字段对齐 02 §1（23 字段）。
 //! - `AccessMode`/`WireApi` 序列化按 02 §4（snake_case）；**反序列化兼容历史 camelCase 值**，避免旧 providers.json 被清空。
-//! - `providers.json` 存储按 02 §3（`schema_version` + `active_provider_id` + `providers[]`），原子写（临时文件→rename）。
+//! - `providers.json` 存储按 02 §3（兼容旧 `active_provider_id`，新增 `active_provider_ids` 按平台保存），原子写（临时文件→rename）。
 //! - 字段校验按 02 §2（返回 `Vec<ValidationError>` 字段级错误，供 M4 映射为 422 `E_VALIDATION`）。
 //! - CRUD 按 FR-1.1~1.6。
 
@@ -94,6 +94,23 @@ pub struct ModelConfig {
     pub send_as_is: bool,
 }
 
+/// Claude Desktop 菜单角色到上游实际模型的映射。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeDesktopModelRoute {
+    pub role: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "label_override"
+    )]
+    pub label_override: Option<String>,
+    #[serde(default = "default_true", rename = "supports1m", alias = "supports_1m")]
+    pub supports_1m: bool,
+}
+
 /// Provider 完整结构（02 §1，23 字段，逐字段一致）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Provider {
@@ -139,6 +156,8 @@ pub struct Provider {
     pub model: String,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude_desktop_model_routes: Vec<ClaudeDesktopModelRoute>,
     #[serde(default)]
     pub context_window: Option<String>,
 
@@ -169,6 +188,10 @@ fn default_multiplier() -> f64 {
     1.0
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_agent() -> String {
     "codex".to_string()
 }
@@ -189,8 +212,12 @@ fn normalize_agent(agent: &str) -> String {
 pub struct ProviderData {
     #[serde(default)]
     pub schema_version: i64,
+    /// 兼容旧客户端的最后一次选择；网关路由不再依赖该全局字段。
     #[serde(default)]
     pub active_provider_id: Option<String>,
+    /// 每个平台独立的 active provider，避免跨平台选择互相覆盖。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub active_provider_ids: HashMap<String, String>,
     #[serde(default)]
     pub providers: Vec<Provider>,
 }
@@ -220,6 +247,8 @@ pub struct ProviderInput {
     pub user_agent: Option<String>,
     pub model: String,
     pub models: Vec<ModelConfig>,
+    /// None 表示旧客户端未提交该字段，更新时保留已有映射。
+    pub claude_desktop_model_routes: Option<Vec<ClaudeDesktopModelRoute>>,
     pub context_window: Option<String>,
     pub proxy_url: Option<String>,
     pub timeout_secs: Option<u64>,
@@ -245,6 +274,19 @@ pub fn load(path: &Path) -> ProviderData {
     for p in &mut data.providers {
         p.agent = normalize_agent(&p.agent);
     }
+    data.active_provider_ids.retain(|agent, id| {
+        data.providers
+            .iter()
+            .any(|provider| provider.id == *id && provider.agent == *agent)
+    });
+    // 旧文件只有全局 active：迁移到该 provider 所属平台；不立即写盘，下一次正常保存时落地。
+    if let Some(id) = data.active_provider_id.as_deref() {
+        if let Some(provider) = data.providers.iter().find(|provider| provider.id == id) {
+            data.active_provider_ids
+                .entry(provider.agent.clone())
+                .or_insert_with(|| id.to_string());
+        }
+    }
     data
 }
 
@@ -252,7 +294,19 @@ fn save_atomic(path: &Path, data: &ProviderData, op: &str) -> Result<(), String>
     let raw = serde_json::to_string_pretty(data).map_err(|e| format!("序列化失败: {e}"))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &raw).map_err(|e| format!("写临时文件失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("设置临时文件权限失败: {e}"))?;
+    }
     std::fs::rename(&tmp, path).map_err(|e| format!("重命名失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("设置供应商文件权限失败: {e}"))?;
+    }
     // 审计(尽力而为,失败不影响主流程)——排查 providers.json 异常变动的唯一指望(§1.5-2)
     append_audit(path, op, data);
     Ok(())
@@ -266,6 +320,7 @@ fn append_audit(providers_path: &Path, op: &str, data: &ProviderData) {
         "ts": chrono::Local::now().to_rfc3339(),
         "op": op,
         "active": data.active_provider_id,
+        "activeByAgent": data.active_provider_ids,
         "providers": data.providers.iter().map(|p| json!({"id": p.id, "name": p.name})).collect::<Vec<_>>(),
         "count": data.providers.len(),
     });
@@ -303,6 +358,7 @@ pub fn input_to_provider(input: ProviderInput) -> Provider {
         user_agent: input.user_agent,
         model: input.model,
         models: input.models,
+        claude_desktop_model_routes: input.claude_desktop_model_routes.unwrap_or_default(),
         context_window: input.context_window,
         proxy_url: input.proxy_url,
         timeout_secs: input.timeout_secs,
@@ -427,6 +483,7 @@ pub fn create(path: &Path, input: ProviderInput) -> Result<Provider, Vec<Validat
         user_agent: input.user_agent,
         model: input.model,
         models: input.models,
+        claude_desktop_model_routes: input.claude_desktop_model_routes.unwrap_or_default(),
         context_window: input.context_window,
         proxy_url: input.proxy_url,
         timeout_secs: input.timeout_secs,
@@ -486,6 +543,9 @@ pub fn update(
     p.user_agent = eff.user_agent;
     p.model = eff.model;
     p.models = eff.models;
+    if let Some(routes) = eff.claude_desktop_model_routes {
+        p.claude_desktop_model_routes = routes;
+    }
     p.context_window = eff.context_window;
     p.proxy_url = eff.proxy_url;
     p.timeout_secs = eff.timeout_secs;
@@ -505,6 +565,8 @@ pub fn update(
 pub fn delete(path: &Path, id: &str) {
     let mut data = load(path);
     data.providers.retain(|p| p.id != id);
+    data.active_provider_ids
+        .retain(|_, active_id| active_id != id);
     if data.active_provider_id.as_deref() == Some(id) {
         data.active_provider_id = None;
     }
@@ -535,14 +597,49 @@ pub fn reorder(path: &Path, ids: &[String]) {
 #[allow(dead_code)] // 测试/未来路由用
 pub fn set_active(path: &Path, id: &str) {
     let mut data = load(path);
+    let Some(agent) = data
+        .providers
+        .iter()
+        .find(|provider| provider.id == id)
+        .map(|provider| provider.agent.clone())
+    else {
+        return;
+    };
+    data.active_provider_ids.insert(agent, id.to_string());
     data.active_provider_id = Some(id.to_string());
     let _ = save_atomic(path, &data, "set_active");
 }
 
+/// 只切换指定平台的 active，不改兼容旧客户端使用的全局 active。
+/// 多平台场景下，Claude 选中的供应商不能覆盖 Codex 的 active。
+pub fn set_active_for_agent(path: &Path, id: &str) -> Result<(), String> {
+    let mut data = load(path);
+    let Some(provider) = data.providers.iter().find(|provider| provider.id == id) else {
+        return Err("供应商不存在".into());
+    };
+    data.active_provider_ids
+        .insert(provider.agent.clone(), id.to_string());
+    save_atomic(path, &data, "set_active_for_agent")
+}
+
 #[allow(dead_code)] // activate-official（M2）会用到
 pub fn clear_active(path: &Path) {
+    clear_active_for_agent(path, "codex");
+}
+
+pub fn clear_active_for_agent(path: &Path, agent: &str) {
     let mut data = load(path);
-    data.active_provider_id = None;
+    let agent = normalize_agent(agent);
+    let removed = data.active_provider_ids.remove(&agent);
+    if removed.as_deref() == data.active_provider_id.as_deref()
+        || data
+            .active_provider_id
+            .as_deref()
+            .and_then(|id| data.providers.iter().find(|provider| provider.id == id))
+            .is_some_and(|provider| provider.agent == agent)
+    {
+        data.active_provider_id = data.active_provider_ids.values().next().cloned();
+    }
     let _ = save_atomic(path, &data, "clear_active");
 }
 
@@ -552,32 +649,53 @@ pub fn get_active(path: &Path) -> Option<Provider> {
     data.providers.into_iter().find(|p| &p.id == id)
 }
 
-/// 按 agent 取当前供应商(网关 `/v1/*` 与 `/anthropic/*` 共用;`active_provider_id` 仍全局单实例)。
+pub fn get_active_for_agent(path: &Path, agent: &str) -> Option<Provider> {
+    let data = load(path);
+    let agent = normalize_agent(agent);
+    let id = data.active_provider_ids.get(&agent)?;
+    data.providers
+        .into_iter()
+        .find(|provider| provider.id == *id && provider.agent == agent)
+}
+
+/// 按 agent 取当前供应商。优先使用明确 active；仅当该平台只有一个候选时兼容旧数据。
+/// 多候选但缺少 active 时安全失败，禁止静默选首项把请求或 Key 发往错误上游。
 ///
 /// **本期语义**(写死便于复核):
-/// - 若全局 `active_provider_id` 恰好归属该 agent → 用该供应商(UI「启用」+ 热切换语义保持不变);
-/// - 否则 → 取该 agent 下 `sort_index` 最小(list 顺序首个)的供应商兜底;
+/// - 优先使用该 agent 的 `active_provider_ids`；
+/// - 兼容旧文件时，仅接受恰好归属该 agent 的全局 `active_provider_id`；
+/// - 缺少明确 active 时，只有单候选可安全兼容，多候选必须返回 `None`；
 /// - 该 agent 无任何供应商 → `None`(调用方报「请先选择 X 供应商」)。
 ///
 /// 由此 Codex 与 Claude 的 active 互不串台:即便全局 active 是 codex,`/anthropic/*`
 /// 仍取 claude 供应商(claude 里首个);同理 `/v1/*` 只认 codex,绝不把 Codex 流量发给 claude 供应商。
 pub fn get_provider_for_agent(path: &Path, agent: &str) -> Option<Provider> {
     let data = load(path);
-    let mut provs: Vec<Provider> = data
+    let agent = normalize_agent(agent);
+    let provs: Vec<Provider> = data
         .providers
-        .into_iter()
+        .iter()
         .filter(|p| p.agent == agent)
+        .cloned()
         .collect();
     if provs.is_empty() {
         return None;
+    }
+    if let Some(id) = data.active_provider_ids.get(&agent) {
+        if let Some(provider) = provs.iter().find(|provider| provider.id == *id) {
+            return Some(provider.clone());
+        }
     }
     if let Some(id) = data.active_provider_id.as_deref() {
         if let Some(p) = provs.iter().find(|p| p.id == id) {
             return Some(p.clone());
         }
     }
-    provs.sort_by_key(|p| p.sort_index);
-    provs.into_iter().next()
+    if provs.len() == 1 {
+        provs.into_iter().next()
+    } else {
+        None
+    }
 }
 
 // ── 边界映射 / 兼容（供 server.rs，camelCase ↔ snake_case；M4 会以正式路由替代）──
@@ -606,7 +724,9 @@ pub fn public_provider(p: &Provider) -> Value {
         "accessMode": serde_json::to_value(p.access_mode).unwrap_or(json!("pure_api")),
         "wireApi": serde_json::to_value(p.wire_api).unwrap_or(json!("responses")),
         "userAgent": p.user_agent,
-        "model": p.model, "models": p.models, "contextWindow": p.context_window,
+        "model": p.model, "models": p.models,
+        "claudeDesktopModelRoutes": p.claude_desktop_model_routes,
+        "contextWindow": p.context_window,
         "proxyUrl": p.proxy_url, "timeoutSecs": p.timeout_secs,
         "sub2apiEnabled": p.sub2api_enabled, "sub2apiMultiplier": p.sub2api_multiplier,
         "customHeaders": p.custom_headers,
@@ -658,6 +778,10 @@ pub fn value_to_input(body: &Value) -> ProviderInput {
             .unwrap_or("")
             .to_string(),
         models: body.get("models").map(parse_models).unwrap_or_default(),
+        claude_desktop_model_routes: body
+            .get("claudeDesktopModelRoutes")
+            .or_else(|| body.get("claude_desktop_model_routes"))
+            .map(parse_claude_desktop_model_routes),
         context_window: opt_str(body, &["contextWindow", "context_window"]),
         proxy_url: opt_str(body, &["proxyUrl", "proxy_url"]),
         timeout_secs: body
@@ -720,6 +844,38 @@ fn parse_models(v: &Value) -> Vec<ModelConfig> {
                             .or_else(|| m.get("send_as_is"))
                             .and_then(|x| x.as_bool())
                             .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_claude_desktop_model_routes(v: &Value) -> Vec<ClaudeDesktopModelRoute> {
+    v.as_array()
+        .map(|routes| {
+            routes
+                .iter()
+                .filter_map(|route| {
+                    let role = opt_str(route, &["role"])?;
+                    let role = match role.trim().to_ascii_lowercase().as_str() {
+                        "sonnet" | "claude-sonnet-5" => "sonnet",
+                        "opus" | "claude-opus-5" => "opus",
+                        "fable" | "claude-fable-5" => "fable",
+                        "haiku" | "claude-haiku-4-5" => "haiku",
+                        _ => return None,
+                    };
+                    Some(ClaudeDesktopModelRoute {
+                        role: role.to_string(),
+                        model: opt_str(route, &["model"]).unwrap_or_default(),
+                        label_override: opt_str(route, &["labelOverride", "label_override"])
+                            .map(|label| label.trim().to_string())
+                            .filter(|label| !label.is_empty()),
+                        supports_1m: route
+                            .get("supports1m")
+                            .or_else(|| route.get("supports_1m"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
                     })
                 })
                 .collect()
@@ -806,6 +962,7 @@ mod tests {
                 is_multimodal: true,
                 send_as_is: false,
             }],
+            claude_desktop_model_routes: vec![],
             context_window: Some("128k".into()),
             proxy_url: Some("http://127.0.0.1:7890".into()),
             timeout_secs: Some(120),
@@ -1170,6 +1327,49 @@ mod tests {
         assert_eq!(v["reasoning_levels"].as_array().map(|a| a.len()), Some(2));
     }
 
+    #[test]
+    fn claude_desktop_routes_parse_publish_and_preserve_on_old_updates() {
+        let body = json!({
+            "name": "Desktop",
+            "model": "gpt-5.6",
+            "accessMode": "official",
+            "claudeDesktopModelRoutes": [
+                {"role":"sonnet","model":"gpt-5.6","labelOverride":"GPT 5.6","supports1m":true},
+                {"role":"claude-opus-5","model":"gpt-5.6-sol","supports_1m":false},
+                {"role":"unknown","model":"ignored"}
+            ]
+        });
+        let input = value_to_input(&body);
+        let routes = input.claude_desktop_model_routes.as_ref().unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].role, "sonnet");
+        assert_eq!(routes[0].label_override.as_deref(), Some("GPT 5.6"));
+        assert!(routes[0].supports_1m);
+        assert_eq!(routes[1].role, "opus");
+        assert!(!routes[1].supports_1m);
+
+        let path = tmp_path("claude_desktop_routes");
+        let created = create(&path, input).unwrap();
+        let public = public_provider(&created);
+        assert_eq!(
+            public["claudeDesktopModelRoutes"][0]["labelOverride"],
+            "GPT 5.6"
+        );
+        assert_eq!(public["claudeDesktopModelRoutes"][1]["supports1m"], false);
+
+        let mut old_client_update = sample_input("Desktop 2", AccessMode::Official);
+        old_client_update.model = "gpt-5.7".into();
+        let updated = update(&path, &created.id, old_client_update).unwrap();
+        assert_eq!(
+            updated.claude_desktop_model_routes,
+            created.claude_desktop_model_routes
+        );
+        assert!(value_to_input(&json!({"name":"Old","model":"m"}))
+            .claude_desktop_model_routes
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
     // ── UA 伪装(user_agent:预设字符串原样存取;None=网关默认 UA)──────
 
     #[test]
@@ -1198,7 +1398,10 @@ mod tests {
                 .as_deref(),
             Some("PostmanRuntime/7.37.3")
         );
-        assert_eq!(value_to_input(&json!({"name":"X","model":"m"})).user_agent, None);
+        assert_eq!(
+            value_to_input(&json!({"name":"X","model":"m"})).user_agent,
+            None
+        );
 
         // public 输出 userAgent
         let v = public_provider(&p);
@@ -1266,6 +1469,37 @@ mod tests {
     }
 
     #[test]
+    fn active_provider_is_isolated_per_agent() {
+        let path = tmp_path("active_per_agent");
+        let mut codex_a = sample_input("Codex A", AccessMode::Official);
+        codex_a.agent = "codex".into();
+        let codex_a = create(&path, codex_a).unwrap();
+        let mut codex_b = sample_input("Codex B", AccessMode::Official);
+        codex_b.agent = "codex".into();
+        let codex_b = create(&path, codex_b).unwrap();
+        let mut claude_a = sample_input("Claude A", AccessMode::Official);
+        claude_a.agent = "claude".into();
+        let claude_a = create(&path, claude_a).unwrap();
+        let mut claude_b = sample_input("Claude B", AccessMode::Official);
+        claude_b.agent = "claude".into();
+        let claude_b = create(&path, claude_b).unwrap();
+
+        set_active(&path, &codex_b.id);
+        set_active(&path, &claude_b.id);
+
+        assert_eq!(
+            get_provider_for_agent(&path, "codex").map(|p| p.id),
+            Some(codex_b.id)
+        );
+        assert_eq!(
+            get_provider_for_agent(&path, "claude").map(|p| p.id),
+            Some(claude_b.id)
+        );
+        assert_ne!(codex_a.id, claude_a.id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn public_provider_includes_agent() {
         let p = sample_provider(); // agent: codex
         let v = public_provider(&p);
@@ -1328,7 +1562,7 @@ mod tests {
         let mut i1 = sample_input("Cl1", AccessMode::Official);
         i1.model = "m".into();
         i1.agent = "claude".into();
-        let p1 = create(&path, i1).expect("create claude1");
+        let _p1 = create(&path, i1).expect("create claude1");
         let mut i2 = sample_input("Cl2", AccessMode::Official);
         i2.model = "m".into();
         i2.agent = "claude".into();
@@ -1341,13 +1575,10 @@ mod tests {
             get_provider_for_agent(&path, "codex").map(|p| p.id),
             Some(p_c.id.clone())
         );
-        // claude 路径:active 不是 claude → 取 claude 中 sort 首个(p1)
-        assert_eq!(
-            get_provider_for_agent(&path, "claude").map(|p| p.id),
-            Some(p1.id.clone())
-        );
+        // claude 尚未明确选择 → 安全失败，不静默回退首项。
+        assert!(get_provider_for_agent(&path, "claude").is_none());
 
-        // 切 active 到 claude2 → claude 路径取 p2(active 优先),codex 路径仍取 p_c(active 归属 claude → 取 codex 首个)
+        // 切 active 到 claude2 → claude 路径取 p2；codex 保留独立 active。
         set_active(&path, &p2.id);
         assert_eq!(
             get_provider_for_agent(&path, "claude").map(|p| p.id),
@@ -1365,6 +1596,54 @@ mod tests {
         assert!(get_provider_for_agent(&empty, "codex").is_none());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn legacy_multi_candidate_agent_without_active_fails_closed() {
+        let path = tmp_path("legacy_multi_candidate");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 2,
+                "active_provider_id": "codex-active",
+                "providers": [
+                    { "id": "codex-active", "name": "Codex", "agent": "codex", "base_url": "https://codex.example", "api_key": "sk-c", "model": "c" },
+                    { "id": "claude-first", "name": "Claude A", "agent": "claude", "base_url": "https://a.example", "api_key": "sk-a", "model": "a", "sort_index": 0 },
+                    { "id": "claude-second", "name": "Claude B", "agent": "claude", "base_url": "https://b.example", "api_key": "sk-b", "model": "b", "sort_index": 1 }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_provider_for_agent(&path, "codex").map(|provider| provider.id),
+            Some("codex-active".into())
+        );
+        assert!(
+            get_provider_for_agent(&path, "claude").is_none(),
+            "旧文件没有 claude active 且存在多候选时必须安全失败"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_store_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_path("private_store");
+        let mut input = sample_input("Private", AccessMode::PureApi);
+        input.model = "m".into();
+        input.api_key = "sk-private".into();
+        input.base_url = "https://private.example/v1".into();
+        create(&path, input).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

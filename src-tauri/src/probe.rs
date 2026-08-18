@@ -291,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_all_ok() {
         let base = spawn_mock_router("all").await;
-        let r = preflight(&base, "good", "").await;
+        let r = preflight(&base, "good", "", crate::providers::WireApi::Responses).await;
         assert!(r.key_ok && r.models.len() == 1);
         assert!(r.responses_compat, "responses 应读到 SSE");
         assert!(r.chat_ok);
@@ -302,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_chat_only_suggests_gateway_conversion() {
         let base = spawn_mock_router("chat_only").await;
-        let r = preflight(&base, "good", "m-x").await;
+        let r = preflight(&base, "good", "m-x", crate::providers::WireApi::Responses).await;
         assert!(!r.responses_compat);
         assert!(r.chat_ok);
         assert_eq!(r.suggest, "gateway", "仅 chat 也建议走网关(由网关转换)");
@@ -311,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_responses_only() {
         let base = spawn_mock_router("responses_only").await;
-        let r = preflight(&base, "good", "m-x").await;
+        let r = preflight(&base, "good", "m-x", crate::providers::WireApi::Responses).await;
         assert!(r.responses_compat);
         assert!(!r.chat_ok);
         assert_eq!(r.suggest, "gateway");
@@ -320,14 +320,26 @@ mod tests {
     #[tokio::test]
     async fn preflight_bad_key_classifies_auth() {
         let base = spawn_mock_router("all").await;
-        let r = preflight(&base, "wrong-key", "m-x").await;
+        let r = preflight(
+            &base,
+            "wrong-key",
+            "m-x",
+            crate::providers::WireApi::Responses,
+        )
+        .await;
         assert!(!r.key_ok);
         assert_eq!(r.error, Some("auth"), "401 应分类为 auth");
     }
 
     #[tokio::test]
     async fn preflight_unreachable_classifies_timeout() {
-        let r = preflight("http://127.0.0.1:9", "sk", "m").await;
+        let r = preflight(
+            "http://127.0.0.1:9",
+            "sk",
+            "m",
+            crate::providers::WireApi::Responses,
+        )
+        .await;
         assert!(!r.key_ok && !r.responses_compat && !r.chat_ok);
         assert_eq!(r.error, Some("timeout"));
     }
@@ -336,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_bad_key_no_model_classifies_auth() {
         let base = spawn_mock_router("all").await; // 无 model → 流探测跳过 → 走 /models 状态辅助
-        let r = preflight(&base, "wrong-key", "").await;
+        let r = preflight(&base, "wrong-key", "", crate::providers::WireApi::Responses).await;
         assert!(!r.key_ok);
         assert_eq!(
             r.error,
@@ -392,6 +404,66 @@ pub async fn probe_chat(base_url: &str, api_key: &str, model: &str) -> StreamPro
         status: None,
         got_sse: false,
     }
+}
+
+pub async fn probe_anthropic(base_url: &str, api_key: &str, model: &str) -> StreamProbe {
+    let base = base_url.trim_end_matches('/');
+    let body = serde_json::json!({
+        "model": model, "messages": [{"role":"user","content":"hi"}], "max_tokens": 1
+    });
+    let urls = if base.ends_with("/v1") {
+        vec![format!("{base}/messages")]
+    } else {
+        vec![format!("{base}/v1/messages"), format!("{base}/messages")]
+    };
+    for url in urls {
+        if let Some(result) = try_native_probe(
+            client()
+                .post(url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body),
+        )
+        .await
+        {
+            return result;
+        }
+    }
+    StreamProbe {
+        status: None,
+        got_sse: false,
+    }
+}
+
+pub async fn probe_gemini(base_url: &str, api_key: &str, model: &str) -> StreamProbe {
+    let base = base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1beta") {
+        format!("{base}/models/{model}:generateContent")
+    } else {
+        format!("{base}/v1beta/models/{model}:generateContent")
+    };
+    let body = serde_json::json!({
+        "contents": [{"role":"user","parts":[{"text":"hi"}]}]
+    });
+    try_native_probe(
+        client()
+            .post(url)
+            .header("x-goog-api-key", api_key)
+            .json(&body),
+    )
+    .await
+    .unwrap_or(StreamProbe {
+        status: None,
+        got_sse: false,
+    })
+}
+
+async fn try_native_probe(request: reqwest::RequestBuilder) -> Option<StreamProbe> {
+    let response = request.send().await.ok()?;
+    Some(StreamProbe {
+        status: Some(response.status().as_u16()),
+        got_sse: false,
+    })
 }
 
 /// 仅探测 /models 的 HTTP 状态(用于 model 为空时区分 timeout/auth/notfound;
@@ -463,13 +535,21 @@ pub struct PreflightResult {
     pub models: Vec<(String, Option<u64>)>,
     pub responses_compat: bool,
     pub chat_ok: bool,
+    pub anthropic_ok: bool,
+    pub gemini_ok: bool,
+    pub wire_api: crate::providers::WireApi,
     pub latency_ms: u64,
     pub suggest: String,             // "gateway" | ""
     pub error: Option<&'static str>, // "timeout" | "auth" | "notfound"
 }
 
-/// 完整 preflight:models 探测(key 有效性+延迟) + responses/chat 流探测 + 建议。
-pub async fn preflight(base_url: &str, api_key: &str, model_hint: &str) -> PreflightResult {
+/// 完整 preflight:models 探测(key 有效性+延迟) + 当前协议真实请求 + 建议。
+pub async fn preflight(
+    base_url: &str,
+    api_key: &str,
+    model_hint: &str,
+    wire_api: crate::providers::WireApi,
+) -> PreflightResult {
     let started = std::time::Instant::now();
     let models = probe_endpoint(base_url, api_key).await;
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -480,53 +560,72 @@ pub async fn preflight(base_url: &str, api_key: &str, model_hint: &str) -> Prefl
         models.first().map(|(n, _)| n.clone()).unwrap_or_default()
     };
 
-    let (resp_probe, chat_probe) = if model.is_empty() {
+    let empty_probe = StreamProbe {
+        status: None,
+        got_sse: false,
+    };
+    let (resp_probe, chat_probe, anthropic_probe, gemini_probe) = if model.is_empty() {
         // 连模型名都没有:流探测无从发起
-        (
-            StreamProbe {
-                status: None,
-                got_sse: false,
-            },
-            StreamProbe {
-                status: None,
-                got_sse: false,
-            },
-        )
+        (empty_probe, empty_probe, empty_probe, empty_probe)
     } else {
-        futures_util::join!(
-            probe_responses_stream(base_url, api_key, &model),
-            probe_chat(base_url, api_key, &model)
-        )
+        match wire_api {
+            crate::providers::WireApi::Responses | crate::providers::WireApi::ChatCompletions => {
+                let (responses, chat) = futures_util::join!(
+                    probe_responses_stream(base_url, api_key, &model),
+                    probe_chat(base_url, api_key, &model)
+                );
+                (responses, chat, empty_probe, empty_probe)
+            }
+            crate::providers::WireApi::Anthropic => (
+                empty_probe,
+                empty_probe,
+                probe_anthropic(base_url, api_key, &model).await,
+                empty_probe,
+            ),
+            crate::providers::WireApi::Gemini => (
+                empty_probe,
+                empty_probe,
+                empty_probe,
+                probe_gemini(base_url, api_key, &model).await,
+            ),
+        }
     };
 
-    let key_ok = !models.is_empty();
     let responses_compat = resp_probe.got_sse;
     let chat_ok = chat_probe.status == Some(200);
+    let anthropic_ok = anthropic_probe.status == Some(200);
+    let gemini_ok = gemini_probe.status == Some(200);
+    let native_ok = responses_compat || chat_ok || anthropic_ok || gemini_ok;
+    let key_ok = !models.is_empty() || native_ok;
 
     // 错误分类(优先级:连不上 > 认证 > 地址/协议)。
     // 注意:model 为空时流探测全部跳过(status=None),此时须依据 /models 的 HTTP 状态
     // 辅助分类(实测:DeepSeek 坏 key 时 /models 返回 401,先前误报 timeout——真机暴露修复)。
-    let (probe1, probe2) = if resp_probe.status.is_none() && chat_probe.status.is_none() && !key_ok
-    {
-        probe_models_http_status(base_url, api_key).await
-    } else {
-        (resp_probe.status, chat_probe.status)
-    };
-    let error = if probe1.is_none() && probe2.is_none() && !key_ok {
+    let mut statuses = [
+        resp_probe.status,
+        chat_probe.status,
+        anthropic_probe.status,
+        gemini_probe.status,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if statuses.is_empty() && !key_ok {
+        let (first, second) = probe_models_http_status(base_url, api_key).await;
+        statuses.extend(first);
+        statuses.extend(second);
+    }
+    let error = if statuses.is_empty() && !key_ok {
         Some("timeout")
-    } else if probe1 == Some(401)
-        || probe2 == Some(401)
-        || probe1 == Some(403)
-        || probe2 == Some(403)
-    {
+    } else if statuses.iter().any(|status| matches!(status, 401 | 403)) {
         Some("auth")
-    } else if !key_ok && !responses_compat && !chat_ok {
+    } else if !key_ok && !native_ok {
         Some("notfound")
     } else {
         None
     };
 
-    let suggest = if responses_compat || chat_ok {
+    let suggest = if native_ok {
         "gateway".to_string()
     } else {
         String::new()
@@ -537,6 +636,9 @@ pub async fn preflight(base_url: &str, api_key: &str, model_hint: &str) -> Prefl
         models,
         responses_compat,
         chat_ok,
+        anthropic_ok,
+        gemini_ok,
+        wire_api,
         latency_ms,
         suggest,
         error,

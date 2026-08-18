@@ -414,7 +414,7 @@ impl HealthState {
 }
 
 /// 健康探测:真实 GET 上游 `{endpoint}/models` 计时(直连上游,非经加速线;
-/// 经线计时由装配方做)。任何 HTTP 响应 → 线路可达(Ok(延迟 ms));连接/超时 → Err。
+/// 经线计时由装配方做)。只有 2xx 响应算健康，401/407/5xx 等服务错误均进入失败计数。
 pub async fn probe_line(client: &reqwest::Client, line: &AccLine) -> Result<u64, String> {
     let base = line.endpoint.trim_end_matches('/');
     let started = std::time::Instant::now();
@@ -424,8 +424,11 @@ pub async fn probe_line(client: &reqwest::Client, line: &AccLine) -> Result<u64,
         .await
         .map_err(|e| format!("连接失败: {e}"))?;
     let latency_ms = started.elapsed().as_millis() as u64;
-    let _ = resp.status();
-    Ok(latency_ms)
+    if resp.status().is_success() {
+        Ok(latency_ms)
+    } else {
+        Err(format!("服务端未就绪(HTTP {})", resp.status()))
+    }
 }
 
 /// 探测用 HTTP 客户端(no_proxy + 10s 超时,仿 probe.rs:35-41)。

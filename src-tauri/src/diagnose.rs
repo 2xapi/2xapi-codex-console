@@ -131,22 +131,32 @@ async fn real_request(p: &Provider, errors: &mut Vec<DiagError>) -> bool {
             json!({ "model": p.model, "messages": [{ "role": "user", "content": "ping" }], "max_tokens": 16 }),
         ),
         WireApi::Anthropic => (
-            format!("{base}/v1/messages"),
+            if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            },
             json!({ "model": p.model, "max_tokens": 16, "messages": [{ "role": "user", "content": "ping" }] }),
         ),
         // 多平台阶段 C:原生 generateContent ping(2xa 实测 Bearer 头亦过认证)
         WireApi::Gemini => (
-            format!("{base}/v1beta/models/{}:generateContent", p.model),
+            if base.ends_with("/v1beta") {
+                format!("{base}/models/{}:generateContent", p.model)
+            } else {
+                format!("{base}/v1beta/models/{}:generateContent", p.model)
+            },
             json!({ "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }] }),
         ),
     };
-    match client
-        .post(&url)
-        .bearer_auth(&p.api_key)
-        .json(&body)
-        .send()
-        .await
-    {
+    let request = match p.wire_api {
+        WireApi::Anthropic => client
+            .post(&url)
+            .header("x-api-key", &p.api_key)
+            .header("anthropic-version", "2023-06-01"),
+        WireApi::Gemini => client.post(&url).header("x-goog-api-key", &p.api_key),
+        _ => client.post(&url).bearer_auth(&p.api_key),
+    };
+    match request.json(&body).send().await {
         Ok(r) if r.status().is_success() => true,
         Ok(r) => {
             errors.push(err(

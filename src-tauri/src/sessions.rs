@@ -200,18 +200,18 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
         return json!({ "fixed": 0, "scanned": 0, "error": "未找到会话数据库" });
     };
 
-    // 写前整库备份(三保险)
-    let _ = std::fs::create_dir_all(backup_dir);
+    // 写前创建 SQLite 一致性快照；失败必须中止，不能带着无备份继续 UPDATE。
+    if let Err(error) = std::fs::create_dir_all(backup_dir) {
+        return json!({ "fixed": 0, "scanned": 0, "error": format!("创建备份目录失败: {error}") });
+    }
     let backup_name = format!(
-        "sessions-{}.db",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        "sessions-{}-{}.db",
+        chrono::Local::now().format("%Y%m%d-%H%M%S%.3f"),
+        uuid::Uuid::new_v4()
     );
     let backup_path = backup_dir.join(&backup_name);
-    if let Ok(data) = std::fs::read(&db_path) {
-        let _ = std::fs::write(&backup_path, &data);
-    }
 
-    let conn = match Connection::open(&db_path) {
+    let mut conn = match Connection::open(&db_path) {
         Ok(c) => c,
         Err(e) => {
             return json!({ "fixed": 0, "scanned": 0, "error": format!("打开数据库失败: {e}") })
@@ -221,13 +221,19 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
     if !has_column(&conn, catalog, "source_detail") {
         return json!({ "fixed": 0, "scanned": 0, "error": "不支持的 schema(缺 source_detail)" });
     }
+    let Some(backup_utf8) = backup_path.to_str() else {
+        return json!({ "fixed": 0, "scanned": 0, "error": "备份路径不是有效 UTF-8" });
+    };
+    if let Err(error) = conn.execute("VACUUM INTO ?1", [backup_utf8]) {
+        return json!({ "fixed": 0, "scanned": 0, "error": format!("创建会话数据库快照失败: {error}") });
+    }
 
     let mut scanned = 0u32;
     let mut fixed = 0u32;
 
     // 遍历全部 catalog 行,对账 rollout 文件存在性
-    let sql = format!("SELECT thread_id, source_detail, missing_candidate FROM {catalog}");
-    let ids_to_fix: Vec<(String, i64)> = {
+    let sql = format!("SELECT host_id, thread_id, source_detail, missing_candidate FROM {catalog}");
+    let ids_to_fix: Vec<(String, String, i64)> = {
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return json!({ "fixed": 0, "scanned": 0, "error": "查询失败" }),
@@ -235,8 +241,9 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
         let Ok(rows) = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
             ))
         }) else {
             return json!({ "fixed": 0, "scanned": 0, "error": "查询失败" });
@@ -244,7 +251,7 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
         let mut out = Vec::new();
         for row in rows.flatten() {
             scanned += 1;
-            let (tid, detail, current_missing) = row;
+            let (host_id, tid, detail, current_missing) = row;
             let exists = detail
                 .as_deref()
                 .map(|p| {
@@ -260,21 +267,35 @@ pub fn repair_sessions(codex_home: &Path, backup_dir: &Path) -> Value {
             if (current_missing.unwrap_or(0) != want_missing)
                 || (want_missing == 0 && current_missing.is_none())
             {
-                out.push((tid, want_missing));
+                out.push((host_id, tid, want_missing));
             }
         }
         out
     };
 
-    // 落库修复(每行 UPDATE)
-    for (tid, want_missing) in &ids_to_fix {
-        let upd = format!("UPDATE {catalog} SET missing_candidate = ?1 WHERE thread_id = ?2");
-        if conn
-            .execute(&upd, rusqlite::params![want_missing, tid])
-            .is_ok()
-        {
-            fixed += 1;
+    // 主键为 (host_id, thread_id)，整批在一个事务内完成；任一失败则全部回滚。
+    let transaction = match conn.transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return json!({ "fixed": 0, "scanned": scanned, "error": format!("开启修复事务失败: {error}") })
         }
+    };
+    for (host_id, tid, want_missing) in &ids_to_fix {
+        let upd = format!(
+            "UPDATE {catalog} SET missing_candidate = ?1 WHERE host_id = ?2 AND thread_id = ?3"
+        );
+        match transaction.execute(&upd, rusqlite::params![want_missing, host_id, tid]) {
+            Ok(1) => fixed += 1,
+            Ok(_) => {
+                return json!({ "fixed": 0, "scanned": scanned, "error": "会话记录在修复期间发生变化,已回滚" })
+            }
+            Err(error) => {
+                return json!({ "fixed": 0, "scanned": scanned, "error": format!("修复写入失败,已回滚: {error}") })
+            }
+        }
+    }
+    if let Err(error) = transaction.commit() {
+        return json!({ "fixed": 0, "scanned": scanned, "error": format!("提交修复失败: {error}") });
     }
 
     json!({ "fixed": fixed, "scanned": scanned })
@@ -457,6 +478,30 @@ mod tests {
         assert_eq!(get("t1"), 0);
         assert_eq!(get("t2"), 1, "缺失 rollout 应标记 missing");
         assert_eq!(get("t3"), 0, "存在文件应清除 missing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_stops_when_backup_cannot_be_created() {
+        let (root, _) = sandbox("repair-backup-fail");
+        make_catalog_db(
+            &root,
+            &[("t1", "甲", "custom", "/nonexistent/x.jsonl", 100)],
+        );
+        let invalid_backup_dir = root.join("not-a-directory");
+        std::fs::write(&invalid_backup_dir, "file").unwrap();
+
+        let result = repair_sessions(&root, &invalid_backup_dir);
+        assert!(result["error"].as_str().unwrap().contains("备份目录"));
+        let conn = Connection::open(root.join("sqlite/codex-dev.db")).unwrap();
+        let missing: i64 = conn
+            .query_row(
+                "SELECT missing_candidate FROM local_thread_catalog WHERE host_id='local' AND thread_id='t1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0, "备份失败时不得继续修复写入");
         let _ = std::fs::remove_dir_all(&root);
     }
 

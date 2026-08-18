@@ -5,8 +5,7 @@
 //! 登记表没有 = 用户手动添加,只读展示);「停用」语义 = 从平台配置移除 + 登记表留
 //! spec 标 enabled=false(启用时写回)——JSON/TOML/YAML 均无原生 disabled 字段,统一此策略。
 //!
-//! 支持平台独立于 agents 托管注册表(cursor/trae 无托管世界也可管理生态):
-//! A 段 = codex(config.toml)+cursor(mcp.json);B 段 = claude-desktop/grokbuild/opencode/hermes/trae;
+//! 支持平台与产品十平台定义一致；Gemini CLI 使用 `~/.gemini/settings.json` 的 `mcpServers`。
 //! 补齐 = openclaw(openclaw.json 的 mcp.servers 嵌套段,2026-08-17 CLI 实证:
 //! 条目 {command,args,env?,enabled?},enabled:false=原生停用,走 native_enabled 通路与 Codex 同款)。
 
@@ -30,7 +29,7 @@ pub const SUPPORTED: &[&str] = &[
     "grokbuild",
     "opencode",
     "hermes",
-    "trae",
+    "gemini",
     "workbuddy",
     "openclaw",
 ];
@@ -45,7 +44,7 @@ pub fn display_name(agent: &str) -> &'static str {
         "grokbuild" => "Grok Build",
         "opencode" => "OpenCode",
         "hermes" => "Hermes",
-        "trae" => "TRAE",
+        "gemini" => "Gemini CLI",
         "workbuddy" => "WorkBuddy",
         "openclaw" => "OpenClaw",
         _ => "未知平台",
@@ -794,7 +793,8 @@ mod tests {
             Some("openclaw"),
             "补齐:mcp.servers 载体"
         );
-        assert_eq!(supported("gemini"), None, "gemini 无 MCP 载体,B 段未入编");
+        assert_eq!(supported("gemini"), Some("gemini"));
+        assert_eq!(supported("trae"), None, "TRAE 不属于产品十平台集合");
         assert_eq!(
             spec_summary(&json!({ "command": "npx", "args": ["a", "b"] })),
             "npx a b"

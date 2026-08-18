@@ -276,6 +276,7 @@ impl EcoStore for HermesStore {
 
     fn backup(&self, backup_dir: &Path) -> Result<(), super::OpError> {
         crate::config::backup_file(&self.path, backup_dir, "eco-apply", "pre-eco")
+            .map(|_| ())
             .map_err(|e| (500, "E_IO".to_string(), e))
     }
 }

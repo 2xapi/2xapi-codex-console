@@ -9,8 +9,11 @@ var state = {
   view: "dash",        // dash | history
   selId: null,         // 当前选中供应商
   providers: [],       // GET /api/providers(pure_api 过滤后;含 agent 字段,按 agent 分流)
+  activeProviderIds: {}, // GET /api/providers.active_provider_ids(按平台隔离)
   dstate: null,        // GET /api/desktop/state {hasOfficial, gateway, hosting}(Codex 托管)
-  claude: null,        // Claude 注入式(前端本地态:null 或 {started, way, providerId, providerName, env, command, model};后端无 claude-state 接口)
+  claude: null,        // Claude 托管态:后端返回 {hosting:null|{providerId,providerName,model,way,...}}
+  claudeStateError: null,
+  claudeWayChoice: "gateway",
   hermes: null,        // Hermes 托管态(GET /api/desktop/hermes/state:{hosting:{way,entry}|null, pointer, configPath})
   codexWay: "gateway", // Codex 通路方式(会话内本地态 gateway|direct;direct 由 hasOfficial===false 门控,不落盘)
   accel: null,         // GET /api/accel/state {mode, customNode, lines, scopeNote, usage}
@@ -40,7 +43,7 @@ var state = {
   busy: null,          // 进行中动作
   loginEmail: "", loginPassword: "", loginError: "", remembered: false,
   balShow: true,       // 顶栏实时余额开关(localStorage 持久)
-  aboutVersion: null,  // GET /api/version(后端未实现时回退 "1.0.0")
+  aboutVersion: null,  // null=未请求;""=请求失败;其他=真实构建版本
   checkingUpdate: false,
   updateState: null,   // null | {latest} | {err:true}(关于页「检查更新」结果)
   confirmCb: null,
@@ -65,10 +68,17 @@ function hosting() {
   var h = d && d.hosting;
   return (h && (h.way === "gateway" || h.way === "direct")) ? h : null;
 }
-function claudeStarted() { var c = state.claude; return !!(c && c.started); }
+function claudeHosting() {
+  var c = state.claude;
+  if (!c || c.hosting === null || c.hosted === false) return null;
+  var h = c.hosting || c;
+  if (!h || h.hosted === false || h.active === false || !h.providerId) return null;
+  return h;
+}
+function claudeStarted() { return !!claudeHosting(); }
 function hermesHosted() { var h = state.hermes; return !!(h && h.hosting); }
 function hermesPointerName() { var h = state.hermes; return (h && h.pointer) || ""; }
-function claudeWay() { var c = state.claude; return (c && c.way) || "gateway"; }
+function claudeWay() { var h = claudeHosting(); return (h && h.way) || state.claudeWayChoice || "gateway"; }
 function codexWayNow() {
   var w = state.codexWay || "gateway";
   /* 直连仅在 hasOfficial === false(纯 API 模式)可用;官方登录在/状态未知 → 回落网关 */
@@ -76,8 +86,9 @@ function codexWayNow() {
   return w;
 }
 function hostedBy(id) {
-  if (state.agent === "claude") { var c = state.claude; return !!(c && c.started && c.providerId === id); }
-  if (state.agent === "hermes") return false; /* hermes 托管为整体态(条目存在),不绑死单个供应商 */
+  if (state.agent === "claude") { var h = claudeHosting(); return !!(h && h.providerId === id); }
+  if (state.agent === "hermes") return hermesHosted() && state.activeProviderIds.hermes === id;
+  if (GW_AGENTS[state.agent]) return gwHosted(state.agent) && state.activeProviderIds[state.agent] === id;
   var h = hosting(); return !!h && h.providerId === id;
 }
 function wireLabel(p) {
@@ -116,6 +127,31 @@ function fmtTime(ms) {
 function normModel(m) {
   return { name: m.name || m.id || m.model || "", contextWindow: m.contextWindow || m.context_window || null };
 }
+var CLAUDE_DESKTOP_ROLES = [
+  { role: "sonnet", label: "Sonnet", routeId: "claude-sonnet-5" },
+  { role: "opus", label: "Opus", routeId: "claude-opus-5" },
+  { role: "fable", label: "Fable", routeId: "claude-fable-5" },
+  { role: "haiku", label: "Haiku", routeId: "claude-haiku-4-5" },
+];
+function normClaudeDesktopRoutes(routes, defaultModel) {
+  var source = Array.isArray(routes) ? routes : [];
+  return CLAUDE_DESKTOP_ROLES.map(function (definition, index) {
+    var saved = source.find(function (route) {
+      var role = String((route && route.role) || "").toLowerCase();
+      return role === definition.role || role === definition.routeId;
+    }) || {};
+    return {
+      role: definition.role,
+      routeId: definition.routeId,
+      label: definition.label,
+      labelOverride: saved.labelOverride || saved.label_override || "",
+      model: saved.model || (!source.length && index === 0 ? (defaultModel || "") : ""),
+      supports1m: typeof saved.supports1m === "boolean"
+        ? saved.supports1m
+        : (typeof saved.supports_1m === "boolean" ? saved.supports_1m : true),
+    };
+  });
+}
 
 /* ── toast / confirm(页面内反馈,替换原生 alert/confirm)── */
 function showToast(msg, kind) {
@@ -145,6 +181,7 @@ function normProviders(d) {
 async function refreshProviders() {
   var d = await api.listProviders();
   state.providers = normProviders(d);
+  state.activeProviderIds = (d && d.active_provider_ids) || {};
   var mine = providersFor(state.agent);
   if (mine.length && !lineOf(state.selId)) {
     var h = hosting();
@@ -158,11 +195,14 @@ async function refreshDesktop() {
   if (h && (h.way === "direct" || h.way === "gateway")) state.codexWay = h.way;
 }
 async function refreshClaudeState() {
-  /* 后端无 claude-state 接口:注入态纯前端本地;注入的供应商若已被删除 → 复位未注入 */
-  var c = state.claude;
-  if (c && c.started) {
-    var p = providersFor("claude").find(function (x) { return x.id === c.providerId; });
-    if (!p) state.claude = null;
+  try {
+    state.claude = await api.claudeState();
+    state.claudeStateError = null;
+    var h = claudeHosting();
+    if (h && (h.way === "direct" || h.way === "gateway")) state.claudeWayChoice = h.way;
+  } catch (e) {
+    state.claude = null;
+    state.claudeStateError = e.message || "无法读取 Claude Code 托管状态";
   }
 }
 async function refreshHermesState() {
@@ -210,19 +250,19 @@ function capsSectionHtml(p) {
   var selects = dims.map(function (d) {
     return '<span style="display:inline-flex;align-items:center;gap:3px;margin-right:8px">' + d[1]
       + '<select data-a="cap-set" data-id="' + esc(p.id) + '" data-model="' + esc(p.model || "") + '" data-dim="' + d[0] + '">'
-      + '<option value="">auto</option><option value="on">on</option><option value="off">off</option>'
+      + '<option value="auto">auto</option><option value="on">on</option><option value="off">off</option>'
       + '</select></span>';
   }).join("");
   return '<div style="margin:10px 0 0;padding:10px 12px;background:rgba(120,160,255,.05);border:1px solid rgba(120,160,255,.22);border-radius:9px">'
     + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">'
     + '<span style="font-size:11.5px;color:#A8C0F0">能力(模型 ' + esc(p.model || "未设置") + ')' + manualTag + ' ' + chips + '</span>'
     + '<button class="btn ghost" data-a="cap-probe" data-id="' + esc(p.id) + '"' + (state.busy === "cap-probe" ? " disabled" : "") + '>⚡ 探测能力</button></div>'
-    + '<div style="margin-top:6px;font-size:10.5px;color:var(--muted)">覆盖:' + selects + '<span>auto=按探测;on/off=手动兜底(探测不冲);重探强制回 auto</span></div>'
+    + '<div style="margin-top:6px;font-size:10.5px;color:var(--muted)">覆盖:' + selects + '<span>auto=清除手动覆盖;on/off=手动兜底;普通探测不覆盖手动值</span></div>'
     + '</div>';
 }
 function doCapProbe(id) {
   state.busy = "cap-probe"; render();
-  api.probeCapabilities(id, { force: true }).then(function () {
+  api.probeCapabilities(id, { force: false }).then(function () {
     return refreshCapTags();
   }).then(function () {
     showToast("能力探测完成", "ok");
@@ -233,7 +273,6 @@ function doCapProbe(id) {
   });
 }
 function doCapSet(id, model, dim, val) {
-  if (!val) return; // auto 空值=不清除选择,由重探恢复
   api.capabilitySet({ providerId: id, model: model, dim: dim, val: val }).then(function () {
     return refreshCapTags();
   }).then(function () {
@@ -268,14 +307,17 @@ function renderNav() {
     chip.lastChild.textContent = " " + ((gw && gw.addr) || "127.0.0.1:8787");
     if (led) led.classList.toggle("off", !(gw && gw.alive));
   }
-  /* 托管 chip:Codex 走桌面托管,Claude 走注入式 */
+  /* 托管 chip:各平台都以对应服务端状态为准 */
   var h = hosting();
   var hc = document.getElementById("hostChip");
   if (hc) {
     hc.classList.toggle("claude", state.agent === "claude");
     if (state.agent === "claude") {
-      var c = state.claude;
-      hc.textContent = (c && c.started && c.providerName) ? "Claude · 注入 " + c.providerName : "Claude · 未注入";
+      var ch = claudeHosting();
+      hc.textContent = ch ? "Claude · 托管中 " + (ch.providerName || "") : "Claude · 未托管";
+    } else if (GW_AGENTS[state.agent]) {
+      var gh = gwState(state.agent);
+      hc.textContent = gh && gh.hosting ? agentName(state.agent) + " · 托管中" : agentName(state.agent) + " · 未托管";
     } else {
       hc.textContent = (h && h.providerName) ? "托管 · " + h.providerName : "未托管";
     }
@@ -438,7 +480,7 @@ function dashHtml() {
   if (hp && !direct && accelOn && usage && usage.degradedToDirect) {
     scopeHtml += '<div style="margin:6px 0 0;padding:8px 10px;background:rgba(229,161,59,.08);border:1px solid rgba(229,161,59,.35);border-radius:8px;font-size:11.5px;color:#EAC98F">⚠ 官方加速配额已用满,已自动切换直连;可在 ⚙ 设置 → IP 管理 刷新凭证重试。</div>';
   }
-  var selVal = hp ? hp.id : state.selId;
+  var selVal = state.selId || (hp && hp.id);
   var opts = mine.map(function (x) {
     return '<option value="' + esc(x.id) + '"' + (x.id === selVal ? " selected" : "") + '>' + esc(x.name) + (x.model ? "(" + esc(x.model) + ")" : "") + '</option>';
   }).join("");
@@ -484,16 +526,16 @@ function dashHtml() {
 /* 供应商详情卡(Codex / Claude 共用;按 agent 过滤与分支按钮) */
 function providerDetailCard(p) {
   var hb = hostedBy(p.id);
-  var tagLabel = state.agent === "claude" ? "注入中" : "托管中";
+  var tagLabel = state.agent === "claude" ? "托管中" : "托管中";
   var btns;
   if (state.agent === "claude") {
-    /* Claude 世界:启用(未注入)/停用(已注入) + 编辑 + 诊断 + 删除(注入中禁用) */
     btns = (hb
-      ? '<button class="btn" data-a="claude-stop" data-id="' + esc(p.id) + '"' + (state.busy === "claude-stop" ? " disabled" : "") + '>停用</button>'
-      : '<button class="btn primary" data-a="claude-start" data-id="' + esc(p.id) + '"' + (state.busy === "claude-start" ? " disabled" : "") + '>启用</button>')
+      ? '<button class="btn" data-a="claude-unhost"' + (state.busy === "claude-unhost" ? " disabled" : "") + '>还原官方</button>'
+      : '<button class="btn primary" data-a="claude-host" data-id="' + esc(p.id) + '"' + (state.busy === "claude-host" ? " disabled" : "") + '>'
+        + (state.busy === "claude-host" ? "正在启用…" : "启用并打开 Claude Code") + '</button>')
       + '<button class="btn" data-a="edit" data-id="' + esc(p.id) + '">编辑</button>'
       + '<button class="btn" data-a="diag">' + (state.diag && state.diag.forId === p.id ? "收起诊断" : "诊断") + '</button>'
-      + (hb ? '<button class="btn ghost" disabled>删除(注入中)</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
+      + (hb ? '<button class="btn ghost" disabled>删除(使用中)</button>' : '<button class="btn ghost danger" data-a="del" data-id="' + esc(p.id) + '">删除</button>');
   } else {
     /* Codex 世界:启用(未托管)/停用(已托管)+ 编辑 + 诊断 + 删除(托管中禁用)——与 Claude 分支同构 */
     btns = (hb
@@ -516,7 +558,7 @@ function providerDetailCard(p) {
   return html;
 }
 
-/* ── 主卡 dash(Claude:注入式托管)── */
+/* ── 主卡 dash(Claude:一键打开终端启动)── */
 function claudeEmptyHtml() {
   return '<section class="card" style="min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px">'
     + '<svg viewBox="0 0 24 24" width="40" height="40" fill="var(--c-claude)" aria-hidden="true"><path d="m4.7144 15.9555 4.7174-2.6471.079-.2307-.079-.1275h-.2307l-.7893-.0486-2.6956-.0729-2.3375-.0971-2.2646-.1214-.5707-.1215-.5343-.7042.0546-.3522.4797-.3218.686.0608 1.5179.1032 2.2767.1578 1.6514.0972 2.4468.255h.3886l.0546-.1579-.1336-.0971-.1032-.0972L6.973 9.8356l-2.55-1.6879-1.3356-.9714-.7225-.4918-.3643-.4614-.1578-1.0078.6557-.7225.8803.0607.2246.0607.8925.686 1.9064 1.4754 2.4893 1.8336.3643.3035.1457-.1032.0182-.0728-.164-.2733-1.3539-2.4467-1.445-2.4893-.6435-1.032-.17-.6194c-.0607-.255-.1032-.4674-.1032-.7285L6.287.1335 6.6997 0l.9957.1336.419.3642.6192 1.4147 1.0018 2.2282 1.5543 3.0296.4553.8985.2429.8318.091.255h.1579v-.1457l.1275-1.706.2368-2.0947.2307-2.6957.0789-.7589.3764-.9107.7468-.4918.5828.2793.4797.686-.0668.4433-.2853 1.8517-.5586 2.9021-.3643 1.9429h.2125l.2429-.2429.9835-1.3053 1.6514-2.0643.7286-.8196.85-.9046.5464-.4311h1.0321l.759 1.1293-.34 1.1657-1.0625 1.3478-.8804 1.1414-1.2628 1.7-.7893 1.36.0729.1093.1882-.0183 2.8535-.607 1.5421-.2794 1.8396-.3157.8318.3886.091.3946-.3278.8075-1.967.4857-2.3072.4614-3.4364.8136-.0425.0304.0486.0607 1.5482.1457.6618.0364h1.621l3.0175.2247.7892.522.4736.6376-.079.4857-1.2142.6193-1.6393-.3886-3.825-.9107-1.3113-.3279h-.1822v.1093l1.0929 1.0686 2.0035 1.8092 2.5075 2.3314.1275.5768-.3218.4554-.34-.0486-2.2039-1.6575-.85-.7468-1.9246-1.621h-.1275v.17l.4432.6496 2.3436 3.5214.1214 1.0807-.17.3521-.6071.2125-.6679-.1214-1.3721-1.9246L14.38 17.959l-1.1414-1.9428-.1397.079-.674 7.2552-.3156.3703-.7286.2793-.6071-.4614-.3218-.7468.3218-1.4753.3886-1.9246.3157-1.53.2853-1.9004.17-.6314-.0121-.0425-.1397.0182-1.4328 1.9672-2.1796 2.9446-1.7243 1.8456-.4128.164-.7164-.3704.0667-.6618.4008-.5889 2.386-3.0357 1.4389-1.882.929-1.0868-.0062-.1579h-.0546l-6.3385 4.1164-1.1293.1457-.4857-.4554.0608-.7467.2307-.2429 1.9064-1.3114Z"/></svg>'
@@ -524,42 +566,30 @@ function claudeEmptyHtml() {
     + '<div class="sub" style="max-width:400px">还没有 Claude 供应商。点下方「新建」添加一个 Anthropic 兼容中转站;这套列表只属于 Claude,与 Codex 完全独立。</div>'
     + '<div class="btn-row" style="justify-content:center"><button class="btn primary" data-a="new">＋ 新建供应商</button></div></section>';
 }
-function maskKey(k) {
-  var s = String(k == null ? "" : k);
-  if (!s) return "";
-  if (s.length <= 8) return s.slice(0, 2) + "…" + s.slice(-2);
-  return s.slice(0, 6) + "…" + s.slice(-4);
-}
-function claudeEnvHtml() {
-  var c = state.claude;
-  if (!c || !c.started) return "";
-  var p = c.providerId ? lineOf(c.providerId) : null;
-  var env = c.env || {};
-  var base = env.ANTHROPIC_BASE_URL || env.baseUrl || "http://127.0.0.1:8787/anthropic";
-  var rawTok = env.ANTHROPIC_AUTH_TOKEN || "";
-  var tok = rawTok ? maskKey(rawTok) : (env.authTokenMasked || (p && p.apiKeyMasked) || "");
-  var model = env.ANTHROPIC_MODEL || env.model || (p && p.model) || c.model || "";
-  var rows = '<div><div class="k">ANTHROPIC_BASE_URL</div><div class="v mono">' + esc(base) + '</div></div>';
-  if (tok) rows += '<div><div class="k">ANTHROPIC_AUTH_TOKEN</div><div class="v mono">' + esc(tok) + '</div></div>';
-  if (model) rows += '<div><div class="k">ANTHROPIC_MODEL</div><div class="v mono">' + esc(model) + '</div></div>';
-  /* 可复制启动命令:界面掩码展示,「复制」取完整命令(含 Key)进剪贴板 */
-  var cmdHtml = "";
-  if (c.command) {
-    var disp = rawTok ? c.command.split(rawTok).join(maskKey(rawTok)) : c.command;
-    cmdHtml = '<div style="margin-top:8px;display:flex;gap:6px;align-items:center">'
-      + '<code style="flex:1;min-width:0;overflow-x:auto;white-space:nowrap;font:11px var(--mono);color:var(--text);background:var(--ink);border:1px solid var(--hair);border-radius:7px;padding:6px 9px">' + esc(disp) + '</code>'
-      + '<button class="btn sm ghost" data-a="claude-copy" title="复制完整启动命令(含 Key)到剪贴板">复制</button></div>';
+function claudeManagedStatusHtml(hp) {
+  if (state.claudeStateError) {
+    return '<div class="sub" style="margin:10px 0 0;padding:8px 10px;background:rgba(229,88,88,.08);border:1px solid rgba(229,88,88,.35);border-radius:8px;color:#F0A5A5">无法读取托管状态：' + esc(state.claudeStateError) + '</div>';
+  }
+  if (!hp) {
+    return '<div class="sub" style="margin:10px 0 0;padding:8px 10px;background:var(--raised);border:1px solid var(--hair);border-radius:8px">选择供应商后点击「启用并打开 Claude Code」。软件会写入 Claude 的托管设置并自动启动，不需要复制命令。</div>';
   }
   return '<div class="sub" style="margin:10px 0 0;padding:8px 10px;background:var(--raised);border:1px solid var(--hair);border-radius:8px">'
-    + '<div class="eyebrow" style="margin:0 0 6px">已注入环境变量(Key 已掩码,不显明文)</div>'
-    + '<div class="kv" style="margin-top:0">' + rows + '</div>' + cmdHtml + '</div>';
+    + '<b>当前已托管</b> · ' + esc(hp.name || hp.providerName || "当前供应商")
+    + (hp.model ? ' · 默认模型 ' + esc(hp.model) : "")
+    + '<br><span style="color:var(--muted)">Claude Code 已使用本软件写入的设置；点击「还原官方」即可移除托管配置。</span></div>';
 }
 function claudeDashHtml() {
   var mine = providersFor("claude");
   if (!mine.length) return claudeEmptyHtml();
-  var started = claudeStarted();
-  var hp = started ? (lineOf(state.claude.providerId) || null) : null;
-  started = !!hp; /* 注入的供应商已删除 → 视为未启动,回到「启动」态 */
+  var managed = claudeHosting();
+  var started = !!managed;
+  var hp = started ? (lineOf(managed.providerId) || {
+    id: managed.providerId,
+    name: managed.providerName || managed.providerId,
+    model: managed.model || "",
+  }) : null;
+  var hpIndex = hp ? mine.findIndex(function (x) { return x.id === hp.id; }) : 0;
+  if (hpIndex < 0) hpIndex = 0;
   var acc = state.accel || {};
   var accelMode = acc.mode || "off";
   var accelOn = accelMode !== "off";
@@ -567,25 +597,19 @@ function claudeDashHtml() {
 
   var st = function (c, b, s) { return '<div class="st" style="--lc:' + c + '"><span class="dot"></span><span class="lb"><b>' + b + '</b><span>' + s + '</span></span></div>'; };
   var lk = function (c) { return '<div class="lk live" style="--lc:' + c + '"></div>'; };
-  var way = claudeWay();
-  var direct = way === "direct";
+  var way = "gateway";
+  var direct = false;
   var r, note;
   if (!hp) {
     r = st(ac, "Claude Code", "终端 CLI") + lk(ac) + st(ac, "官方 Anthropic", "claude.ai 登录");
-    note = '当前:官方直连 · 选一个供应商并点「启用」即注入中转';
-  } else if (direct) {
-    /* 通路:直连 —— Key 直注入,不经网关、无加速(两站) */
-    r = st(ac, "Claude Code", "注入式") + lk("var(--c-direct)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
-    note = '通路:直连(Key 直注入,不经网关、无加速)';
+    note = '当前:官方直连 · 选择供应商后点「启用并打开 Claude Code」';
   } else if (!accelOn) {
-    /* 通路:网关,加速关(三站) */
-    r = st(ac, "Claude Code", "注入式") + lk(ac) + st("var(--c-gw)", "网关", "127.0.0.1:8787") + lk(ac) + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
-    note = '通路:网关(注入式,不写 ~/.claude 配置)';
+    r = st(ac, "Claude Code", "托管中") + lk(ac) + st("var(--c-gw)", "网关", "127.0.0.1:8787") + lk(ac) + st(chipColor(hp, hpIndex), esc(hp.name), "中转站");
+    note = '通路:网关 · 托管设置已写入 ~/.claude/settings.json';
   } else {
-    /* 通路:网关 + 加速(四站) */
-    r = st(ac, "Claude Code", "注入式") + lk(ac) + st("var(--c-gw)", "网关", "127.0.0.1:8787")
-      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, mine.indexOf(hp)), esc(hp.name), "中转站");
-    note = '通路:网关(注入式,不写 ~/.claude 配置)';
+    r = st(ac, "Claude Code", "托管中") + lk(ac) + st("var(--c-gw)", "网关", "127.0.0.1:8787")
+      + lk("var(--c-accel)") + st("var(--c-accel)", "加速节点", "自动择优线路") + lk("var(--c-accel)") + st(chipColor(hp, hpIndex), esc(hp.name), "中转站");
+    note = '通路:网关 + 加速 · 托管设置已写入 ~/.claude/settings.json';
   }
   /* scope 提示条(与 Codex 同逻辑,agent=claude 时 scopeNote 语义同;直连无加速 → 不出条) */
   var scopeHtml = "";
@@ -605,31 +629,30 @@ function claudeDashHtml() {
   /* 详情卡在前、主卡在后(两世界一致) */
   var html = "";
   if (p) html += providerDetailCard(p);
-  html += '<section class="card"><h2>Claude Code · 主通道(注入式)</h2>'
+  var statusText = started ? (direct ? "直连 · 托管中" : "网关 · 托管中") : (state.claudeStateError ? "托管状态读取失败" : "未托管");
+  html += '<section class="card"><h2>Claude Code · 一键托管</h2>'
     + '<div class="detect">'
-    + '<span class="tag on">Claude Code · 注入式</span>'
-    + (started ? '<span class="tag" style="border-color:var(--c-claude);color:var(--c-claude)">已注入 · ' + esc(hp.name) + '</span>' : '<span class="tag">未注入</span>')
+    + '<span class="tag on">Claude Code · 裸 claude 启动</span>'
+    + (started ? '<span class="tag" style="border-color:var(--c-claude);color:var(--c-claude)">托管中 · ' + esc(hp.name) + '</span>' : '<span class="tag">' + (state.claudeStateError ? "状态异常" : "未托管") + '</span>')
     + '</div>'
     + '<div class="route">' + r + '</div>'
     + '<div class="route-mode"><span class="k" style="color:var(--c-claude)">●</span> ' + note + '</div>'
     + scopeHtml
-    + claudeEnvHtml()
+    + claudeManagedStatusHtml(hp)
     + '<div class="grid2">'
-    + '<div class="f"><label>通路方式</label><div class="seg">'
-    + '<button data-a="way" data-w="direct" aria-pressed="' + (direct) + '" style="--lc:var(--c-direct)">直连<small>Key 直注入</small></button>'
-    + '<button data-a="way" data-w="gateway" aria-pressed="' + (!direct) + '" style="--lc:var(--c-gw)">网关<small>经网关·可加速</small></button></div></div>'
+    + '<div class="f"><label>通路方式</label><div class="seg"><button data-a="way" data-w="gateway" aria-pressed="true" style="--lc:var(--c-gw);flex:1">网关<small>写入 Claude 设置 · 经网关·可加速</small></button></div></div>'
     + '<div class="f"><label>加速</label><div style="display:flex;gap:6px;align-items:center">'
     + '<div class="seg" style="flex:1">'
     + '<button data-a="accel" data-m="off" aria-pressed="' + (!accelOn) + '" style="--lc:var(--muted)"' + (direct ? " disabled" : "") + '>关</button>'
     + '<button data-a="accel" data-m="on" aria-pressed="' + (accelOn) + '" style="--lc:var(--c-accel)"' + (direct ? " disabled" : "") + '>开<small>自动择优</small></button></div>'
     + '</div><div class="sub" style="margin-top:2px">线路在 左下 ⚙ 设置 → IP 管理 里维护</div></div>'
     + '<div class="f"><label>供应商(走哪家中转)</label><select id="provSel" data-a="prov">' + opts + '</select></div>'
-    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:' + (direct ? "var(--c-direct)" : "var(--c-gw)") + ';color:' + (direct ? "var(--c-direct)" : "var(--c-gw)") + '">' + (started ? (direct ? "直连 · 已注入" : "网关 · 已注入") : "未启动") + '</span></div></div>'
+    + '<div class="f"><label>状态</label><div style="padding:6px 0"><span class="tag" style="border-color:' + (direct ? "var(--c-direct)" : "var(--c-gw)") + ';color:' + (direct ? "var(--c-direct)" : "var(--c-gw)") + '">' + statusText + '</span></div></div>'
     + '</div>'
     + '<div class="btn-row">'
     + (started
-      ? '<button class="btn" data-a="claude-stop"' + (state.busy === "claude-stop" ? " disabled" : "") + '>还原官方</button>'
-      : '<button class="btn primary" data-a="claude-start"' + (state.busy === "claude-start" ? " disabled" : "") + '>启动 Claude Code</button>')
+      ? '<button class="btn" data-a="claude-unhost"' + (state.busy === "claude-unhost" ? " disabled" : "") + '>' + (state.busy === "claude-unhost" ? "正在还原…" : "还原官方") + '</button>'
+      : '<button class="btn primary" data-a="claude-host" data-id="' + esc(state.selId || "") + '"' + (state.busy === "claude-host" ? " disabled" : "") + '>' + (state.busy === "claude-host" ? "正在启用…" : "启用并打开 Claude Code") + '</button>')
     + '<button class="btn ghost" data-a="test"' + (state.test && state.test.busy ? " disabled" : "") + '>⚡ 测试连接</button>'
     + '</div><div id="rtest"></div></section>';
   if (state.test) html = html.replace('<div id="rtest"></div>', testStepsHtml());
@@ -651,8 +674,12 @@ function testStepsHtml() {
   var d = t.data;
   var steps = [];
   steps.push(step(d.keyOk ? "✓" : "✗", d.keyOk ? "密钥有效" : "密钥无效", (d.keyOk ? ((d.models || []).length + " 个模型") : "") + " · " + (d.latencyMs != null ? d.latencyMs + "ms" : ""), !d.keyOk));
-  var proto = d.responsesCompat ? "Responses 兼容" : (d.chatOk ? "仅 Chat(网关自动转换)" : "协议未测出");
-  steps.push(step((d.responsesCompat || d.chatOk) ? "✓" : "✗", "协议判定:" + proto, d.responsesCompat ? "免转换" : (d.chatOk ? "需经网关转换" : ""), !(d.responsesCompat || d.chatOk)));
+  var protoOk = !!d.nativeOk || !!d.responsesCompat || !!d.chatOk;
+  var proto = d.anthropicOk ? "Anthropic Messages 可用"
+    : d.geminiOk ? "Gemini generateContent 可用"
+      : d.responsesCompat ? "Responses 兼容"
+        : d.chatOk ? "仅 Chat(网关自动转换)" : "协议未测出";
+  steps.push(step(protoOk ? "✓" : "✗", "协议判定:" + proto, d.responsesCompat ? "免转换" : (d.chatOk ? "需经网关转换" : "原生协议"), !protoOk));
   if (d.suggest === "gateway") steps.push(step("⚡", "建议方式:网关(推荐,零落盘)", "可一键开启托管"));
   else if (d.error) steps.push(step("✗", "无可用接入方式", d.error, true));
   else steps.push(step("⚡", "建议方式:网关", ""));
@@ -827,23 +854,25 @@ function hermesDashHtml() {
 /* ── 生态中心(开发组·生态中心 A 段):平台 tab + MCP 服务器管理 + 预设市场 ──
  * 后端契约:GET|POST /api/desktop/:agent/eco(信封 data={servers});手动条目只读(409 拒写)。
  * 总部修订(2026-08-17):三 tab 设计作废,生态管理=MCP 单页;平台清单来自 /api/desktop/eco-presets。 */
-var ECO_STATE = { agent: "codex", data: null, presets: null, agentsList: null, loading: false, pendingInstall: null, pendingParams: {} };
+var ECO_STATE = { agent: "codex", data: null, presets: null, agentsList: null, loading: false, pendingInstall: null, pendingParams: {}, requestSeq: 0, busy: null };
 /* eco 支持平台(与后端 SUPPORTED 10 平台对齐;世界内嵌生态入口按此渲染) */
-var ECO_SUPPORTED_IDS = { codex: 1, cursor: 1, claude: 1, "claude-desktop": 1, grokbuild: 1, opencode: 1, hermes: 1, trae: 1, workbuddy: 1, openclaw: 1 };
+var ECO_SUPPORTED_IDS = { codex: 1, cursor: 1, claude: 1, "claude-desktop": 1, grokbuild: 1, opencode: 1, hermes: 1, gemini: 1, workbuddy: 1, openclaw: 1 };
 function loadEco(force) {
   var agent = ECO_STATE.agent; /* 发起时的 agent;异步回填前校验,防 tab 切换竞态 */
+  var seq = ++ECO_STATE.requestSeq;
   ECO_STATE.loading = true; render();
   var p = api.ecoPresets().then(function (v) {
+    if (ECO_STATE.agent !== agent || ECO_STATE.requestSeq !== seq) return;
     ECO_STATE.presets = (v && v.presets) || [];
     ECO_STATE.agentsList = (v && v.agents) || [];
   }).catch(function () { ECO_STATE.presets = []; ECO_STATE.agentsList = []; });
   var l = api.ecoList(agent).then(function (v) {
-    if (ECO_STATE.agent !== agent) return; /* 已切平台,丢弃过期回填 */
+    if (ECO_STATE.agent !== agent || ECO_STATE.requestSeq !== seq) return; /* 已切平台,丢弃过期回填 */
     ECO_STATE.data = v;
   }).catch(function (e) {
-    if (ECO_STATE.agent !== agent) return;
+    if (ECO_STATE.agent !== agent || ECO_STATE.requestSeq !== seq) return;
     ECO_STATE.data = { error: e.message };
-  }).finally(function () { if (ECO_STATE.agent === agent) ECO_STATE.loading = false; });
+  }).finally(function () { if (ECO_STATE.agent === agent && ECO_STATE.requestSeq === seq) ECO_STATE.loading = false; });
   loadPlug();
   return Promise.all([p, l]).then(function () { if (state.view === "eco") render(); });
 }
@@ -925,32 +954,38 @@ function ecoCenterHtml() {
   return html;
 }
 function doEcoOp(op, name) {
+  var agent = ECO_STATE.agent;
   ECO_STATE.busy = name || op;
-  api.ecoOp(ECO_STATE.agent, { op: op, name: name }).then(function (v) {
+  api.ecoOp(agent, { op: op, name: name }).then(function (v) {
+    if (ECO_STATE.agent !== agent) return;
     ECO_STATE.data = v;
     var label = { install: "安装", uninstall: "卸载", enable: "启用", disable: "停用" }[op] || op;
     showToast(label + (name ? " " + name : "") + "完成", "ok");
   }).catch(function (e) {
     showToast(e.message || "操作失败", "error");
   }).finally(function () {
+    if (ECO_STATE.agent !== agent) return;
     ECO_STATE.busy = null;
     if (state.view === "eco") render();
   });
 }
 function doEcoInstall(presetId, params) {
+  var agent = ECO_STATE.agent;
   var p = (ECO_STATE.presets || []).find(function (x) { return x.id === presetId; });
   ECO_STATE.busy = presetId;
   var body = { op: "install", presetId: presetId };
   if (params) body.params = params;
-  api.ecoOp(ECO_STATE.agent, body).then(function (v) {
+  api.ecoOp(agent, body).then(function (v) {
+    if (ECO_STATE.agent !== agent) return;
     ECO_STATE.data = v;
     var envNote = (p && p.needsEnv && p.needsEnv.length)
       ? ";该服务器需要 " + p.needsEnv.join(", ") + " 环境变量,已按空值安装,请稍后在平台配置中补填"
       : "";
-    showToast("已安装到 " + ECO_STATE.agent + envNote, "ok");
+    showToast("已安装到 " + agent + envNote, "ok");
   }).catch(function (e) {
     showToast(e.message || "安装失败", "error");
   }).finally(function () {
+    if (ECO_STATE.agent !== agent) return;
     ECO_STATE.busy = null;
     ECO_STATE.pendingInstall = null;
     ECO_STATE.pendingParams = {};
@@ -1091,7 +1126,7 @@ function plugSectionHtml() {
 var PLUG2 = { tab: "market", q: "", cat: "all", detail: null, dt: "doc", ui: null,
   mode: "mock", loading: false, busy: null,
   data: [], installed: {}, enabled: {}, updates: {},
-  local: [], mySources: [], srcForm: false, cfgModels: null, cfgVals: null, cfgFailover: undefined };
+  local: [], mySources: [], source: "all", srcForm: false, cfgModels: null, cfgVals: null, cfgFailover: undefined };
 var PLUG2_FALLBACK = [
   { id: "image-describe", name: "识图 · 图片转文字", author: "官方", version: "2.0.1", cap: "识图", icon: "🖼️", ui: true,
     mount: "media_parse",
@@ -1204,9 +1239,13 @@ function plug2IconById(id) {
 /* config_values/failover/models 是用户已存配置(详情返回),必须保留进条目供配置页回显 */
 function plug2NormEntry(p) {
   p = p || {};
+  var sourceId = p.sourceId || p.source_id || "official";
+  var pluginId = p.pluginId || p.marketId || p.id || "";
+  var registryId = p.registryId || (sourceId && sourceId !== "official" ? sourceId + "." + pluginId : pluginId);
   return {
-    id: p.id, name: p.name || p.id || "", author: p.author || "官方", version: p.version || "1.0.0",
-    cap: p.cap || "", icon: p.icon || plug2IconById(p.id),
+    id: registryId, pluginId: pluginId, sourceId: sourceId, sourceName: p.sourceName || (sourceId === "official" ? "官方源" : sourceId),
+    name: p.name || pluginId || "", author: p.author || "官方", version: p.version || "1.0.0",
+    cap: p.cap || "", icon: p.icon || plug2IconById(pluginId),
     mount: p.mount || "", desc: p.desc || p.short_desc || "", power: p.power || "",
     input: p.input || {}, output: p.output || {},
     tags: p.tags || [], scenes: p.scenes || [], config: p.config || [], models: p.models || [],
@@ -1220,7 +1259,13 @@ function plug2NormMarket(mk) {
   if (!arr.length) return null;
   var f = arr[0];
   if (!f || (f.cap === undefined && f.tags === undefined && f.md === undefined)) return null;
-  return arr.map(plug2NormEntry).filter(function (x) { return !!x.id; });
+  return arr.map(function (p) {
+    var e = {};
+    Object.keys(p || {}).forEach(function (k) { e[k] = p[k]; });
+    e.sourceId = "official";
+    e.sourceName = (mk.official.source && mk.official.source.name) || "官方源";
+    return plug2NormEntry(e);
+  }).filter(function (x) { return !!x.id; });
 }
 /* 输入→输出计数:后端为 {required,properties} 对象,演示数据为数组,兼容两种 */
 function plug2InOut(p) {
@@ -1266,7 +1311,31 @@ function plug2CfgState(p) {
 function plug2Load() {
   PLUG2.loading = true;
   if (state.view === "plug") render();
-  var m = api.plugMarket().then(plug2NormMarket).catch(function () { return null; });
+  var m = api.plugMarket().then(function (mk) {
+    var official = plug2NormMarket(mk);
+    if (!official) return null;
+    var sources = ((mk && mk.sources) || []).filter(function (src) {
+      return src && src.id && src.id !== "official" && !src.builtin;
+    });
+    return Promise.all(sources.map(function (src) {
+      return api.plugSrcList(src.id).then(function (v) {
+        var plugins = ((v && v.plugins) || []).map(function (p) {
+          var e = {};
+          Object.keys(p || {}).forEach(function (k) { e[k] = p[k]; });
+          e.sourceId = src.id;
+          e.sourceName = src.name || src.id;
+          return plug2NormEntry(e);
+        }).filter(function (p) { return !!p.id; });
+        return { id: src.id, name: src.name || src.id, url: src.url || "", src: "远程源", kind: "source", plugins: plugins, error: "" };
+      }).catch(function (e) {
+        return { id: src.id, name: src.name || src.id, url: src.url || "", src: "远程源", kind: "source", plugins: [], error: e.message || "拉取失败" };
+      });
+    })).then(function (remoteSources) {
+      var remote = [];
+      remoteSources.forEach(function (src) { remote = remote.concat(src.plugins); });
+      return { data: official.concat(remote), sources: remoteSources };
+    });
+  }).catch(function () { return null; });
   var i = api.plugList().then(function (v) {
     var arr = (v && v.plugins) || [];
     var inst = {}, en = {}, list = [];
@@ -1283,12 +1352,22 @@ function plug2Load() {
       PLUG2.updates = { "image-describe": "2.1.0", "ffmpeg-frame-extract": "1.1.0" };
     } else {
       PLUG2.mode = "api";
-      PLUG2.data = mk;
+      PLUG2.data = mk.data;
+      PLUG2.mySources = mk.sources;
+      if (PLUG2.source !== "all" && PLUG2.source !== "official" && !PLUG2.mySources.some(function (src) { return src.id === PLUG2.source; })) PLUG2.source = "all";
       PLUG2.installed = (ii && ii.inst) || {};
       PLUG2.enabled = (ii && ii.en) || {};
       PLUG2.updates = {};
+      PLUG2.local = [];
       if (ii) {
         ii.list.forEach(function (x) {
+          var mt = x.meta || {};
+          if (x.source === "local" || x.source === "paste") {
+            PLUG2.local.push({
+              id: x.id, name: mt.name || mt.id || x.id, src: x.source === "paste" ? "粘贴" : "本地",
+              detail: mt.desc || mt.short_desc || mt.id || "", kind: "local", enabled: !!x.enabled
+            });
+          }
           var p = plug2ById(x.id);
           var instV = x.version || (x.meta && x.meta.version) || null;
           if (p) {
@@ -1296,8 +1375,14 @@ function plug2Load() {
             if (instV && plug2SemverGt(p.version, instV)) PLUG2.updates[x.id] = p.version;
           } else {
             /* 本地/第三方已装条目不在市场数据里 → 补进列表 */
-            var mt = x.meta || {};
-            PLUG2.data.push(plug2NormEntry({ id: x.id, name: mt.name, version: instV, short_desc: mt.short_desc, desc: mt.desc, mount: mt.mount }));
+            var sid = mt.source_id || x.source || "local";
+            PLUG2.data.push(plug2NormEntry({
+              id: mt.id || x.id, registryId: x.id, sourceId: sid,
+              sourceName: sid === "local" ? "本地" : sid, name: mt.name, version: instV,
+              short_desc: mt.short_desc, desc: mt.desc, mount: mt.mount, author: mt.author,
+              cap: mt.cap, icon: mt.icon, input: mt.input, output: mt.output, tags: mt.tags,
+              scenes: mt.scenes, config: mt.config, models: mt.models, md: mt.md, docs: mt.docs, ui: mt.ui
+            }));
           }
         });
       }
@@ -1348,7 +1433,7 @@ function plug2LocalFile(inp) {
     try { m = JSON.parse(rd.result); } catch (e) { showToast("manifest JSON 解析失败:" + e.message, "error"); return; }
     if (!m || !m.id || !m.name) { showToast("manifest 校验失败:缺 id/name", "error"); return; }
     if (PLUG2.mode !== "api") {
-      PLUG2.local.push({ id: m.id, name: m.name, src: "本地", detail: f.name + " · " + (m.desc || m.short_desc || "") });
+      PLUG2.local.push({ id: m.id, name: m.name, src: "本地", detail: f.name + " · " + (m.desc || m.short_desc || ""), kind: "local", enabled: true });
       showToast("✓ 本地插件「" + m.name + "」校验通过,已上架(演示)", "ok");
       render();
       return;
@@ -1421,9 +1506,11 @@ function plugCenterHtml() {
 /* ── 市场页:搜索 / 分类 / 列表(行 = 图标+名称+作者·版本·挂载点 | 能力 | 输入→输出 | 标签 | 状态 | 操作)── */
 function plug2MarketHtml() {
   var cats = ["all", "识图", "文生图", "图编辑", "抽帧", "语音"];
+  var sourceTabs = [{ id: "all", name: "全部来源" }, { id: "official", name: "官方源" }].concat(PLUG2.mySources || []);
   /* 分类归一:后端 cap 用 ASR/TTS,前端分类叫「语音」——按映射表归一后过滤 */
   var CAT_OF = { "ASR": "语音", "TTS": "语音" };
   var list = PLUG2.data.filter(function (p) {
+    if (PLUG2.mode === "api" && PLUG2.source !== "all" && p.sourceId !== PLUG2.source) return false;
     if (PLUG2.cat !== "all" && (CAT_OF[p.cap] || p.cap) !== PLUG2.cat) return false;
     if (PLUG2.q && (p.name + p.desc + (p.tags || []).join(" ")).toLowerCase().indexOf(PLUG2.q.toLowerCase()) < 0) return false;
     return true;
@@ -1431,7 +1518,14 @@ function plug2MarketHtml() {
   var html = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'
     + '<input data-a="plug2-search" placeholder="搜索插件(识图 / 生图 / 抽帧…)" value="' + esc(PLUG2.q) + '" style="flex:1;min-width:180px;background:var(--raised);border:1px solid var(--hair);border-radius:8px;color:var(--text);padding:8px 12px;font-size:12px">'
     + cats.map(function (c) { return '<button class="eco-tab ' + (PLUG2.cat === c ? "on" : "") + '" data-a="plug2-cat" data-v="' + c + '">' + (c === "all" ? "全部" : c) + '</button>'; }).join("")
-    + '</div>';
+    + '</div>'
+    + (PLUG2.mode === "api" ? '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-3px 0 12px"><span class="sub" style="margin:0 3px 0 0">来源</span>'
+      + sourceTabs.map(function (src) { return '<button class="eco-tab ' + (PLUG2.source === src.id ? "on" : "") + '" data-a="plug2-source" data-v="' + esc(src.id) + '">' + esc(src.name || src.id) + '</button>'; }).join("") + '</div>' : '');
+  var sourceErrors = (PLUG2.mySources || []).filter(function (src) { return !!src.error; });
+  if (sourceErrors.length) {
+    html += '<div style="margin-bottom:10px;padding:8px 10px;background:rgba(226,88,78,.08);border:1px solid rgba(226,88,78,.35);border-radius:8px;font-size:11px;color:#FFBAB4">'
+      + sourceErrors.map(function (src) { return esc(src.name || src.id) + ': ' + esc(src.error); }).join('<br>') + '</div>';
+  }
   if (!list.length) return html + '<div class="sub" style="padding:30px 0;text-align:center">没有匹配的插件;换个关键词,或到「我的设计」自己做一个。</div>';
   html += '<table class="mtable"><thead><tr><th style="width:36%">插件</th><th style="width:10%">能力</th><th style="width:12%">输入 → 输出</th><th>标签</th><th style="width:11%">状态</th><th style="width:12%">操作</th></tr></thead><tbody>'
     + list.map(plug2Row).join("") + '</tbody></table>';
@@ -1443,9 +1537,9 @@ function plug2Row(p) {
   var st = (inst ? '<span class="tag" style="border-color:var(--c-official);color:var(--c-official)">● 已启用</span>' : '<span class="tag">未安装</span>');
   return '<tr style="cursor:pointer" data-a="plug2-open" data-id="' + esc(p.id) + '">'
     + '<td><div style="display:flex;align-items:center;gap:9px">'
-    + '<span style="width:30px;height:30px;border-radius:8px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:15px;flex:none">' + p.icon + '</span>'
+    + '<span style="width:30px;height:30px;border-radius:8px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:15px;flex:none">' + esc(p.icon) + '</span>'
     + '<div style="min-width:0"><b style="font-size:12.5px">' + esc(p.name) + '</b>'
-    + '<span class="sub" style="font-size:10px;display:block">' + esc(p.author) + ' · v' + esc(p.version) + ' · 挂载 ' + esc(p.mount) + '</span></div></div></td>'
+    + '<span class="sub" style="font-size:10px;display:block">' + esc(p.sourceName || "官方源") + ' · ' + esc(p.author) + ' · v' + esc(p.version) + ' · 挂载 ' + esc(p.mount) + '</span></div></div></td>'
     + '<td>' + kindTag + '</td>'
     + '<td>' + plug2InOut(p) + '</td>'
     + '<td>' + (p.tags || []).map(function (t) { return '<span class="tag">' + esc(t) + '</span>'; }).join("") + '</td>'
@@ -1468,7 +1562,7 @@ function plug2DetailHtml(p) {
     + '<span class="sub" style="margin:0">插件详情</span></div>'
     + '<section class="card" style="background:linear-gradient(135deg,rgba(61,126,255,.07),rgba(123,92,255,.05))">'
     + '<div style="display:flex;gap:14px;align-items:flex-start">'
-    + '<span style="width:52px;height:52px;border-radius:13px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:26px;flex:none">' + p.icon + '</span>'
+    + '<span style="width:52px;height:52px;border-radius:13px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:26px;flex:none">' + esc(p.icon) + '</span>'
     + '<div style="flex:1;min-width:0"><h2 style="margin:0 0 3px;font-size:16px">' + esc(p.name) + '</h2>'
     + '<div class="sub" style="margin:0 0 6px">' + esc(p.author) + ' · v' + esc(p.version) + (hasUpdate ? ' · <span class="tag on" style="border-color:#E8A84A;color:#E8A84A">可更新 → v' + esc(PLUG2.updates[p.id]) + '</span>' : '') + '</div>'
     + '<div style="display:flex;gap:4px;flex-wrap:wrap">' + (p.tags || []).map(function (t) { return '<span class="tag">' + esc(t) + '</span>'; }).join("")
@@ -1536,7 +1630,7 @@ function plug2InstalledHtml() {
     var on = !!PLUG2.enabled[p.id];
     var hasUpdate = !!PLUG2.updates[p.id];
     return '<div style="display:flex;align-items:center;gap:12px;background:var(--raised);border:1px solid var(--hair);border-radius:12px;padding:12px 14px;margin-bottom:8px">'
-      + '<span style="width:36px;height:36px;border-radius:9px;background:#1d2640;display:flex;align-items:center;justify-content:center;font-size:18px;flex:none">' + p.icon + '</span>'
+      + '<span style="width:36px;height:36px;border-radius:9px;background:#1d2640;display:flex;align-items:center;justify-content:center;font-size:18px;flex:none">' + esc(p.icon) + '</span>'
       + '<div style="flex:1;min-width:0">'
       + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
       + '<b style="font-size:13px">' + esc(p.name) + '</b>'
@@ -1564,7 +1658,7 @@ function plug2UiHtml(p) {
     + '<span class="sub" style="margin:0">' + esc(p.name) + ' · 界面</span></div>'
     + '<section class="card">'
     + '<div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">'
-    + '<span style="width:38px;height:38px;border-radius:10px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:19px">' + p.icon + '</span>'
+    + '<span style="width:38px;height:38px;border-radius:10px;background:var(--raised);display:flex;align-items:center;justify-content:center;font-size:19px">' + esc(p.icon) + '</span>'
     + '<div><h2 style="font-size:14px;margin:0">' + esc(p.name) + '</h2>'
     + '<span class="sub" style="font-size:11px">插件自带操作界面 · 直接使用本插件能力</span></div></div>';
   if (p.cap === "识图") {
@@ -1576,8 +1670,8 @@ function plug2UiHtml(p) {
       + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">识别使用主模型 gpt-5.6(多模态直接识别);失败自动切换备用 deepseek-chat(文字链路)。</div></div>';
   } else if (p.cap === "文生图") {
     html += '<div class="f"><label>画面描述</label><input class="mono" data-pk="ui-q" placeholder="一只在星空下奔跑的机械狐狸…" value="一只在星空下奔跑的机械狐狸,赛博朋克风格" style="width:100%"></div>'
-      + '<div class="grid2" style="margin-top:8px"><div class="f"><label>尺寸</label><select class="mono" style="width:100%;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);padding:6px 9px"><option selected>1024×1024</option><option>512×512</option></select></div>'
-      + '<div class="f"><label>张数</label><input class="mono" type="number" value="1" style="width:100%"></div></div>'
+      + '<div class="grid2" style="margin-top:8px"><div class="f"><label>尺寸</label><select class="mono" data-pk="ui-size" style="width:100%;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);padding:6px 9px"><option selected>1024×1024</option><option>512×512</option></select></div>'
+      + '<div class="f"><label>张数</label><input class="mono" data-pk="ui-n" type="number" value="1" style="width:100%"></div></div>'
       + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 生成</button></div>'
       + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
       + '<div class="sub" style="font-size:10px;margin-bottom:6px">生成结果(产物自动入媒体暂存)</div>'
@@ -1591,8 +1685,8 @@ function plug2UiHtml(p) {
       + '<div id="uiResult" style="font-size:12px;line-height:1.8;color:#A9E6C3">编辑使用 gpt-image-1;新图入媒体暂存,可继续处理。</div></div>';
   } else if (p.cap === "抽帧") {
     html += '<div class="f"><label>视频(暂存 URL 或本机路径)</label><input class="mono" data-pk="ui-video" placeholder="http://127.0.0.1:8787/media/….mp4 或 /path/to/video.mp4" value="http://127.0.0.1:8787/media/demo.mp4" style="width:100%"></div>'
-      + '<div class="grid2" style="margin-top:8px"><div class="f"><label>时间点 t(秒)</label><input class="mono" type="number" value="0.5" style="width:100%"></div>'
-      + '<div class="f"><label>缩放(宽)</label><input class="mono" type="number" value="480" style="width:100%"></div></div>'
+      + '<div class="grid2" style="margin-top:8px"><div class="f"><label>时间点 t(秒)</label><input class="mono" data-pk="ui-t" type="number" value="0.5" style="width:100%"></div>'
+      + '<div class="f"><label>缩放(宽)</label><input class="mono" data-pk="ui-width" type="number" value="480" style="width:100%"></div></div>'
       + '<div class="btn-row" style="margin-top:10px"><button class="btn primary" data-a="plug2-ui-run" data-id="' + esc(p.id) + '">▶ 抽帧</button></div>'
       + '<div style="margin-top:12px;padding:12px 14px;background:var(--raised);border:1px solid var(--hair);border-radius:10px;min-height:70px">'
       + '<div class="sub" style="font-size:10px;margin-bottom:6px">抽帧结果(JPEG 入暂存)</div>'
@@ -1612,6 +1706,40 @@ function plug2UiHtml(p) {
   }
   html += '</section>';
   return html;
+}
+
+function plug2InvokeBody(p, panel) {
+  var values = {};
+  panel.querySelectorAll("[data-pk]").forEach(function (input) { values[input.dataset.pk] = input.value.trim(); });
+  if (p.cap === "识图") return { media_url: values["ui-img"] || "", prompt: values["ui-q"] || "" };
+  if (p.cap === "文生图") return {
+    prompt: values["ui-q"] || "",
+    size: (values["ui-size"] || "1024x1024").replace("×", "x"),
+    n: Math.max(1, Number(values["ui-n"] || 1))
+  };
+  if (p.cap === "图编辑") return { media_url: values["ui-img"] || "", prompt: values["ui-q"] || "" };
+  if (p.cap === "抽帧") return {
+    media_url: values["ui-video"] || "",
+    t: Number(values["ui-t"] || 0),
+    width: Math.max(1, Number(values["ui-width"] || 480))
+  };
+  if (p.cap === "ASR") return { media_url: values["ui-audio"] || "" };
+  if (p.cap === "TTS") return { text: values["ui-text"] || "" };
+  return {};
+}
+
+function plug2InvokeResult(result) {
+  var data = (result && result.data) || {};
+  if (typeof data.text === "string") return '<div style="white-space:pre-wrap">' + esc(data.text) + '</div>';
+  var media = [];
+  if (typeof data.media_url === "string") media.push(data.media_url);
+  if (Array.isArray(data.media_urls)) media = media.concat(data.media_urls);
+  if (media.length) {
+    return media.map(function (url) {
+      return '<div class="mono" style="margin-bottom:5px;color:#A9E6C3">' + esc(url) + '</div>';
+    }).join("");
+  }
+  return '<pre class="mono" style="margin:0;white-space:pre-wrap;color:#A9E6C3">' + esc(JSON.stringify(data, null, 2)) + '</pre>';
 }
 
 /* ── 我的设计(开放生态:任何人设计插件)── */
@@ -1646,11 +1774,18 @@ function plug2DesignHtml() {
   /* 我的插件/源列表 */
   if (mine.length) {
     html += '<table class="mtable" style="margin-top:14px"><thead><tr><th>我的插件 / 源</th><th style="width:12%">来源</th><th style="width:12%">状态</th><th style="width:18%">操作</th></tr></thead><tbody>'
-      + mine.map(function (m, i) {
+      + mine.map(function (m) {
+        var isSource = m.kind === "source" || PLUG2.mySources.indexOf(m) >= 0;
+        var status = isSource
+          ? (m.error ? '<span class="tag" style="border-color:#E2584E;color:#FFBAB4">拉取失败</span>' : '<span class="tag on" style="border-color:var(--c-official);color:var(--c-official)">' + ((m.plugins || []).length) + ' 个插件</span>')
+          : '<span class="tag on" style="border-color:var(--c-official);color:var(--c-official)">' + (m.enabled === false ? "已停用" : "已安装") + '</span>';
+        var action = isSource
+          ? '<button class="btn ghost" data-a="plug2-source-view" data-id="' + esc(m.id) + '">浏览</button>'
+          : '<button class="btn ghost" data-a="plug2-open" data-id="' + esc(m.id) + '">配置</button>';
         return '<tr><td><b>' + esc(m.name) + '</b><br><span class="sub" style="font-size:10px">' + esc(m.detail || m.url || "") + '</span></td>'
           + '<td><span class="tag">' + esc(m.src || "远程") + '</span></td>'
-          + '<td><span class="tag on" style="border-color:var(--c-official);color:var(--c-official)">已上架</span></td>'
-          + '<td><button class="btn ghost" data-a="plug2-src-use" data-id="' + esc(m.id) + '">安装</button> <button class="btn ghost" data-a="plug2-local-del" data-i="' + i + '">移除</button></td></tr>';
+          + '<td>' + status + '</td>'
+          + '<td>' + action + ' <button class="btn ghost" data-a="plug2-design-del" data-kind="' + (isSource ? "source" : "local") + '" data-id="' + esc(m.id) + '">移除</button></td></tr>';
       }).join("")
       + '</tbody></table>';
   } else {
@@ -1801,6 +1936,41 @@ function renderModelRows() {
   }).join("");
   tb.innerHTML = rows || '<tr><td colspan="3" style="color:var(--muted)">还没有模型;点「拉取模型」自动填写。</td></tr>';
 }
+function renderClaudeDesktopRoutes() {
+  var section = document.getElementById("claudeDesktopRoutes");
+  var tbody = document.getElementById("claudeDesktopRouteRows");
+  var options = document.getElementById("claudeDesktopModelOptions");
+  if (!section || !tbody || !state.edit) return;
+  var visible = state.agent === "claude-desktop";
+  section.style.display = visible ? "" : "none";
+  if (!visible) return;
+  var routes = state.edit.claudeDesktopModelRoutes || normClaudeDesktopRoutes([], state.edit.model);
+  tbody.innerHTML = routes.map(function (route, index) {
+    return '<tr><td class="claude-route-role">' + esc(route.label)
+      + '<span class="claude-route-id">' + esc(route.routeId) + '</span></td>'
+      + '<td><input data-cdf="label" data-ci="' + index + '" value="' + esc(route.labelOverride || "") + '" placeholder="默认显示实际模型"></td>'
+      + '<td><input data-cdf="model" data-ci="' + index + '" list="claudeDesktopModelOptions" value="' + esc(route.model || "") + '" placeholder="留空自动回退"></td>'
+      + '<td><input type="checkbox" data-cdf="supports1m" data-ci="' + index + '"' + (route.supports1m ? " checked" : "") + ' aria-label="' + esc(route.label) + ' 支持 1M"></td></tr>';
+  }).join("");
+  if (options) {
+    options.innerHTML = (state.edit.models || []).map(function (model) {
+      return '<option value="' + esc(model.name || "") + '"></option>';
+    }).join("");
+  }
+}
+function readClaudeDesktopRoutes() {
+  return CLAUDE_DESKTOP_ROLES.map(function (definition, index) {
+    var label = document.querySelector('#claudeDesktopRouteRows input[data-cdf="label"][data-ci="' + index + '"]');
+    var model = document.querySelector('#claudeDesktopRouteRows input[data-cdf="model"][data-ci="' + index + '"]');
+    var supports = document.querySelector('#claudeDesktopRouteRows input[data-cdf="supports1m"][data-ci="' + index + '"]');
+    return {
+      role: definition.role,
+      labelOverride: label ? label.value.trim() : "",
+      model: model ? model.value.trim() : "",
+      supports1m: supports ? supports.checked : true,
+    };
+  });
+}
 /* ── 预设供应商选择层(presets.js 目录:2xapi 置顶+27 家厂商;选中回填编辑弹窗) ── */
 var presetQuery = "";
 function openPresetPicker() {
@@ -1849,13 +2019,16 @@ function applyPreset(pid) {
 function openEdit(id) {
   var p = id ? lineOf(id) : null;
   var isC = state.agent === "claude";
+  var isCd = state.agent === "claude-desktop";
   var isH = state.agent === "hermes";
-  var defWire = isC ? "anthropic" : (isH ? "chat_completions" : "responses");
+  var defWire = (isC || isCd) ? "anthropic" : (isH ? "chat_completions" : "responses");
   state.edit = p
-    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, icon: p.icon || null, iconColor: p.iconColor || null, ua: p.userAgent || null, models: (p.models || []).map(normModel) }
-    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, icon: null, iconColor: null, ua: null, models: [] };
+    ? { id: p.id, isNew: false, name: p.name, baseUrl: p.baseUrl || "", apiKey: "", model: p.model || "", wireApi: p.wireApi || defWire, icon: p.icon || null, iconColor: p.iconColor || null, ua: p.userAgent || null, models: (p.models || []).map(normModel), claudeDesktopModelRoutes: normClaudeDesktopRoutes(p.claudeDesktopModelRoutes || p.claude_desktop_model_routes, p.model || "") }
+    : { id: null, isNew: true, name: "", baseUrl: "", apiKey: "", model: "", wireApi: defWire, icon: null, iconColor: null, ua: null, models: [], claudeDesktopModelRoutes: normClaudeDesktopRoutes([], "") };
   state.fieldErrors = {};
-  document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + (isC ? "Claude" : (isH ? "Hermes" : "Codex"));
+  document.getElementById("editTitle").textContent = (p ? "编辑供应商 · " + p.name : "新建供应商") + " · " + agentName(state.agent);
+  var editBox = document.getElementById("editBox");
+  if (editBox) editBox.style.width = isCd ? "760px" : "520px";
   document.getElementById("eName").value = state.edit.name;
   document.getElementById("eUrl").value = state.edit.baseUrl;
   document.getElementById("eKey").value = "";
@@ -1863,7 +2036,10 @@ function openEdit(id) {
   document.getElementById("eModel").value = state.edit.model;
   var wSel = document.getElementById("eWire");
   /* 新建一律显示「自动」(保存时落世界默认值,拉取模型探测后回写);编辑已有供应商显示当前实际协议 */
-  if (wSel) wSel.value = state.edit.isNew ? "auto" : ((["responses","chat_completions","anthropic"].indexOf(state.edit.wireApi) >= 0) ? state.edit.wireApi : "auto");
+  if (wSel) {
+    wSel.disabled = isCd;
+    wSel.value = isCd ? "anthropic" : (state.edit.isNew ? "auto" : ((["responses","chat_completions","anthropic"].indexOf(state.edit.wireApi) >= 0) ? state.edit.wireApi : "auto"));
+  }
   var uaSel = document.getElementById("eUa");
   if (uaSel) {
     uaSel.value = state.edit.ua || "";
@@ -1873,6 +2049,7 @@ function openEdit(id) {
     }
   }
   renderModelRows();
+  renderClaudeDesktopRoutes();
   document.getElementById("editMask").style.display = "";
 }
 function collectEdit() {
@@ -1902,12 +2079,16 @@ async function doSaveEdit() {
   if (!d.baseUrl) errs.baseUrl = "必填";
   if (state.edit.isNew && !d.apiKey) errs.apiKey = "新建必填";
   var models = readModelRows();
+  var desktopRoutes = state.agent === "claude-desktop" ? readClaudeDesktopRoutes() : null;
   if (errs.name || errs.baseUrl || errs.apiKey) {
     state.fieldErrors = errs;
     showToast("还有必填项未完成", "error");
     return;
   }
-  var model = d.model || (models.length ? models[0].name : "");
+  var mappedDefault = desktopRoutes
+    ? ((desktopRoutes.find(function (route) { return route.role === "sonnet" && route.model; }) || desktopRoutes.find(function (route) { return route.model; }) || {}).model || "")
+    : "";
+  var model = d.model || mappedDefault || (models.length ? models[0].name : "");
   var body = {
     name: d.name, accessMode: "pure_api", model: model,
     baseUrl: d.baseUrl, apiKey: d.apiKey || "",
@@ -1918,6 +2099,10 @@ async function doSaveEdit() {
     iconColor: state.edit.iconColor || null,
     agent: state.agent,
   };
+  if (desktopRoutes) {
+    body.wireApi = "anthropic";
+    body.claudeDesktopModelRoutes = desktopRoutes;
+  }
   state.busy = "save"; render();
   try {
     var saved = state.edit.isNew ? await api.createProvider(body) : await api.updateProvider(state.edit.id, body);
@@ -1934,6 +2119,9 @@ async function doSaveEdit() {
 }
 async function doFetchModels() {
   var d = collectEdit();
+  if (state.agent === "claude-desktop") {
+    state.edit.claudeDesktopModelRoutes = readClaudeDesktopRoutes();
+  }
   var fmBody = (!state.edit.isNew && state.edit.id) ? { id: state.edit.id } : { baseUrl: d.baseUrl, apiKey: d.apiKey };
   if (!state.edit.isNew && d.apiKey) fmBody = { id: state.edit.id, apiKey: d.apiKey };
   if (fmBody.baseUrl !== undefined && (!fmBody.baseUrl || !fmBody.apiKey)) {
@@ -1944,8 +2132,14 @@ async function doFetchModels() {
     var r = await api.fetchModels(fmBody);
     state.edit.models = (r.models || []).map(normModel);
     state.edit.reasoning_levels = Array.isArray(r.reasoning_levels) ? r.reasoning_levels.slice() : [];
-    if (!d.model && state.edit.models.length) $("#eModel").value = state.edit.models[0].name;
+    if (!d.model && state.edit.models.length) {
+      $("#eModel").value = state.edit.models[0].name;
+      if (state.agent === "claude-desktop" && state.edit.claudeDesktopModelRoutes && !state.edit.claudeDesktopModelRoutes[0].model) {
+        state.edit.claudeDesktopModelRoutes[0].model = state.edit.models[0].name;
+      }
+    }
     renderModelRows();
+    renderClaudeDesktopRoutes();
     showToast("拉取到 " + state.edit.models.length + " 个模型" + (state.edit.models.length ? ",默认模型已填入" : ""), "ok");
   } catch (e) {
     showToast("拉取模型失败:" + e.message, "error");
@@ -1972,7 +2166,7 @@ async function doHost(providerId, way) {
     if (state.agent === "hermes") {
       /* Hermes 叠加托管:固定 gateway 通路,走泛化路由 */
       var r = await api.agentHost("hermes", providerId, "gateway");
-      await refreshHermesState();
+      await Promise.all([refreshHermesState(), refreshProviders()]);
       state.selId = providerId;
       showToast(r && r.pointerSwitched === false
         ? "条目已写入;Hermes 当前默认模型指向你的第三方供应商,未自动切换(可在 hermes 内自选)"
@@ -2009,7 +2203,7 @@ async function doUnhost() {
   try {
     if (state.agent === "hermes") {
       var r = await api.agentUnhost("hermes");
-      await refreshHermesState();
+      await Promise.all([refreshHermesState(), refreshProviders()]);
       showToast(r && r.restored ? "已还原(条目已移除,指针已恢复;可从备份目录恢复)" : "当前未托管,无需还原", "ok");
     } else if (GW_AGENTS[state.agent]) {
       var g2 = await api.agentUnhost(state.agent);
@@ -2027,36 +2221,46 @@ async function doUnhost() {
   state.busy = null; render();
 }
 
-/* ── Claude 注入式托管(后端返回注入信息,前端展示/复制;停用=前端本地态)── */
-async function doClaudeStart(providerId) {
+/* ── Claude Code 托管:后端负责写入 settings.json 并启动裸 claude ── */
+async function doClaudeHost(providerId) {
   var pid = providerId || state.selId;
   if (!pid) { showToast("请先选择或新建一个供应商", "error"); return; }
-  state.busy = "claude-start"; render();
+  state.busy = "claude-host"; render();
   try {
-    var r = await api.claudeStart(claudeWay(), pid);
-    state.claude = {
-      started: true,
-      way: r.way || claudeWay(),
-      providerId: r.providerId || pid,
-      providerName: r.providerName || (lineOf(r.providerId || pid) || {}).name || "",
-      env: r.env || {},
-      command: r.command || "",
-      model: r.model || "",
-    };
-    state.selId = state.claude.providerId;
-    showToast("已注入环境变量,在终端运行 claude 即可", "ok");
+    var hosted = await api.claudeHost("gateway", pid);
+    var launched = await api.claudeLaunch("gateway", pid);
+    state.claude = Object.assign({}, hosted || {}, {
+      hosted: true,
+      launched: launched && launched.launched === true,
+      providerId: (launched && launched.providerId) || pid,
+      providerName: (launched && launched.providerName) || (hosted && hosted.providerName) || "",
+      model: (launched && launched.model) || (hosted && hosted.model) || "",
+      way: "gateway",
+    });
+    state.selId = pid;
+    state.claudeStateError = null;
+    showToast("已打开终端并自动启动，Claude Code 已托管", "ok");
+    await refreshClaudeState();
   } catch (e) {
-    state.claude = null;
-    showToast("注入失败:" + e.message, "error");
+    await refreshClaudeState();
+    showToast("Claude Code 配置已写入，但自动打开终端失败：" + (e.message || "请检查 Claude CLI 和系统自动化权限"), "error");
   }
-  state.busy = null; render();
-}
-function doClaudeStop() {
-  /* 后端无 claude-stop 接口(注入式无常驻进程):停用 = 清除前端注入态 */
-  state.claude = null;
   state.busy = null;
   render();
-  showToast("已停用注入", "ok");
+}
+async function doClaudeUnhost() {
+  state.busy = "claude-unhost"; render();
+  try {
+    var restored = await api.claudeUnhost();
+    state.claude = { hosting: null };
+    state.claudeStateError = null;
+    showToast(restored && restored.restored === false ? "当前没有 Claude 托管配置" : "已还原官方 Claude 配置", "ok");
+    await refreshClaudeState();
+  } catch (e) {
+    showToast("还原 Claude 配置失败：" + (e.message || "请重试"), "error");
+  }
+  state.busy = null;
+  render();
 }
 function copyText(t) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -2129,10 +2333,10 @@ async function doLogin() {
   var email = $('#loginForm [data-l="email"]').value.trim();
   var password = $('#loginForm [data-l="password"]').value;
   if (!email || !password) { state.loginError = "邮箱和密码都要填"; renderLoginForm(); return; }
+  var remember = ($('#loginForm [data-l="remember"]') || {}).checked !== false;
   var submit = async function (ticket, randstr) {
     try {
-      await api.login(email, password, ticket, randstr);
-      var remember = ($('#loginForm [data-l="remember"]') || {}).checked !== false;
+      await api.login(email, password, ticket, randstr, remember);
       try { remember ? await api.remember(email, password) : await api.forget(); } catch (e) { /* 记住失败不影响登录 */ }
       document.getElementById("loginMask").style.display = "none";
       state.loginError = "";
@@ -2293,6 +2497,7 @@ function setIpHtml() {
       ? '<div class="hist-row"><b style="min-width:92px">我的代理</b>'
         + '<span class="meta" style="font-family:var(--mono);font-size:11px">' + esc(myEp) + '</span>'
         + '<span class="tag">我的</span>'
+        + '<button class="btn sm ghost" data-a="ipm-enable">' + ((acc.mode === "custom") ? "已启用" : "启用") + '</button>'
         + '<button class="btn sm ghost danger" data-a="ipm-del">删除</button></div>'
       : '<div class="sub" style="padding:4px 0">还没有自己的代理;在下面添加一条。</div>')
     + '<div class="mg-tools" style="margin-top:8px"><input class="mono" id="ipmNew" data-a="ipm-new-input" style="flex:1;min-width:0;padding:6px 9px;background:var(--raised);border:1px solid var(--hair);border-radius:7px;color:var(--text);font:11.5px var(--mono)" placeholder="https://你的节点:端口 或 http://用户:密码@你的VPS:443" value="' + esc(nodeVal) + '">'
@@ -2330,6 +2535,15 @@ async function doIpmDel() {
     state.nodeDraft = "";
     await refreshAccel();
     showToast("我的代理已删除(仅本机)", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+  state.busy = null; renderSettings();
+}
+async function doIpmEnable() {
+  state.busy = "ipm"; renderSettings();
+  try {
+    await api.accelSetMode("custom");
+    await refreshAccel();
+    showToast("已启用我的代理", "ok");
   } catch (e) { showToast(e.message, "error"); }
   state.busy = null; renderSettings();
 }
@@ -2452,17 +2666,17 @@ function setAdvancedHtml() {
     + '<button class="btn sm danger" data-a="restore-official" style="margin-top:6px">执行恢复</button></div>';
 }
 function setAboutHtml() {
-  /* 惰性拉取版本号(仿 setAccountHtml 的 remembered 模式;失败回退 1.0.0) */
+  /* 惰性拉取真实构建版本;失败显示未知,不伪造版本号。 */
   if (state.aboutVersion === null) {
     api.version().then(function (v) {
-      state.aboutVersion = (v && v.version) || "1.0.0";
+      state.aboutVersion = (v && v.version) || "";
       if (state.setTab === "about") renderSettings();
     }).catch(function () {
-      state.aboutVersion = "1.0.0";
+      state.aboutVersion = "";
       if (state.setTab === "about") renderSettings();
     });
   }
-  var ver = "v" + (state.aboutVersion || "1.0.0");
+  var ver = state.aboutVersion ? ("v" + state.aboutVersion) : "版本未知";
   var upd = state.updateState;
   var updHint = upd && upd.err
     ? '<button class="btn sm ghost" data-a="about-update-link">GitHub Releases</button> 请到 Releases 查看最新版本'
@@ -2479,16 +2693,16 @@ function setAboutHtml() {
 async function doCheckUpdate() {
   if (state.checkingUpdate) return;
   state.checkingUpdate = true; renderSettings();
-  var cur = state.aboutVersion || "1.0.0";
   try {
     var r = await api.checkUpdate();
     var latest = (r && r.latest) || "";
-    if (latest && latest !== cur) {
+    var current = (r && r.current) || state.aboutVersion || "";
+    if (r && r.updateAvailable) {
       state.updateState = { latest: latest };
       showToast("发现新版本 v" + latest + ",点「去下载」查看 GitHub Releases", "ok");
     } else {
-      state.updateState = { latest: latest || cur };
-      showToast("已是最新版本 " + (latest || cur), "ok");
+      state.updateState = { latest: latest || current };
+      showToast("已是最新版本 " + (latest || current || ""), "ok");
     }
   } catch (e) {
     state.updateState = { err: true };
@@ -2498,16 +2712,112 @@ async function doCheckUpdate() {
   renderSettings();
 }
 async function doRestoreOfficial() {
-  var yes = await askConfirm("恢复官方配置?", "清除本软件写入的全部托管痕迹(config 托管段 / auth Key),~/.codex 回到官方初始状态;操作前自动备份,可从 备份 找回。");
+  var yes = await askConfirm("恢复全部平台官方配置?", "先记录当前托管态并创建配置快照,再依次清除九个平台的托管痕迹;若任一平台失败,会尽力恢复操作前的托管态并汇总结果。");
   if (!yes) return;
   state.busy = "restore"; renderSettings();
   try {
-    try { await api.snapshot(); } catch (e) { /* 备份失败不阻断 */ }
-    var r = await api.desktopUnhost();
-    await refreshAll();
-    showToast(r && r.restored ? "已恢复官方配置(已自动备份)" : "当前未托管,无需恢复", "ok");
-  } catch (e) { showToast(e.message, "error"); }
-  state.busy = null; render();
+    var platforms = [
+      { id: "codex", name: "Codex" },
+      { id: "workbuddy", name: "WorkBuddy" },
+      { id: "hermes", name: "Hermes" },
+      { id: "gemini", name: "Gemini" },
+      { id: "grokbuild", name: "Grok Build" },
+      { id: "opencode", name: "OpenCode" },
+      { id: "openclaw", name: "OpenClaw" },
+      { id: "claude-desktop", name: "Claude Desktop" },
+      { id: "cursor", name: "Cursor" }
+    ];
+    try {
+      await Promise.all([refreshAll(), refreshHermesState()].concat(Object.keys(GW_AGENTS).map(function (agent) { return refreshGwState(agent); })));
+    } catch (e) {
+      showToast("读取当前托管状态失败,已中止恢复:" + (e.message || "未知错误"), "error");
+      return;
+    }
+    var missingStates = [];
+    if (!state.dstate) missingStates.push("Codex");
+    if (!state.hermes) missingStates.push("Hermes");
+    Object.keys(GW_AGENTS).forEach(function (agent) { if (!gwState(agent)) missingStates.push((GW_META[agent] && GW_META[agent].label) || agent); });
+    if (missingStates.length) {
+      showToast("无法确认当前托管状态,已中止恢复:" + missingStates.join("、"), "error");
+      return;
+    }
+    var before = {};
+    platforms.forEach(function (platform) {
+      if (platform.id === "codex") {
+        var codexHosting = hosting();
+        before.codex = codexHosting ? { hosted: true, providerId: codexHosting.providerId || state.activeProviderIds.codex || "", way: codexHosting.way || "gateway" } : { hosted: false };
+      } else if (platform.id === "hermes") {
+        before.hermes = { hosted: hermesHosted(), providerId: state.activeProviderIds.hermes || "", way: "gateway" };
+      } else {
+        before[platform.id] = { hosted: gwHosted(platform.id), providerId: state.activeProviderIds[platform.id] || "", way: "gateway" };
+      }
+    });
+    var snapshot;
+    try {
+      snapshot = await api.snapshot();
+    } catch (e) {
+      showToast("快照创建失败,已中止恢复:" + (e.message || "未知错误"), "error");
+      return;
+    }
+    var restored = 0, untouched = 0, failures = [];
+    for (var i = 0; i < platforms.length; i++) {
+      var platform = platforms[i];
+      try {
+        var result = platform.id === "codex" ? await api.desktopUnhost() : await api.agentUnhost(platform.id);
+        if (result && result.restored) restored++; else untouched++;
+      } catch (e) {
+        failures.push(platform.name + ": " + (e.message || "恢复失败"));
+      }
+    }
+    var rollbackOk = [], rollbackFailures = [];
+    if (failures.length) {
+      for (var rollbackIndex = 0; rollbackIndex < platforms.length; rollbackIndex++) {
+        var rollbackPlatform = platforms[rollbackIndex];
+        var previous = before[rollbackPlatform.id] || {};
+        if (!previous.hosted) continue;
+        if (!previous.providerId) {
+          rollbackFailures.push(rollbackPlatform.name + ": 缺少操作前供应商 ID");
+          continue;
+        }
+        try {
+          if (rollbackPlatform.id === "codex") await api.desktopHost(previous.providerId, previous.way || "gateway");
+          else await api.agentHost(rollbackPlatform.id, previous.providerId, "gateway");
+          rollbackOk.push(rollbackPlatform.name);
+        } catch (e) {
+          if (rollbackPlatform.id === "codex" && snapshot && snapshot.path) {
+            try {
+              await api.restoreConfig(snapshot.path);
+              rollbackOk.push("Codex 配置快照");
+              continue;
+            } catch (restoreError) {
+              rollbackFailures.push("Codex: 重新托管失败(" + (e.message || "未知错误") + "),快照恢复也失败(" + (restoreError.message || "未知错误") + ")");
+              continue;
+            }
+          }
+          rollbackFailures.push(rollbackPlatform.name + ": " + (e.message || "回滚失败"));
+        }
+      }
+    }
+    var refreshError = "";
+    try {
+      await Promise.all([refreshAll(), refreshHermesState()].concat(Object.keys(GW_AGENTS).map(function (agent) { return refreshGwState(agent); })));
+    } catch (e) {
+      refreshError = e.message || "状态刷新失败";
+    }
+    if (failures.length || refreshError) {
+      var summary = failures.length ? "恢复未完成:操作阶段已还原 " + restored + " 个,无需处理 " + untouched + " 个" : "恢复完成但状态刷新失败:已还原 " + restored + " 个,无需处理 " + untouched + " 个";
+      if (failures.length) summary += ";失败 " + failures.length + " 个(" + failures.join("; ") + ")";
+      if (rollbackOk.length) summary += ";已回滚 " + rollbackOk.length + " 项(" + rollbackOk.join("、") + ")";
+      if (rollbackFailures.length) summary += ";回滚失败 " + rollbackFailures.length + " 项(" + rollbackFailures.join("; ") + ")";
+      if (refreshError) summary += ";状态刷新失败:" + refreshError;
+      showToast(summary, "error");
+    } else {
+      showToast(restored ? "全部平台恢复完成:已还原 " + restored + " 个,无需处理 " + untouched + " 个(快照已创建)" : "全部平台当前均未托管(快照已创建)", "ok");
+    }
+  } finally {
+    state.busy = null;
+    render();
+  }
 }
 
 /* ── 事件(单一委托,无内联 onclick)── */
@@ -2593,20 +2903,28 @@ document.addEventListener("click", function (ev) {
       break;
     case "plug2-tab": PLUG2.tab = t.dataset.t; PLUG2.detail = null; PLUG2.cfgModels = null; render(); break;
     case "plug2-cat": PLUG2.cat = t.dataset.v; render(); break;
+    case "plug2-source": PLUG2.source = t.dataset.v; render(); break;
+    case "plug2-source-view":
+      PLUG2.source = t.dataset.id; PLUG2.tab = "market"; PLUG2.detail = null; PLUG2.cfgModels = null; render(); break;
     case "plug2-dt": PLUG2.dt = t.dataset.t; render(); break;
     case "plug2-open": plug2OpenDetail(t.dataset.id, "cfg"); break;
     case "plug2-doc": plug2OpenDetail(t.dataset.id, "doc"); break;
     case "plug2-back": PLUG2.detail = null; PLUG2.cfgModels = null; render(); break;
     case "plug2-install": {
       var id2 = t.dataset.id;
+      var marketPlugin = plug2ById(id2);
       var done = function () {
         PLUG2.installed[id2] = 1; PLUG2.enabled[id2] = true;
         PLUG2.tab = "installed"; PLUG2.detail = null;
         showToast("已安装:点「配置」填写 API / Key / 模型后即可使用", "ok");
       };
       if (PLUG2.mode !== "api") { done(); render(); break; }
+      if (!marketPlugin) { showToast("插件不存在或来源尚未加载", "error"); break; }
       PLUG2.busy = id2;
-      api.plugInstallId(id2).then(done).catch(function (e) { showToast(e.message || "安装失败", "error"); })
+      var install = marketPlugin.sourceId && marketPlugin.sourceId !== "local"
+        ? api.plugInstall(marketPlugin.sourceId, marketPlugin.pluginId)
+        : api.plugInstallId(id2);
+      install.then(done).catch(function (e) { showToast(e.message || "安装失败", "error"); })
         .finally(function () { PLUG2.busy = null; render(); });
       break;
     }
@@ -2654,7 +2972,28 @@ document.addEventListener("click", function (ev) {
     case "plug2-ui-back": PLUG2.ui = null; render(); break;
     case "plug2-ui-run": {
       var uir = document.getElementById("uiResult");
-      if (uir) { uir.innerHTML = "处理中…"; setTimeout(function () { uir.innerHTML = "✓ 完成(演示):结果已返回并存入媒体暂存,可继续喂给下游流程。"; }, 1200); }
+      var uiPlugin = plug2ById(t.dataset.id);
+      var uiPanel = t.closest("section");
+      if (!uir || !uiPlugin || !uiPanel) break;
+      if (PLUG2.mode !== "api") {
+        uir.textContent = "后端插件 API 当前不可用,未执行任何操作。";
+        showToast("插件 API 不可用,没有产生结果", "error");
+        break;
+      }
+      var invokeBody = plug2InvokeBody(uiPlugin, uiPanel);
+      t.disabled = true;
+      uir.textContent = "处理中…";
+      api.plugInvoke(uiPlugin.id, invokeBody).then(function (result) {
+        if (!result || result.ok !== true) {
+          var pluginError = result && result.error;
+          throw new Error((pluginError && (pluginError.human || pluginError.message)) || "插件执行失败");
+        }
+        uir.innerHTML = plug2InvokeResult(result);
+        showToast("插件执行完成", "ok");
+      }).catch(function (e) {
+        uir.textContent = "执行失败:" + (e.message || "未知错误");
+        showToast(e.message || "插件执行失败", "error");
+      }).finally(function () { t.disabled = false; });
       break;
     }
     case "plug2-mup": {
@@ -2686,7 +3025,7 @@ document.addEventListener("click", function (ev) {
         try { m = JSON.parse(pk["d-json"]); } catch (e) { showToast("manifest JSON 解析失败:" + e.message, "error"); break; }
         if (!m || !m.id || !m.name) { showToast("manifest 校验失败:缺 id/name", "error"); break; }
         if (PLUG2.mode !== "api") {
-          PLUG2.local.push({ id: m.id, name: m.name, src: "AI", detail: m.desc || m.short_desc || "" });
+          PLUG2.local.push({ id: m.id, name: m.name, src: "AI", detail: m.desc || m.short_desc || "", kind: "local", enabled: true });
           PLUG2.srcForm = false;
           showToast("✓ manifest 校验通过,已上架到「我的源」(演示)", "ok");
           render();
@@ -2701,7 +3040,7 @@ document.addEventListener("click", function (ev) {
       } else if (pk["r-id"] && pk["r-name"] && pk["r-url"]) {
         /* 远程清单 */
         if (PLUG2.mode !== "api") {
-          PLUG2.mySources.push({ id: pk["r-id"], name: pk["r-name"], url: pk["r-url"] });
+          PLUG2.mySources.push({ id: pk["r-id"], name: pk["r-name"], url: pk["r-url"], src: "远程源", kind: "source", plugins: [], error: "" });
           PLUG2.srcForm = false;
           showToast("远程源已添加(演示)", "ok");
           render();
@@ -2718,27 +3057,30 @@ document.addEventListener("click", function (ev) {
       }
       break;
     }
-    case "plug2-src-use": {
-      var id6 = t.dataset.id;
-      var done = function () {
-        PLUG2.installed[id6] = 1; PLUG2.enabled[id6] = true;
-        showToast("已安装", "ok");
-      };
-      if (PLUG2.mode !== "api") { done(); showToast("已安装(演示)", "ok"); render(); break; }
-      PLUG2.busy = id6;
-      api.plugInstallId(id6).then(done).catch(function (e) { showToast(e.message || "安装失败", "error"); })
-        .finally(function () { PLUG2.busy = null; render(); });
-      break;
-    }
-    case "plug2-local-del": {
-      var i9 = +t.dataset.i;
-      var mine = PLUG2.local.concat(PLUG2.mySources);
-      var it = mine[i9];
-      if (it) {
-        var li = PLUG2.local.indexOf(it);
-        if (li >= 0) PLUG2.local.splice(li, 1); else { var si = PLUG2.mySources.indexOf(it); if (si >= 0) PLUG2.mySources.splice(si, 1); }
+    case "plug2-design-del": {
+      var designId = t.dataset.id;
+      var designKind = t.dataset.kind;
+      if (PLUG2.mode !== "api") {
+        var target = designKind === "source" ? PLUG2.mySources : PLUG2.local;
+        var targetIndex = target.findIndex(function (it) { return it.id === designId; });
+        if (targetIndex >= 0) target.splice(targetIndex, 1);
+        render();
+        break;
       }
-      render();
+      var confirmRemove = designKind === "source"
+        ? askConfirm("删除远程源?", "将先卸载该源已经安装的全部插件,确认全部卸载并持久化后再删除源。")
+        : Promise.resolve(true);
+      confirmRemove.then(function (confirmed) {
+        if (!confirmed) return null;
+        PLUG2.busy = designId; render();
+        return designKind === "source" ? api.plugSrcDel(designId) : api.plugRemove(designId);
+      }).then(function (result) {
+        if (!result) return;
+        var removedCount = result && Array.isArray(result.removedPlugins) ? result.removedPlugins.length : 0;
+        showToast(designKind === "source" ? "远程源已删除" + (removedCount ? ",并卸载 " + removedCount + " 个关联插件" : "") : "本地插件已删除", "ok");
+      })
+        .catch(function (e) { showToast(e.message || "删除失败", "error"); })
+        .finally(function () { PLUG2.busy = null; plug2Load(); });
       break;
     }
     case "eco-jump":
@@ -2759,6 +3101,7 @@ document.addEventListener("click", function (ev) {
       renderSettings(); renderTopAuth(); break;
     case "ipm-toggle": break; /* 官方线路本期只读 */
     case "ipm-add": doIpmAdd(); break;
+    case "ipm-enable": doIpmEnable(); break;
     case "ipm-del": doIpmDel(); break;
     case "ipm-test": doIpmTest(); break;
     case "ipm-refresh": doIpmRefresh(); break;
@@ -2787,6 +3130,10 @@ document.addEventListener("click", function (ev) {
     case "del": {
       var delp = lineOf(t.dataset.id);
       if (!delp) break;
+      if (hostedBy(delp.id)) {
+        showToast("该供应商正在被 " + agentName(state.agent) + " 托管,请先还原官方", "error");
+        break;
+      }
       askConfirm("删除供应商「" + delp.name + "」?", "将移除该供应商的地址与 Key(仅从本软件移除,不影响你的 " + (state.agent === "claude" ? "Claude" : "Codex") + " 配置)。此操作不可撤销。").then(function (yes) {
         if (!yes) return;
         api.deleteProvider(delp.id).then(function () {
@@ -2850,20 +3197,12 @@ document.addEventListener("click", function (ev) {
       break;
     case "way":
       if (state.agent === "claude") {
-        state.claude = state.claude || {};
-        state.claude.way = t.dataset.w;
+        state.claudeWayChoice = t.dataset.w === "direct" ? "direct" : "gateway";
       } else {
         state.codexWay = t.dataset.w === "direct" ? "direct" : "gateway";
       }
       render();
       break;
-    case "claude-copy": {
-      var cmd = state.claude && state.claude.command;
-      if (!cmd) { showToast("没有可复制的启动命令", "error"); break; }
-      copyText(cmd).then(function () { showToast("已复制启动命令,粘贴到终端运行", "ok"); })
-        .catch(function () { showToast("复制失败,请手动复制命令", "error"); });
-      break;
-    }
     case "gw-start":
       (async function () {
         state.busy = "gw-start"; render();
@@ -2878,14 +3217,14 @@ document.addEventListener("click", function (ev) {
         state.busy = null; render();
       })();
       break;
-    case "claude-start":
-      askConfirm("启动 Claude Code?", "注入环境变量(ANTHROPIC_BASE_URL 等)并生成注入式启动命令,不动 ~/.claude 配置。").then(function (yes) {
-        if (yes) doClaudeStart(t.dataset.id || state.selId);
+    case "claude-host":
+      askConfirm("启用 Claude Code 托管?", "软件会把当前供应商写入 ~/.claude/settings.json，并自动打开 Claude Code。你不需要复制或输入命令。").then(function (yes) {
+        if (yes) doClaudeHost(t.dataset.id || state.selId);
       });
       break;
-    case "claude-stop":
-      askConfirm("停用注入?", "清除注入态,Claude Code 回到官方 Anthropic。").then(function (yes) {
-        if (yes) doClaudeStop();
+    case "claude-unhost":
+      askConfirm("还原官方 Claude 配置?", "软件会移除自己写入 ~/.claude/settings.json 的托管内容，Claude Code 恢复官方配置。已有文件会先由后端备份。").then(function (yes) {
+        if (yes) doClaudeUnhost();
       });
       break;
     case "diag": doDiag(); break;
@@ -2916,10 +3255,12 @@ document.addEventListener("change", function (ev) {
     var id = sel.value;
     state.selId = id;
     if (state.agent === "claude") {
-      if (claudeStarted()) doClaudeStart(id); /* 已注入:切供应商 = 重新注入 */
-      else render();
+      render(); /* 只有点击启动按钮才打开新终端,切换供应商不产生副作用。 */
     } else if (state.agent === "hermes") {
       if (hermesHosted()) doHost(id, "gateway"); /* 已托管:切供应商 = 条目热更新 */
+      else render();
+    } else if (GW_AGENTS[state.agent]) {
+      if (gwHosted(state.agent)) doHost(id, "gateway");
       else render();
     } else if (hosting()) doHost(id); /* 已托管:切供应商 = 网关热切换 */
     else render();

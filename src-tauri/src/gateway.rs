@@ -7,12 +7,13 @@
 //! - 本文件为 **M3a：透传 + key 注入 + 热切换**。Responses↔Chat 协议转换（FR-5）在 M3b 实现（届时按 `wire_api=chat_completions` 在 `/responses` 入口做转换）。
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{HeaderValue, Request, Response, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Json},
 };
 use futures_util::StreamExt;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,15 +27,18 @@ pub async fn proxy_responses(State(s): State<Arc<AppState>>, req: Request<Body>)
     dispatch(&s, req, "responses", "codex").await
 }
 
-/// 文生图入口(C 段,`/v1/images/generations` 双形态):codex active 供应商直通上游
+/// 文生图入口(C 段,`/v1/images/generations` 双形态):codex active 供应商经统一加速链转发
 /// /v1/images/generations(侦察实测 2xa 支持,b64 形态)。成功(200 且 data 有图)即
 /// `mark_dim(image_out=yes)` 单维实证标记——免探测成本,失败不标(参数错≠能力无)。
 pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     // 托盘「网关开/关」守卫(/v1/images/generations 不走 dispatch,入口处单独拦截)
-    if !s.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    if !s
+        .tray_gate_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return err_resp(StatusCode::SERVICE_UNAVAILABLE, "网关已由托盘关闭");
     }
-    let provider = match crate::providers::get_active(&s.providers_path) {
+    let provider = match crate::providers::get_active_for_agent(&s.providers_path, "codex") {
         Some(p) => p,
         None => return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择供应商"),
     };
@@ -43,7 +47,39 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
     }
     // Key 池(一期):多 Key 轮询
     let provider = crate::keypool::apply(&s.keypool, provider);
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    let line = accel_plan(&s, &provider.base_url, &provider.api_key);
+    let line = ensure_line_cred(&s, line, &provider.base_url, &provider.api_key).await;
+    let direct_client = match build_client(&provider) {
+        Ok(c) => c,
+        Err(e) => {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("build client: {e}"),
+            )
+        }
+    };
+    let timeout = Duration::from_secs(provider.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+    let line_client = match &line {
+        Some((l, _)) => match build_line_client(l, timeout) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return err_resp(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("build line client: {e}"),
+                )
+            }
+        },
+        None => None,
+    };
+    if let Some((l, pk)) = &line {
+        eprintln!(
+            "[GW] images accel line={} endpoint={} per_key={} (直连兜底开启)",
+            l.id, l.endpoint, pk
+        );
+    }
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
@@ -57,36 +93,57 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
     } else {
         format!("{base}/v1/images/generations")
     };
-    let client = match build_client(&provider) {
-        Ok(c) => c,
-        Err(e) => {
-            return err_resp(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("build client: {e}"),
-            )
-        }
-    };
-    let resp = client
-        .post(&target)
-        .header(
+    let usage_started = std::time::Instant::now();
+    let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
+        let mut request = client.post(&target).header(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", provider.api_key),
-        )
-        .body(body_bytes.to_vec())
-        .send()
-        .await;
-    let upstream = match resp {
-        Ok(r) => r,
-        Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("上游不可达: {e}")),
+        );
+        if let Some(ua) = provider.user_agent.as_deref().filter(|s| !s.is_empty()) {
+            request = request.header(reqwest::header::USER_AGENT, ua);
+        }
+        if let Some(headers) = provider.custom_headers.as_ref() {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+        if let Some(content_type) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type.clone());
+        }
+        if !body_bytes.is_empty() {
+            request = request.body(body_bytes.clone());
+        }
+        request
+    };
+    let (upstream, send_meta) = match send_with_accel(
+        &s,
+        &provider.api_key,
+        &line,
+        &line_client,
+        &direct_client,
+        timeout,
+        &build_rb,
+    )
+    .await
+    {
+        Ok(sent) => sent,
+        Err((resp, meta)) => {
+            usage_log(&s, &provider, "images", usage_started, &meta, false);
+            s.keypool.mark_failure(&provider.id, &provider.api_key);
+            return resp;
+        }
     };
     // 成功判定+单维实证标记(200 且 data[0] 有 b64_json/url → image_out=yes)
     let status = upstream.status();
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
-        Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &format!("读响应失败: {e}")),
+        Err(e) => {
+            usage_log(&s, &provider, "images", usage_started, &send_meta, false);
+            return err_resp(StatusCode::BAD_GATEWAY, &format!("读响应失败: {e}"));
+        }
     };
-    if status.is_success() {
-        let has_image = serde_json::from_slice::<serde_json::Value>(&bytes)
+    let has_image = if status.is_success() {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
             .and_then(|v| {
                 v.get("data").and_then(|d| d.as_array()).map(|a| {
@@ -95,7 +152,19 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
                             .any(|x| x.get("b64_json").is_some() || x.get("url").is_some())
                 })
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    usage_log(
+        &s,
+        &provider,
+        "images",
+        usage_started,
+        &send_meta,
+        status.is_success() && has_image,
+    );
+    if status.is_success() {
         if has_image && !model.is_empty() {
             crate::capprobe::mark_dim(
                 &s.codex_home,
@@ -184,6 +253,83 @@ pub async fn proxy_anthropic(State(s): State<Arc<AppState>>, req: Request<Body>)
     dispatch_anthropic(&s, req).await
 }
 
+/// Claude Code 模型目录：返回当前 Claude active 供应商登记的全部模型。
+/// Claude CLI 会在 `/model` 和启动校验时读取该接口；不能把请求转成上游 `/models`,
+/// 因为上游可能是 Responses 协议且不一定提供 Anthropic 模型目录。
+pub async fn proxy_anthropic_models(State(s): State<Arc<AppState>>) -> Response<Body> {
+    anthropic_models(&s, None)
+}
+
+/// Claude Code 模型详情：兼容 CLI 对单个模型的探测。
+pub async fn proxy_anthropic_model(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+) -> Response<Body> {
+    anthropic_models(&s, Some(model_id.as_str()))
+}
+
+fn anthropic_models(state: &AppState, requested_id: Option<&str>) -> Response<Body> {
+    let Some(provider) = crate::providers::get_provider_for_agent(&state.providers_path, "claude")
+    else {
+        return err_resp(StatusCode::SERVICE_UNAVAILABLE, "请先选择 Claude 供应商");
+    };
+    if provider.access_mode == AccessMode::Official {
+        return err_resp(StatusCode::BAD_REQUEST, "Official 模式不走网关");
+    }
+
+    let mut names = provider
+        .models
+        .iter()
+        .filter_map(|model| {
+            let name = model.name.trim();
+            (!name.is_empty()).then(|| (name.to_string(), model.display_name.clone()))
+        })
+        .collect::<Vec<_>>();
+    if names.is_empty() && !provider.model.trim().is_empty() {
+        names.push((provider.model.trim().to_string(), None));
+    }
+    names.dedup_by(|left, right| left.0 == right.0);
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let entries = names
+        .iter()
+        .map(|(id, display_name)| {
+            json!({
+                "type": "model",
+                "id": id,
+                "display_name": display_name.as_deref().unwrap_or(id),
+                "created_at": created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(model_id) = requested_id {
+        let Some(model) = entries.iter().find(|model| model["id"] == model_id) else {
+            return err_resp(
+                StatusCode::NOT_FOUND,
+                "所选模型不在当前 Claude 供应商目录中",
+            );
+        };
+        return Json(model.clone()).into_response();
+    }
+
+    let first_id = entries
+        .first()
+        .and_then(|model| model["id"].as_str())
+        .map(ToOwned::to_owned);
+    let last_id = entries
+        .last()
+        .and_then(|model| model["id"].as_str())
+        .map(ToOwned::to_owned);
+    Json(json!({
+        "data": entries,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id,
+    }))
+    .into_response()
+}
+
 /// Claude 转发(Claude 接入批次):与 Codex 路径(dispatch)隔离——
 /// - 取 agent=claude 的 active 供应商(规则见 providers::get_provider_for_agent,global active 是 codex 时取 claude 首个);
 /// - 注入该供应商 api_key 作 `Authorization: Bearer <key>`(Key 只走上游,不进日志),透传到供应商 base_url 的 `/v1/messages`;
@@ -211,7 +357,10 @@ async fn dispatch_anthropic_for(
     agent: &str,
 ) -> Response<Body> {
     // 托盘「网关开/关」守卫:关闭时全部代理入口统一 503 人话(同 dispatch/proxy_images)
-    if !state.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .tray_gate_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return err_resp(StatusCode::SERVICE_UNAVAILABLE, "网关已由托盘关闭");
     }
     let provider = match crate::providers::get_provider_for_agent(&state.providers_path, agent) {
@@ -265,6 +414,7 @@ async fn dispatch_anthropic_for(
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
+    let body_bytes = rewrite_anthropic_request_model(agent, &provider, body_bytes);
 
     // 媒体关卡(超融合二期):同 codex 通道(模型取请求体 model,与 codex 通路一致);
     // 纯文本零路径变化
@@ -307,7 +457,7 @@ async fn dispatch_anthropic_for(
         rb
     };
 
-    let upstream = match send_with_accel(
+    let (upstream, send_meta) = match send_with_accel(
         state,
         &provider.api_key,
         &line,
@@ -318,31 +468,34 @@ async fn dispatch_anthropic_for(
     )
     .await
     {
-        Ok(r) => r,
-        Err(resp) => return resp,
+        Ok(sent) => sent,
+        Err((resp, meta)) => {
+            usage_log(state, &provider, "anthropic", _usage_started, &meta, false);
+            return resp;
+        }
     };
 
     // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
     if is_html_upstream(&upstream) {
+        usage_log(
+            state,
+            &provider,
+            "anthropic",
+            _usage_started,
+            &send_meta,
+            false,
+        );
         return err_resp(StatusCode::BAD_GATEWAY, HTML_UPSTREAM_ERR);
     }
 
     // 用量台账(仪表盘后端):落一行(尽力而为,不阻塞)
-    crate::usage_stats::log_request(
-        &state.codex_home,
-        &crate::usage_stats::ReqLog {
-            ts: chrono::Utc::now().timestamp(),
-            provider_id: provider.id.clone(),
-            provider_name: provider.name.clone(),
-            key_masked: crate::usage_stats::mask_key(&provider.api_key),
-            route: "anthropic".into(),
-            line: line
-                .as_ref()
-                .map(|(l, _)| l.id.clone())
-                .unwrap_or_else(|| "direct".into()),
-            latency_ms: _usage_started.elapsed().as_millis() as u64,
-            ok: upstream.status().is_success(),
-        },
+    usage_log(
+        state,
+        &provider,
+        "anthropic",
+        _usage_started,
+        &send_meta,
+        upstream.status().is_success(),
     );
 
     // 原样透传（FR-4.11）：上游状态码 + body 流式回传，不做协议转换
@@ -361,6 +514,39 @@ async fn dispatch_anthropic_for(
         Ok(r) => r,
         Err(_) => err_resp(StatusCode::BAD_GATEWAY, "build response body"),
     }
+}
+
+fn rewrite_anthropic_request_model(
+    agent: &str,
+    provider: &crate::providers::Provider,
+    body_bytes: Bytes,
+) -> Bytes {
+    if agent != "claude-desktop" {
+        return body_bytes;
+    }
+
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&body_bytes) else {
+        return body_bytes;
+    };
+    let Some(requested_model) = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return body_bytes;
+    };
+    let Some(upstream_model) =
+        crate::agents::claude_desktop::map_request_model(provider, &requested_model)
+    else {
+        return body_bytes;
+    };
+    if upstream_model == requested_model {
+        return body_bytes;
+    }
+    body["model"] = json!(upstream_model);
+    serde_json::to_vec(&body)
+        .map(Bytes::from)
+        .unwrap_or(body_bytes)
 }
 
 /// Gemini 流量转发入口(`/v1beta/models/{model}:{action}`,server.rs 注册)。
@@ -396,7 +582,10 @@ async fn dispatch_gemini(
     req: Request<Body>,
 ) -> Response<Body> {
     // 托盘「网关开/关」守卫:关闭时全部代理入口统一 503 人话(同 dispatch/proxy_images)
-    if !state.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .tray_gate_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return gemini_err(
             StatusCode::SERVICE_UNAVAILABLE,
             "UNAVAILABLE",
@@ -499,6 +688,7 @@ async fn dispatch_gemini(
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
 
+    let usage_started = std::time::Instant::now();
     match provider.wire_api {
         // ── 透传:上游原生 generateContent(2xa 实测路由存在,Key 头 x-goog-api-key 与 Bearer 均可)──
         crate::providers::WireApi::Gemini => {
@@ -518,7 +708,6 @@ async fn dispatch_gemini(
                 body_bytes.len()
             );
 
-            let _usage_started = std::time::Instant::now();
             let build_rb = |client: &reqwest::Client| -> reqwest::RequestBuilder {
                 let mut rb = client
                     .post(&target)
@@ -537,7 +726,7 @@ async fn dispatch_gemini(
                 }
                 rb
             };
-            let upstream = match send_with_accel(
+            let (upstream, send_meta) = match send_with_accel(
                 state,
                 &provider.api_key,
                 &line,
@@ -548,29 +737,25 @@ async fn dispatch_gemini(
             )
             .await
             {
-                Ok(r) => r,
-                Err(resp) => return resp,
+                Ok(sent) => sent,
+                Err((resp, meta)) => {
+                    usage_log(state, &provider, "gemini", usage_started, &meta, false);
+                    return resp;
+                }
             };
             // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
             if is_html_upstream(&upstream) {
+                usage_log(state, &provider, "gemini", usage_started, &send_meta, false);
                 return gemini_err(StatusCode::BAD_GATEWAY, "UNAVAILABLE", HTML_UPSTREAM_ERR);
             }
             // 用量台账(仪表盘后端)
-            crate::usage_stats::log_request(
-                &state.codex_home,
-                &crate::usage_stats::ReqLog {
-                    ts: chrono::Utc::now().timestamp(),
-                    provider_id: provider.id.clone(),
-                    provider_name: provider.name.clone(),
-                    key_masked: crate::usage_stats::mask_key(&provider.api_key),
-                    route: "gemini".into(),
-                    line: line
-                        .as_ref()
-                        .map(|(l, _)| l.id.clone())
-                        .unwrap_or_else(|| "direct".into()),
-                    latency_ms: _usage_started.elapsed().as_millis() as u64,
-                    ok: upstream.status().is_success(),
-                },
+            usage_log(
+                state,
+                &provider,
+                "gemini",
+                usage_started,
+                &send_meta,
+                upstream.status().is_success(),
             );
             let status =
                 StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -639,7 +824,7 @@ async fn dispatch_gemini(
                 }
                 rb
             };
-            let upstream = match send_with_accel(
+            let (upstream, send_meta) = match send_with_accel(
                 state,
                 &provider.api_key,
                 &line,
@@ -650,14 +835,26 @@ async fn dispatch_gemini(
             )
             .await
             {
-                Ok(r) => r,
-                Err(resp) => return resp,
+                Ok(sent) => sent,
+                Err((resp, meta)) => {
+                    usage_log(state, &provider, "gemini", usage_started, &meta, false);
+                    return resp;
+                }
             };
 
             // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
             if is_html_upstream(&upstream) {
+                usage_log(state, &provider, "gemini", usage_started, &send_meta, false);
                 return gemini_err(StatusCode::BAD_GATEWAY, "UNAVAILABLE", HTML_UPSTREAM_ERR);
             }
+            usage_log(
+                state,
+                &provider,
+                "gemini",
+                usage_started,
+                &send_meta,
+                upstream.status().is_success(),
+            );
 
             // 上游非成功:包装为 Gemini 错误形态(状态码透传)
             if !upstream.status().is_success() {
@@ -755,21 +952,60 @@ async fn dispatch_gemini(
 /// 全局 active 若属其他 agent,取本 agent sort_index 最小者,不串台。
 /// hermes 接入(B 阶段):`/hermes/chat/completions` 走同一 dispatch,agent="hermes"。
 /// 媒体关卡(超融合二期,方案红线:纯文本请求零路径变化):
-/// body 无媒体标记直接放行(字节预检,纯文本零解析零开销);
-/// 含图(OpenAI image_url/input_image / Anthropic image block / input_audio)
+/// body 无图片结构直接放行;
+/// 含图(OpenAI image_url/input_image / Anthropic image block / Gemini inlineData)
 /// → 查 provider::model 的 image_in 探测标签:不支持 → 400 人话前置拦截
 /// (上游明确拒时上游会报,上游静默吞时这里拦下——A 段 M1/M2 定案);
 /// Unknown 放行(未探测不误伤),audio 维度一期未探测故不拦。
+fn contains_image_input(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(contains_image_input),
+        serde_json::Value::Object(object) => {
+            if object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| matches!(kind, "image_url" | "input_image" | "image"))
+            {
+                return true;
+            }
+            if object.contains_key("image_url") {
+                return true;
+            }
+            for key in ["inlineData", "inline_data"] {
+                if object
+                    .get(key)
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|data| data.get("mimeType").or_else(|| data.get("mime_type")))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|mime| mime.starts_with("image/"))
+                {
+                    return true;
+                }
+            }
+            if object
+                .get("source")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|source| source.get("media_type"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|mime| mime.starts_with("image/"))
+            {
+                return true;
+            }
+            object.values().any(contains_image_input)
+        }
+        _ => false,
+    }
+}
+
 fn media_gate(
     state: &AppState,
     provider: &crate::providers::Provider,
     model: &str,
     body: &[u8],
 ) -> Option<Response<Body>> {
-    let has_media =
-        body.windows(5).any(|w| w == b"image") || body.windows(11).any(|w| w == b"input_audio");
-    if !has_media {
-        return None; // 纯文本:零路径变化
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !contains_image_input(&parsed) {
+        return None;
     }
     let model = if model.is_empty() {
         &provider.model
@@ -799,7 +1035,10 @@ async fn dispatch(
     agent: &str,
 ) -> Response<Body> {
     // 托盘「网关开/关」守卫:关闭时全部代理入口统一 503 人话(含 /v1/* 及 agent 通路)
-    if !state.tray_gate_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .tray_gate_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return err_resp(StatusCode::SERVICE_UNAVAILABLE, "网关已由托盘关闭");
     }
     // FR-4.9 热切换：每次都重新读 active
@@ -952,7 +1191,7 @@ async fn dispatch(
     // ── 换线重试:首发带 line 的 client;连接层失败且 line 存在 → 用直连 client 重试一次。
     // send() 返回 Ok 前未向客户端写任何字节,故「已开始写响应(中途断流)」绝不重试是天然成立的。
     // 407 判别/换线重试整段抽为 send_with_accel(R1 /anthropic 接线共用,行为与原内联等价)。
-    let upstream = match send_with_accel(
+    let (upstream, send_meta) = match send_with_accel(
         state,
         &provider.api_key,
         &line,
@@ -963,8 +1202,9 @@ async fn dispatch(
     )
     .await
     {
-        Ok(r) => r,
-        Err(resp) => {
+        Ok(sent) => sent,
+        Err((resp, meta)) => {
+            usage_log(state, &provider, "codex", _usage_started, &meta, false);
             // Key 池打点:发送层失败(含超时)冷却当前 Key(单 Key 无池,打点为 no-op)
             state.keypool.mark_failure(&provider.id, &provider.api_key);
             return resp;
@@ -972,24 +1212,17 @@ async fn dispatch(
     };
     // 纵深防御:上游返回 HTML 页面(如 base_url 缺 /v1 命中中转站 Web UI)→ 不透传,人话错误
     if is_html_upstream(&upstream) {
+        usage_log(state, &provider, "codex", _usage_started, &send_meta, false);
         return err_resp(StatusCode::BAD_GATEWAY, HTML_UPSTREAM_ERR);
     }
     // 用量台账(仪表盘后端):落一行(尽力而为,不阻塞)
-    crate::usage_stats::log_request(
-        &state.codex_home,
-        &crate::usage_stats::ReqLog {
-            ts: chrono::Utc::now().timestamp(),
-            provider_id: provider.id.clone(),
-            provider_name: provider.name.clone(),
-            key_masked: crate::usage_stats::mask_key(&provider.api_key),
-            route: "codex".into(),
-            line: line
-                .as_ref()
-                .map(|(l, _)| l.id.clone())
-                .unwrap_or_else(|| "direct".into()),
-            latency_ms: _usage_started.elapsed().as_millis() as u64,
-            ok: upstream.status().is_success(),
-        },
+    usage_log(
+        state,
+        &provider,
+        "codex",
+        _usage_started,
+        &send_meta,
+        upstream.status().is_success(),
     );
     eprintln!(
         "[GW] ← upstream {} conv={:?}",
@@ -1359,6 +1592,38 @@ fn build_line_client(line: &AccLine, timeout: Duration) -> Result<reqwest::Clien
         .map_err(|e| format!("client: {e}"))
 }
 
+#[derive(Clone)]
+struct SendMeta {
+    line: String,
+    degraded_to_direct: bool,
+}
+
+type SendResult = Result<(reqwest::Response, SendMeta), (Response<Body>, SendMeta)>;
+
+fn usage_log(
+    state: &AppState,
+    provider: &crate::providers::Provider,
+    route: &str,
+    started: std::time::Instant,
+    meta: &SendMeta,
+    ok: bool,
+) {
+    crate::usage_stats::log_request(
+        &state.codex_home,
+        &crate::usage_stats::ReqLog {
+            ts: chrono::Utc::now().timestamp(),
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            key_masked: crate::usage_stats::mask_key(&provider.api_key),
+            route: route.into(),
+            line: meta.line.clone(),
+            degraded_to_direct: meta.degraded_to_direct,
+            latency_ms: started.elapsed().as_millis() as u64,
+            ok,
+        },
+    );
+}
+
 /// 加速发送核心(R1 抽共用,dispatch 与 dispatch_anthropic 共享):
 /// 首发 = 命中线的 client(未命中/加速关 = 直连 client);Ok 但代理 407 或 Err 呈现代理
 /// 认证失败(CONNECT 阶段 407)→ 非 per-Key(legacy/custom)人话化 502 不绕线,per-Key 走
@@ -1373,12 +1638,23 @@ async fn send_with_accel<F>(
     direct_client: &reqwest::Client,
     timeout: Duration,
     build_rb: &F,
-) -> Result<reqwest::Response, Response<Body>>
+) -> SendResult
 where
     F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
 {
     let used_line = line_client.is_some();
     let per_key = line.as_ref().map(|(_, pk)| *pk).unwrap_or(false);
+    let line_meta = SendMeta {
+        line: line
+            .as_ref()
+            .map(|(line, _)| line.id.clone())
+            .unwrap_or_else(|| "direct".into()),
+        degraded_to_direct: false,
+    };
+    let direct_meta = SendMeta {
+        line: "direct".into(),
+        degraded_to_direct: used_line,
+    };
     let first = line_client.as_ref().unwrap_or(direct_client);
     match build_rb(first).send().await {
         Ok(r) => {
@@ -1387,13 +1663,13 @@ where
             if used_line && r.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
                 if !per_key {
                     eprintln!("[GW] line 凭证无效(407)");
-                    return Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"));
+                    return Err((err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"), line_meta));
                 }
                 let line_ref = &line.as_ref().expect("used_line ⇒ line").0;
                 resolve_407_and_retry(state, api_key, line_ref, timeout, direct_client, build_rb)
                     .await
             } else {
-                Ok(r)
+                Ok((r, line_meta))
             }
         }
         Err(e) => {
@@ -1401,7 +1677,7 @@ where
                 // CONNECT 阶段的 407 以 Err(hyper ProxyAuthRequired) 形态出现:per-Key 同判别
                 if !per_key {
                     eprintln!("[GW] line 代理认证失败: {e}");
-                    return Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"));
+                    return Err((err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"), line_meta));
                 }
                 eprintln!("[GW] per-Key 代理认证失败,重签判别: {e}");
                 let line_ref = &line.as_ref().expect("used_line ⇒ line").0;
@@ -1410,20 +1686,30 @@ where
             } else if used_line {
                 eprintln!("[GW] line 失败({e}),换直连重试一次");
                 match build_rb(direct_client).send().await {
-                    Ok(r) => Ok(r),
-                    Err(e2) if e2.is_timeout() => {
-                        Err(err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"))
-                    }
+                    Ok(r) => Ok((r, direct_meta)),
+                    Err(e2) if e2.is_timeout() => Err((
+                        err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
+                        direct_meta,
+                    )),
                     Err(e2) => {
                         eprintln!("[GW] ✗ upstream ERR: {e2}");
-                        Err(err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"))
+                        Err((
+                            err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"),
+                            direct_meta,
+                        ))
                     }
                 }
             } else if e.is_timeout() {
-                Err(err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"))
+                Err((
+                    err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
+                    direct_meta,
+                ))
             } else {
                 eprintln!("[GW] ✗ upstream ERR: {e}");
-                Err(err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"))
+                Err((
+                    err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"),
+                    direct_meta,
+                ))
             }
         }
     }
@@ -1439,14 +1725,29 @@ async fn resolve_407_and_retry<F>(
     timeout: Duration,
     direct_client: &reqwest::Client,
     build_rb: &F,
-) -> Result<reqwest::Response, Response<Body>>
+) -> SendResult
 where
     F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
 {
     let retry_line = match resolve_407_perkey(state, api_key, line, timeout).await {
-        Resolve407::Invalid => return Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效")),
+        Resolve407::Invalid => {
+            return Err((
+                err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"),
+                SendMeta {
+                    line: line.id.clone(),
+                    degraded_to_direct: false,
+                },
+            ))
+        }
         Resolve407::NewClient(c) => Some(c),
         Resolve407::Direct => None,
+    };
+    let meta = SendMeta {
+        line: retry_line
+            .as_ref()
+            .map(|_| line.id.clone())
+            .unwrap_or_else(|| "direct".into()),
+        degraded_to_direct: retry_line.is_none(),
     };
     let client = retry_line.as_ref().unwrap_or(direct_client);
     match build_rb(client).send().await {
@@ -1456,15 +1757,19 @@ where
                 && r2.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED =>
         {
             eprintln!("[GW] 重签后仍 407");
-            Err(err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"))
+            Err((err_resp(StatusCode::BAD_GATEWAY, "节点凭证无效"), meta))
         }
-        Ok(r2) => Ok(r2),
-        Err(e2) if e2.is_timeout() => {
-            Err(err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"))
-        }
+        Ok(r2) => Ok((r2, meta)),
+        Err(e2) if e2.is_timeout() => Err((
+            err_resp(StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
+            meta,
+        )),
         Err(e2) => {
             eprintln!("[GW] ✗ upstream ERR: {e2}");
-            Err(err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"))
+            Err((
+                err_resp(StatusCode::BAD_GATEWAY, "upstream unreachable"),
+                meta,
+            ))
         }
     }
 }
@@ -1614,7 +1919,6 @@ mod tests {
             oclaw_home: root.join("oclaw"),
             cd_home: root.join("cdsupport"),
             cursor_home: root.join("cursorhome"),
-            trae_home: root.join("traehome"),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
             tray_gate_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             launcher: Default::default(),
@@ -1639,6 +1943,77 @@ mod tests {
         let p = providers::create(path, input).unwrap();
         providers::set_active(path, &p.id);
         p.id
+    }
+
+    fn claude_desktop_mapping_provider() -> crate::providers::Provider {
+        crate::providers::Provider {
+            model: "fallback-model".into(),
+            claude_desktop_model_routes: vec![
+                crate::providers::ClaudeDesktopModelRoute {
+                    role: "sonnet".into(),
+                    model: "gpt-5.6".into(),
+                    label_override: Some("GPT".into()),
+                    supports_1m: true,
+                },
+                crate::providers::ClaudeDesktopModelRoute {
+                    role: "opus".into(),
+                    model: "gpt-5.6-sol".into(),
+                    label_override: None,
+                    supports_1m: true,
+                },
+                crate::providers::ClaudeDesktopModelRoute {
+                    role: "fable".into(),
+                    model: "gpt-5.5".into(),
+                    label_override: None,
+                    supports_1m: false,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claude_desktop_request_models_are_mapped_before_forwarding() {
+        let provider = claude_desktop_mapping_provider();
+        let cases = [
+            ("claude-sonnet-5", "gpt-5.6"),
+            ("claude-opus-5", "gpt-5.6-sol"),
+            ("claude-fable-5", "gpt-5.5"),
+            ("claude-haiku-4-5", "gpt-5.6"),
+        ];
+
+        for (requested, expected) in cases {
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({"model": requested, "messages": []})).unwrap(),
+            );
+            let rewritten = rewrite_anthropic_request_model("claude-desktop", &provider, body);
+            let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+            assert_eq!(value["model"], expected);
+        }
+    }
+
+    #[test]
+    fn anthropic_model_rewrite_is_scoped_and_unknown_models_pass_through() {
+        let provider = claude_desktop_mapping_provider();
+        let body = Bytes::from_static(br#"{"model":"claude-sonnet-5","messages":[]}"#);
+        assert_eq!(
+            rewrite_anthropic_request_model("claude", &provider, body.clone()),
+            body
+        );
+
+        let unknown = Bytes::from_static(br#"{"model":"custom-model","messages":[]}"#);
+        assert_eq!(
+            rewrite_anthropic_request_model("claude-desktop", &provider, unknown.clone()),
+            unknown
+        );
+    }
+
+    fn usage_rows(codex_home: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(codex_home.join("usage-stats.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     /// 启动一个 mock 上游，返回 (base_url, 收到的 Authorization 列表)。
@@ -1679,6 +2054,34 @@ mod tests {
                     }
                 }
             }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), seen)
+    }
+
+    async fn mock_status_upstream(
+        status: StatusCode,
+        resp_body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let app = Router::new().fallback(post(
+            move |h: axum::http::HeaderMap, _b: axum::body::Bytes| {
+                let seen = seen_clone.clone();
+                async move {
+                    let auth = h
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from)
+                        .unwrap_or_default();
+                    seen.lock().unwrap().push(auth);
+                    (status, resp_body)
+                }
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1817,6 +2220,7 @@ mod tests {
         let pd = providers::ProviderData {
             schema_version: 1,
             active_provider_id: Some("p-to".into()),
+            active_provider_ids: std::collections::HashMap::from([("codex".into(), "p-to".into())]),
             providers: vec![providers::Provider {
                 id: "p-to".into(),
                 name: "T".into(),
@@ -1933,10 +2337,7 @@ mod tests {
         .await;
         assert_eq!(r2.status(), StatusCode::OK);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            seen.lock().unwrap().pop().as_deref(),
-            Some("curl/8.6.0")
-        );
+        assert_eq!(seen.lock().unwrap().pop().as_deref(), Some("curl/8.6.0"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2127,7 +2528,7 @@ mod tests {
             serde_json::json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] })
                 .to_string();
         let resp = proxy_gemini(
-            State(Arc::new(state)),
+            State(Arc::new(state.clone())),
             axum::extract::Path("gemini-2.5-flash:generateContent".into()),
             req_gemini("gemini-2.5-flash:generateContent", None, body),
         )
@@ -2155,6 +2556,13 @@ mod tests {
         assert_eq!(up["messages"][0]["role"], "user");
         assert_eq!(up["messages"][0]["content"], "hi");
         assert_eq!(up["stream"], false);
+        let summary = crate::usage_stats::summary(&state.codex_home);
+        assert_eq!(summary["providers"][0]["count"], 1);
+        assert_eq!(summary["providers"][0]["routes"][0], "gemini");
+        let usage = usage_rows(&state.codex_home);
+        assert_eq!(usage[0]["route"], "gemini");
+        assert_eq!(usage[0]["line"], "direct");
+        assert_eq!(usage[0]["ok"], true);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2576,6 +2984,97 @@ mod tests {
             crate::capprobe::tri_of(&state.codex_home, &pid, "gpt-test", "image_out"),
             crate::capprobe::Tri::Yes
         );
+        let summary = crate::usage_stats::summary(&state.codex_home);
+        assert_eq!(summary["providers"][0]["count"], 1);
+        assert_eq!(summary["providers"][0]["routes"][0], "images");
+        let usage = usage_rows(&state.codex_home);
+        assert_eq!(usage[0]["route"], "images");
+        assert_eq!(usage[0]["line"], "direct");
+        assert_eq!(usage[0]["ok"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn images_accel_uses_per_key_cred_and_logs_line() {
+        let (base, upstream_seen) =
+            mock_upstream(r#"{"created":1,"data":[{"url":"https://example.test/i.png"}]}"#).await;
+        let (proxy_url, proxy_seen) = mock_proxy(Some(("img-user", "img-pass"))).await;
+        let (state, providers_path, root) = make_state("img-accel-usage");
+        add_provider(&providers_path, &base, "sk-img-accel-0001");
+        put_cred(&state, "sk-img-accel-0001", "img-user", "img-pass", false);
+        set_accel(
+            &state,
+            "official",
+            vec![test_line(
+                "img-line",
+                &proxy_url,
+                &["127.0.0.1"],
+                Some(Cred {
+                    user: "shared".into(),
+                    pass: "shared-wrong".into(),
+                }),
+            )],
+            "",
+        );
+
+        let resp = proxy_images(
+            State(Arc::new(state.clone())),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-test","prompt":"cat"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !proxy_seen.lock().unwrap().is_empty(),
+            "图片请求应经加速代理"
+        );
+        assert_eq!(
+            upstream_seen.lock().unwrap().first().map(String::as_str),
+            Some("Bearer sk-img-accel-0001")
+        );
+        let summary = crate::usage_stats::summary(&state.codex_home);
+        assert_eq!(summary["providers"][0]["count"], 1);
+        assert_eq!(summary["providers"][0]["routes"][0], "images");
+        let usage = usage_rows(&state.codex_home);
+        assert_eq!(usage[0]["route"], "images");
+        assert_eq!(usage[0]["line"], "img-line");
+        assert_eq!(usage[0]["ok"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn images_upstream_error_logs_failed_usage() {
+        let (base, _seen) = mock_status_upstream(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"upstream failed"}"#,
+        )
+        .await;
+        let (state, providers_path, root) = make_state("img-error-usage");
+        add_provider(&providers_path, &base, "sk-img-error");
+        let resp = proxy_images(
+            State(Arc::new(state.clone())),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"gpt-test","prompt":"x"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let summary = crate::usage_stats::summary(&state.codex_home);
+        assert_eq!(summary["providers"][0]["count"], 1);
+        assert_eq!(summary["providers"][0]["routes"][0], "images");
+        assert_eq!(summary["providers"][0]["okRate"], 0.0);
+        let usage = usage_rows(&state.codex_home);
+        assert_eq!(usage[0]["route"], "images");
+        assert_eq!(usage[0]["line"], "direct");
+        assert_eq!(usage[0]["ok"], false);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2630,6 +3129,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         assert!(media_gate(&state, &p, "", b"{\"input\":\"plain text\"}").is_none());
+        assert!(media_gate(&state, &p, "", br#"{"input":"explain image processing"}"#).is_none());
+        assert!(media_gate(
+            &state,
+            &p,
+            "",
+            br#"{"input":[{"type":"input_audio","audio":"..."}]}"#
+        )
+        .is_none());
         // ④ 标签=支持:带图放行
         let caps_yes = crate::capprobe::Caps {
             image_in: crate::capprobe::Tri::Yes,
@@ -2893,14 +3400,16 @@ mod tests {
     /// 客户端拿到人话错误而非 HTML。
     #[tokio::test]
     async fn chat_html_upstream_returns_human_error_not_html() {
-        let html = "<!DOCTYPE html><html><head><title>2xa</title></head><body>welcome</body></html>";
+        let html =
+            "<!DOCTYPE html><html><head><title>2xa</title></head><body>welcome</body></html>";
         let (base, _seen) = mock_chat_upstream(html, "text/html").await;
         let (state, providers_path, root) = make_state("html-def");
         add_provider(&providers_path, &base, "sk-html");
 
         let resp = proxy_chat(
             State(Arc::new(state)),
-            req_post_chat(r#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#).await,
+            req_post_chat(r#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#)
+                .await,
         )
         .await;
         assert_eq!(
@@ -3089,6 +3598,13 @@ mod tests {
             1,
             "直连重试应恰好命中上游一次"
         );
+        let usage = usage_rows(&root.join("codex"));
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0]["line"], "direct");
+        assert_eq!(usage[0]["degraded_to_direct"], true);
+        assert_eq!(usage[0]["ok"], true);
+        let summary = crate::usage_stats::summary(&root.join("codex"));
+        assert_eq!(summary["providers"][0]["directFallbackCount"], 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3253,7 +3769,6 @@ mod tests {
             oclaw_home: s.oclaw_home.clone(),
             cd_home: s.cd_home.clone(),
             cursor_home: s.cursor_home.clone(),
-            trae_home: s.trae_home.clone(),
             keypool: std::sync::Arc::new(crate::keypool::KeyPool::new()),
             tray_gate_enabled: s.tray_gate_enabled.clone(),
             launcher: s.launcher.clone(),
@@ -3717,6 +4232,11 @@ mod tests {
             "凭证错误不应换直连命中上游"
         );
         assert!(!px_seen.lock().unwrap().is_empty(), "代理应看到请求");
+        let usage = usage_rows(&root.join("codex"));
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0]["line"], "l1");
+        assert_eq!(usage[0]["degraded_to_direct"], false);
+        assert_eq!(usage[0]["ok"], false);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4090,7 +4610,6 @@ mod verify_wb_path {
             oclaw_home: root.clone(),
             cd_home: root.clone(),
             cursor_home: root.clone(),
-            trae_home: root.clone(),
             launcher: Default::default(),
             health: Arc::new(crate::acclines::HealthState::new(vec![])),
             accel: Arc::new(Mutex::new(crate::server::AccelCfg::default())),
