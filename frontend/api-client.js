@@ -141,10 +141,6 @@
     activateOfficial: () => request("POST", "/api/providers/activate-official"),
     previewConfig: (provider) => request("POST", "/api/providers/preview-config", { body: provider }),
     diagnose: (id) => request("POST", "/api/providers/diagnose", { body: { id } }),
-    // 超融合 A 线一期:能力探测/标签/注册表
-    probeCapabilities: (id, body) => request("POST", "/api/providers/" + encodeURIComponent(id) + "/probe-capabilities", { body }),
-    capabilityTags: () => request("GET", "/api/capability-tags"),
-    capabilitySet: (body) => request("POST", "/api/capability-tags", { body }),
     fetchModels: (body) => request("POST", "/api/providers/fetch-models", { body }),
     fetchBalance: (id) => request("POST", "/api/providers/fetch-balance", { body: { id } }),
     // ── 健康（不走信封，04 §2）──
@@ -320,11 +316,18 @@
       return p; // {ok:true, latencyMs}
     },
 
-    // ── 历史会话管理(阶段 3,任务书 §四)──
-    sessions: (page, size, provider) => request("GET", "/api/sessions?page=" + (page || 1) + "&size=" + (size || 50) + "&provider=" + encodeURIComponent(provider || "")),
-    sessionsRepair: () => request("POST", "/api/sessions/repair"),
+    // ── Codex++ 风格会话管理 ──
+    sessions: (page, size, snapshotId) => request("GET", "/api/sessions?page=" + (page || 1) + "&size=" + (size || 50) + (snapshotId ? "&snapshotId=" + encodeURIComponent(snapshotId) : "")),
+    sessionsInspect: () => request("GET", "/api/sessions/inspect"),
+    sessionsRepair: (targetProvider) => request("POST", "/api/sessions/repair", { body: { targetProvider: targetProvider } }),
+    sessionsJob: (id) => request("GET", "/api/sessions/jobs/" + encodeURIComponent(id)),
+    sessionsResume: (id) => request("POST", "/api/sessions/" + encodeURIComponent(id) + "/resume"),
+    sessionsDeletePreview: (ids) => request("POST", "/api/sessions/delete-preview", { body: { ids: ids } }),
+    sessionsDelete: (confirmToken) => request("POST", "/api/sessions/delete", { body: { confirmToken: confirmToken } }),
+    sessionsUndoDelete: (backupId) => request("POST", "/api/sessions/delete/undo", { body: { backupId: backupId } }),
+    sessionsRestartCodex: () => request("POST", "/api/sessions/restart-codex", { body: {} }),
     sessionsSettings: () => request("GET", "/api/sessions/settings"),
-    sessionsSetSettings: (autoRepair) => request("POST", "/api/sessions/settings", { body: { autoRepairBeforeHost: autoRepair } }),
+    sessionsSetSettings: (autoRepair) => request("POST", "/api/sessions/settings", { body: { autoRepairBeforeLaunch: autoRepair } }),
     // ── Claude 会话历史(R2:只读列表;~/.claude/projects jsonl,无修复/删除)──
     claudeSessions: (page, size) => request("GET", "/api/claude/sessions?page=" + (page || 1) + "&size=" + (size || 50)),
 

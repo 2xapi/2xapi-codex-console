@@ -133,6 +133,58 @@ button { font-family: inherit; }
 .hist-row b { font: 600 12px var(--mono); }
 .hist-row .meta { flex: 1; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* Codex++ 风格会话管理 */
+.session-page { display:flex; flex-direction:column; gap:12px; padding-bottom:20px; }
+.session-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.session-heading h1 { margin:0 0 3px; font-size:18px; }
+.session-stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)) minmax(260px,2fr); gap:8px; }
+.session-stats > div { background:var(--panel); border:1px solid var(--hair); border-radius:10px; padding:11px 13px; min-width:0; }
+.session-stats span { display:block; color:var(--muted); font-size:10.5px; }
+.session-stats b { display:block; margin-top:3px; font-size:14px; }
+.session-stats .mono { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10.5px; }
+.session-control { display:flex; align-items:flex-end; justify-content:space-between; gap:14px; }
+.session-control .f { flex:1; margin:0; }
+.session-control select { width:100%; background:var(--raised); border:1px solid var(--hair); border-radius:8px; color:var(--text); padding:8px 10px; }
+.session-progress-head,.session-list-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.session-progress-track { height:8px; margin:12px 0 8px; overflow:hidden; border-radius:999px; background:var(--raised); }
+.session-progress-bar { display:block; height:100%; border-radius:inherit; background:var(--c-gw); transition:width .25s ease; }
+.session-progress-bar.done { background:var(--c-official); }
+.session-progress-bar.error { background:var(--c-err); }
+.session-warning { padding:10px 12px; border:1px solid rgba(231,177,74,.35); border-radius:9px; background:rgba(231,177,74,.07); color:#EBC979; font-size:11.5px; }
+.session-autofix { display:grid; grid-template-columns:1fr auto; align-items:center; gap:4px 16px; }
+.session-autofix label { font-size:12.5px; font-weight:600; }
+.session-autofix .sub { grid-column:1; }
+.session-autofix .btn { grid-column:2; grid-row:1 / span 2; }
+.session-toolbar,.session-pager { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+.session-toolbar { margin:10px 0; }
+.session-pager { justify-content:center; margin-top:10px; color:var(--muted); font-size:11.5px; }
+.session-select-count { font:11px var(--mono); color:var(--muted); }
+.session-rows { display:flex; flex-direction:column; gap:7px; }
+.session-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:10px; align-items:center; background:var(--panel); border:1px solid var(--hair); border-radius:9px; padding:9px 11px; }
+.session-row.selected { border-color:var(--c-gw); background:rgba(61,126,255,.07); }
+.session-row:has(.session-check) { grid-template-columns:auto minmax(0,1fr) auto auto; }
+.session-check input { accent-color:var(--c-gw); }
+.session-row-main { min-width:0; }
+.session-row-main b { display:block; font:600 12px var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.session-meta { display:block; margin-top:2px; color:var(--muted); font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.session-row-tags,.session-row-actions { display:flex; align-items:center; gap:5px; white-space:nowrap; }
+.tag.danger { color:#FFBAB4; border-color:rgba(226,88,78,.5); }
+.session-empty { min-height:180px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; gap:8px; }
+.session-empty-icon { font-size:30px; }
+.session-error { color:#FFBAB4 !important; }
+.toast.error,.toast.err { border-color:rgba(226,88,78,.5); color:#FFBAB4; }
+@media (max-width:760px) {
+  .session-stats { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .session-stats .wide { grid-column:1 / -1; }
+  .session-control { align-items:stretch; flex-direction:column; }
+  .session-autofix { grid-template-columns:1fr; }
+  .session-autofix .sub,.session-autofix .btn { grid-column:1; grid-row:auto; }
+  .session-row,.session-row:has(.session-check) { grid-template-columns:auto minmax(0,1fr); }
+  .session-row:not(:has(.session-check)) { grid-template-columns:minmax(0,1fr); }
+  .session-row-tags,.session-row-actions { grid-column:2; justify-content:flex-start; }
+  .session-row:not(:has(.session-check)) .session-row-tags,.session-row:not(:has(.session-check)) .session-row-actions { grid-column:1; }
+}
+
 /* 顶栏头像下拉菜单(行业标准账号菜单) */
 .userbox { position: relative; }
 .avatar { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--hair); background: linear-gradient(135deg, var(--c-gw), var(--c-accel)); color: #0E1319; font: 700 12px var(--mono); cursor: pointer; }

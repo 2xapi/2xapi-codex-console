@@ -27,9 +27,8 @@ pub async fn proxy_responses(State(s): State<Arc<AppState>>, req: Request<Body>)
     dispatch(&s, req, "responses", "codex").await
 }
 
-/// 文生图入口(C 段,`/v1/images/generations` 双形态):codex active 供应商经统一加速链转发
-/// /v1/images/generations(侦察实测 2xa 支持,b64 形态)。成功(200 且 data 有图)即
-/// `mark_dim(image_out=yes)` 单维实证标记——免探测成本,失败不标(参数错≠能力无)。
+/// 文生图入口(C 段,`/v1/images/generations` 双形态):codex active 供应商经统一加速链转发。
+/// 成功响应只记录用量,不写入模型能力标签。
 pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) -> Response<Body> {
     // 托盘「网关开/关」守卫(/v1/images/generations 不走 dispatch,入口处单独拦截)
     if !s
@@ -83,10 +82,6 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
         Ok(b) => b,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
-    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
-        .unwrap_or_default();
     let base = provider.base_url.trim_end_matches('/');
     let target = if base.ends_with("/v1") {
         format!("{base}/images/generations")
@@ -165,15 +160,7 @@ pub async fn proxy_images(State(s): State<Arc<AppState>>, req: Request<Body>) ->
         status.is_success() && has_image,
     );
     if status.is_success() {
-        if has_image && !model.is_empty() {
-            crate::capprobe::mark_dim(
-                &s.codex_home,
-                &provider.id,
-                &model,
-                "image_out",
-                crate::capprobe::Tri::Yes,
-            );
-        }
+        // 图片能力标签已停用：只记录请求结果，不写入能力标签。
     } else {
         s.keypool.mark_failure(&provider.id, &provider.api_key);
     }
@@ -415,16 +402,6 @@ async fn dispatch_anthropic_for(
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &format!("read body: {e}")),
     };
     let body_bytes = rewrite_anthropic_request_model(agent, &provider, body_bytes);
-
-    // 媒体关卡(超融合二期):同 codex 通道(模型取请求体 model,与 codex 通路一致);
-    // 纯文本零路径变化
-    let req_model: String = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
-        .unwrap_or_default();
-    if let Some(resp) = media_gate(state, &provider, &req_model, &body_bytes) {
-        return resp;
-    }
 
     let base = provider.base_url.trim_end_matches('/');
     let target = if base.ends_with("/v1") {
@@ -947,87 +924,6 @@ async fn dispatch_gemini(
     }
 }
 
-/// 统一转发(Codex 路径 `/v1/*`):取 agent 的 active 供应商 → 注入凭证 → 转发 → 流式透传响应。
-/// 语义(按 agent 过滤取供应商,见 providers::get_provider_for_agent)——
-/// 全局 active 若属其他 agent,取本 agent sort_index 最小者,不串台。
-/// hermes 接入(B 阶段):`/hermes/chat/completions` 走同一 dispatch,agent="hermes"。
-/// 媒体关卡(超融合二期,方案红线:纯文本请求零路径变化):
-/// body 无图片结构直接放行;
-/// 含图(OpenAI image_url/input_image / Anthropic image block / Gemini inlineData)
-/// → 查 provider::model 的 image_in 探测标签:不支持 → 400 人话前置拦截
-/// (上游明确拒时上游会报,上游静默吞时这里拦下——A 段 M1/M2 定案);
-/// Unknown 放行(未探测不误伤),audio 维度一期未探测故不拦。
-fn contains_image_input(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(items) => items.iter().any(contains_image_input),
-        serde_json::Value::Object(object) => {
-            if object
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| matches!(kind, "image_url" | "input_image" | "image"))
-            {
-                return true;
-            }
-            if object.contains_key("image_url") {
-                return true;
-            }
-            for key in ["inlineData", "inline_data"] {
-                if object
-                    .get(key)
-                    .and_then(serde_json::Value::as_object)
-                    .and_then(|data| data.get("mimeType").or_else(|| data.get("mime_type")))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|mime| mime.starts_with("image/"))
-                {
-                    return true;
-                }
-            }
-            if object
-                .get("source")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|source| source.get("media_type"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|mime| mime.starts_with("image/"))
-            {
-                return true;
-            }
-            object.values().any(contains_image_input)
-        }
-        _ => false,
-    }
-}
-
-fn media_gate(
-    state: &AppState,
-    provider: &crate::providers::Provider,
-    model: &str,
-    body: &[u8],
-) -> Option<Response<Body>> {
-    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    if !contains_image_input(&parsed) {
-        return None;
-    }
-    let model = if model.is_empty() {
-        &provider.model
-    } else {
-        model
-    };
-    if model.is_empty() {
-        return None;
-    }
-    if crate::capprobe::tri_of(&state.codex_home, &provider.id, model, "image_in")
-        != crate::capprobe::Tri::No
-    {
-        return None; // yes/unknown 放行
-    }
-    Some(err_resp(
-        StatusCode::BAD_REQUEST,
-        &format!(
-            "模型 {model} 不支持图片输入(能力探测:不支持)。请换支持识图的模型/供应商;若认为探测有误,可在能力面板重探或手动覆盖"
-        ),
-    ))
-}
-
 async fn dispatch(
     state: &AppState,
     req: Request<Body>,
@@ -1127,10 +1023,6 @@ async fn dispatch(
                 .then_some(true)
         })
         .unwrap_or(false);
-    // 媒体关卡(超融合二期):带图请求按 image_in 标签前置拦截;纯文本零路径变化
-    if let Some(resp) = media_gate(state, &provider, &req_model, &body_bytes) {
-        return resp;
-    }
     eprintln!(
         "[GW] /{} | provider={} mode={:?} wire={:?} model={} stream={} body={}B",
         suffix,
@@ -2955,7 +2847,7 @@ mod tests {
     async fn images_passthrough_marks_image_out() {
         let (base, seen) = mock_upstream(r#"{"created":1,"data":[{"b64_json":"aGk="}]}"#).await;
         let (state, providers_path, root) = make_state("img-ok");
-        let pid = add_provider(&providers_path, &base, "sk-img");
+        add_provider(&providers_path, &base, "sk-img");
         let resp = proxy_images(
             State(Arc::new(state.clone())),
             Request::builder()
@@ -2979,11 +2871,7 @@ mod tests {
             seen.lock().unwrap().first().cloned(),
             Some("Bearer sk-img".into())
         );
-        // 单维实证:首次成功即标 image_out=yes(caps 缺则建)
-        assert_eq!(
-            crate::capprobe::tri_of(&state.codex_home, &pid, "gpt-test", "image_out"),
-            crate::capprobe::Tri::Yes
-        );
+        // 单维实证已停用：成功请求只记录用量，不写入能力标签。
         let summary = crate::usage_stats::summary(&state.codex_home);
         assert_eq!(summary["providers"][0]["count"], 1);
         assert_eq!(summary["providers"][0]["routes"][0], "images");
@@ -3081,7 +2969,7 @@ mod tests {
     #[tokio::test]
     async fn images_unreachable_502_no_mark() {
         let (state, providers_path, root) = make_state("img-dead");
-        let pid = add_provider(&providers_path, "http://127.0.0.1:9", "sk-img2");
+        add_provider(&providers_path, "http://127.0.0.1:9", "sk-img2");
         let resp = proxy_images(
             State(Arc::new(state.clone())),
             Request::builder()
@@ -3095,55 +2983,6 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            crate::capprobe::tri_of(&state.codex_home, &pid, "gpt-test", "image_out"),
-            crate::capprobe::Tri::Unknown,
-            "失败不标(参数错≠能力无)"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 媒体关卡(超融合二期):纯文本直过/带图+不支持标签 400 人话/带图+未探测放行/带图+支持放行。
-    #[test]
-    fn media_gate_three_states() {
-        let (state, _providers_path, root) = make_state("gate");
-        let p = crate::providers::Provider {
-            id: "gp1".into(),
-            model: "m1".into(),
-            ..Default::default()
-        };
-        // ① 纯文本:无标签也放行(零路径变化)
-        assert!(media_gate(&state, &p, "", br#"{"input":"hi"}"#).is_none());
-        // ② 未探测(Unknown):带图放行(不误伤)
-        let img_body = br#"{"model":"m1","input":[{"type":"input_image","image_url":"data:image/png;base64,x"}]}"#;
-        assert!(media_gate(&state, &p, "", img_body).is_none());
-        // ③ 标签=不支持:带图 400 人话;纯文本仍放行
-        let caps = crate::capprobe::Caps {
-            text: crate::capprobe::Tri::Yes,
-            tools: crate::capprobe::Tri::Yes,
-            reasoning: crate::capprobe::Tri::Unknown,
-            image_in: crate::capprobe::Tri::No,
-        };
-        crate::capprobe::store_probe_force(&state.codex_home, "gp1", "m1", &caps);
-        let resp = media_gate(&state, &p, "", img_body).expect("带图+No 应拦");
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        assert!(media_gate(&state, &p, "", b"{\"input\":\"plain text\"}").is_none());
-        assert!(media_gate(&state, &p, "", br#"{"input":"explain image processing"}"#).is_none());
-        assert!(media_gate(
-            &state,
-            &p,
-            "",
-            br#"{"input":[{"type":"input_audio","audio":"..."}]}"#
-        )
-        .is_none());
-        // ④ 标签=支持:带图放行
-        let caps_yes = crate::capprobe::Caps {
-            image_in: crate::capprobe::Tri::Yes,
-            ..caps
-        };
-        crate::capprobe::store_probe_force(&state.codex_home, "gp1", "m1", &caps_yes);
-        assert!(media_gate(&state, &p, "", img_body).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

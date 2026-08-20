@@ -17,6 +17,10 @@ mod platform;
 // main.rs 以 launcher::sweep_orphans()/spawn_monitor() 调用:lifecycle 为私有子模块,此处 re-export
 pub use lifecycle::{spawn_monitor, sweep_orphans};
 
+pub(crate) fn resolve_codex_bin() -> String {
+    platform::resolve_codex_bin()
+}
+
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
