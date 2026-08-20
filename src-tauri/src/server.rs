@@ -270,7 +270,23 @@ pub fn build_router(state: AppState) -> Router {
             get(handle_autostart).post(handle_autostart_set),
         )
         .route("/api/sessions", get(handle_sessions_list))
+        .route("/api/sessions/inspect", get(handle_sessions_inspect))
         .route("/api/sessions/repair", post(handle_sessions_repair))
+        .route("/api/sessions/jobs/:id", get(handle_sessions_job))
+        .route(
+            "/api/sessions/delete-preview",
+            post(handle_sessions_delete_preview),
+        )
+        .route("/api/sessions/delete", post(handle_sessions_delete))
+        .route(
+            "/api/sessions/delete/undo",
+            post(handle_sessions_delete_undo),
+        )
+        .route(
+            "/api/sessions/restart-codex",
+            post(handle_sessions_restart_codex),
+        )
+        .route("/api/sessions/:id/resume", post(handle_sessions_resume))
         .route(
             "/api/sessions/settings",
             get(handle_sessions_settings).post(handle_sessions_settings_set),
@@ -287,15 +303,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/accel/test-node", post(handle_accel_test_node))
         // --- 每账号节点凭证(星图 任务 B:usage 刷新)---
         .route("/api/accel/refresh-cred", post(handle_accel_refresh_cred))
-        // --- 超融合 A 线一期:能力探测(前四维)+标签+注册表 ---
-        .route(
-            "/api/providers/:id/probe-capabilities",
-            post(handle_probe_capabilities),
-        )
-        .route(
-            "/api/capability-tags",
-            get(handle_capability_tags).post(handle_capability_tags_set),
-        )
+        // --- 能力注册表（保留插件和内置工具消费）---
         .route("/api/fusion-registry", get(handle_fusion_registry))
         .route("/api/config/snapshot", post(handle_config_snapshot))
         .route("/api/config/restore", post(handle_config_restore))
@@ -1579,7 +1587,7 @@ async fn handle_accel_test_node(
 
 // ── 历史会话管理(阶段 3,任务书 §四)─────────────────────
 
-// GET /api/sessions?page=&size=&provider= → {total, items, db}
+// GET /api/sessions?page=&size= → Codex++ 风格分页、统计和数据库路径
 async fn handle_sessions_list(
     State(s): State<Arc<AppState>>,
     query: axum::extract::Query<Value>,
@@ -1594,25 +1602,160 @@ async fn handle_sessions_list(
         .and_then(|v| v.as_str())
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(50);
-    let provider = query
-        .get("provider")
+    let snapshot_id = query
+        .get("snapshotId")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    ok_env(crate::sessions::list_sessions(
-        &s.codex_home,
-        page,
-        size,
-        &provider,
-    ))
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let data = match snapshot_id {
+        Some(snapshot_id) => match crate::sessions::list_sessions_page_from_snapshot(
+            &s.codex_home,
+            snapshot_id,
+            page,
+            size,
+        ) {
+            Ok(data) => data,
+            Err(error) => return err_env(StatusCode::CONFLICT, "E_SESSION_SNAPSHOT", &error, None),
+        },
+        None => {
+            return err_env(
+                StatusCode::CONFLICT,
+                "E_SESSION_SNAPSHOT",
+                "请先完成会话检查，再加载列表",
+                None,
+            )
+        }
+    };
+    ok_env(data)
 }
 
-// POST /api/sessions/repair → {fixed, scanned}
-async fn handle_sessions_repair(State(s): State<Arc<AppState>>) -> Response {
-    ok_env(crate::sessions::repair_sessions(
-        &s.codex_home,
-        &s.backup_dir,
-    ))
+async fn handle_sessions_inspect(State(s): State<Arc<AppState>>) -> Response {
+    ok_env(crate::sessions::inspect_sessions(&s.codex_home))
+}
+
+async fn handle_sessions_repair(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let target = body
+        .get("targetProvider")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match crate::sessions::start_repair_job(
+        s.codex_home.clone(),
+        s.backup_dir.clone(),
+        target.to_string(),
+    ) {
+        Ok(job_id) => ok_env(json!({"jobId": job_id})),
+        Err(error) => err_env(
+            if error.contains("正在运行") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "E_SESSION_REPAIR",
+            &error,
+            None,
+        ),
+    }
+}
+
+async fn handle_sessions_job(Path(id): Path<String>) -> Response {
+    match crate::sessions::get_repair_job(&id) {
+        Some(job) => ok_env(job),
+        None => err_env(
+            StatusCode::NOT_FOUND,
+            "E_SESSION_JOB",
+            "修复任务不存在",
+            None,
+        ),
+    }
+}
+
+async fn handle_sessions_delete_preview(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let ids: Vec<String> = body
+        .get("ids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    match crate::sessions::preview_delete(&s.codex_home, &ids) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(
+            StatusCode::BAD_REQUEST,
+            "E_SESSION_DELETE_PREVIEW",
+            &error,
+            None,
+        ),
+    }
+}
+
+async fn handle_sessions_delete(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let token = body
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match crate::sessions::apply_delete(&s.codex_home, &s.backup_dir, token) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(StatusCode::BAD_REQUEST, "E_SESSION_DELETE", &error, None),
+    }
+}
+
+async fn handle_sessions_delete_undo(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let backup = body.get("backupId").and_then(Value::as_str).unwrap_or("");
+    match crate::sessions::undo_delete(&s.codex_home, &s.backup_dir, backup) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(StatusCode::BAD_REQUEST, "E_SESSION_UNDO", &error, None),
+    }
+}
+
+async fn handle_sessions_restart_codex(State(s): State<Arc<AppState>>) -> Response {
+    if let Err(error) = crate::sessions::auto_repair_before_launch(&s.codex_home, &s.backup_dir) {
+        return err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_SESSION_AUTO_REPAIR",
+            &error,
+            None,
+        );
+    }
+    match crate::sessions::restart_codex() {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(StatusCode::BAD_REQUEST, "E_SESSION_RESTART", &error, None),
+    }
+}
+
+// POST /api/sessions/:id/resume → 在系统 Terminal 打开固定 codex resume 命令
+async fn handle_sessions_resume(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(error) = crate::sessions::auto_repair_before_launch(&s.codex_home, &s.backup_dir) {
+        return err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_SESSION_AUTO_REPAIR",
+            &error,
+            None,
+        );
+    }
+    match crate::sessions::resume_session(&s.codex_home, &id) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(StatusCode::BAD_REQUEST, "E_SESSION_RESUME", &error, None),
+    }
 }
 
 // GET/POST /api/sessions/settings
@@ -1623,11 +1766,23 @@ async fn handle_sessions_settings_set(
     State(s): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let v = body
-        .get("autoRepairBeforeHost")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(true);
-    ok_env(crate::sessions::set_settings(&s.codex_home, v))
+    let Some(value) = body.get("autoRepairBeforeLaunch").and_then(Value::as_bool) else {
+        return err_env(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "E_VALIDATION",
+            "autoRepairBeforeLaunch 必须是 boolean",
+            Some(vec!["autoRepairBeforeLaunch".into()]),
+        );
+    };
+    match crate::sessions::set_settings(&s.codex_home, value) {
+        Ok(data) => ok_env(data),
+        Err(error) => err_env(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "E_SESSION_SETTINGS",
+            &error,
+            None,
+        ),
+    }
 }
 
 async fn handle_config_snapshot(State(s): State<Arc<AppState>>) -> Response {
@@ -2223,87 +2378,9 @@ async fn handle_agent_start(
     }
 }
 
-// ── 超融合 A 线一期:能力探测/标签/注册表 ────────────────────
+// ── 能力注册表 ─────────────────────────────────────────────
 
-// POST /api/providers/:id/probe-capabilities {model?, force?} —— 前四维探测+落标签
-async fn handle_probe_capabilities(
-    State(s): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(body): Json<Value>,
-) -> Response {
-    let data = crate::providers::load(&s.providers_path);
-    let Some(provider) = data.providers.iter().find(|p| p.id == id) else {
-        return err_env(StatusCode::NOT_FOUND, "E_NOT_FOUND", "供应商不存在", None);
-    };
-    let model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .filter(|m| !m.trim().is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| provider.model.clone());
-    if model.is_empty() {
-        return err_env(
-            StatusCode::BAD_REQUEST,
-            "E_NO_MODEL",
-            "该供应商未配置默认模型,探测需指定 model",
-            None,
-        );
-    }
-    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let caps = crate::capprobe::probe_caps(
-        &provider.base_url,
-        &provider.api_key,
-        &model,
-        provider.wire_api,
-        provider.reasoning_levels.as_deref(),
-    )
-    .await;
-    let entry = if force {
-        crate::capprobe::store_probe_force(&s.codex_home, &provider.id, &model, &caps)
-    } else {
-        crate::capprobe::store_probe(&s.codex_home, &provider.id, &model, &caps)
-    };
-    // 能力注册表同步登记(model 条目,标签作为 meta)
-    let mut meta = serde_json::Map::new();
-    if let Some(c) = entry.get("caps") {
-        meta.insert("caps".into(), c.clone());
-    }
-    crate::registry::upsert_model(&s.codex_home, &provider.id, &model, meta);
-    ok_env(json!({ "providerId": provider.id, "model": model, "entry": entry }))
-}
-
-// GET /api/capability-tags —— 全部标签;POST {providerId, model, dim, val} —— 手动覆盖(on/off/auto)
-async fn handle_capability_tags(State(s): State<Arc<AppState>>) -> Response {
-    ok_env(crate::capprobe::all_json(&s.codex_home))
-}
-
-async fn handle_capability_tags_set(
-    State(s): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Response {
-    let get = |k: &str| {
-        body.get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    };
-    let (pid, model, dim, val) = (get("providerId"), get("model"), get("dim"), get("val"));
-    if pid.is_empty() || model.is_empty() {
-        return err_env(
-            StatusCode::BAD_REQUEST,
-            "E_BAD_REQUEST",
-            "需要 providerId 与 model",
-            None,
-        );
-    }
-    match crate::capprobe::set_manual(&s.codex_home, &pid, &model, &dim, &val) {
-        Ok(entry) => ok_env(json!({ "entry": entry })),
-        Err(e) => err_env(StatusCode::BAD_REQUEST, "E_BAD_OVERRIDE", &e, None),
-    }
-}
-
-// GET /api/fusion-registry —— 能力注册表(一期骨架,二期消费)
+// GET /api/fusion-registry —— 插件和内置工具注册表
 async fn handle_fusion_registry(State(s): State<Arc<AppState>>) -> Response {
     ok_env(crate::registry::list_json(&s.codex_home))
 }
@@ -3165,6 +3242,51 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sessions_list_requires_and_accepts_inspect_snapshot() {
+        let app = build_router(dummy_state());
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions?page=1&size=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        let missing_body = body_json(missing).await;
+        assert_eq!(missing_body["error"]["code"], "E_SESSION_SNAPSHOT");
+
+        let inspected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/inspect")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspected.status(), StatusCode::OK);
+        let inspected_body = body_json(inspected).await;
+        let snapshot_id = inspected_body["data"]["snapshotId"].as_str().unwrap();
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions?page=1&size=50&snapshotId={snapshot_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(body_json(listed).await["ok"], true);
     }
 
     #[tokio::test]

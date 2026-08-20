@@ -22,12 +22,29 @@ var state = {
   menuOpen: false,     // 账号菜单展开
   search: "",          // 供应商栏筛选
   setTab: "ip",        // 设置五分区
-  sessions: null,      // GET /api/sessions items
+  sessions: null,      // 当前页 GET /api/sessions items
   sessionsTotal: 0,
-  sessionsPage: 0,     // 已加载到第几页(50/页;首屏 50 + 加载更多)
+  sessionsPage: 1,
+  sessionsPageSize: 50,
+  sessionsHasMore: false,
+  sessionsStats: { sessions: 0, active: 0, archived: 0 },
+  sessionsDbPaths: { catalog: "", state: "" },
   sessionsLoading: false,
+  sessionsError: "",
+  sessionsRequestSeq: 0,
+  sessionsSnapshotId: "",
+  sessionsInspect: null,
+  sessionsTarget: "",
   sessionsSettings: null,
+  sessionsAutoDraft: false,
+  sessionsSettingsSaving: false,
   sessionsRepairing: false,
+  sessionsRepairJob: null,
+  sessionsRepairTimer: null,
+  sessionsSelectionMode: false,
+  sessionsSelected: {},
+  sessionActionId: "",
+  sessionsLastDelete: null,
   claudeSessions: null,      // GET /api/claude/sessions items(null=未加载/加载中;只读展示,无修复/删除)
   claudeSessionsTotal: 0,
   claudeSessionsPage: 0,     // 已加载到第几页(50/页)
@@ -227,63 +244,8 @@ async function refreshSession() {
     } catch (e) { /* 下次刷新再试 */ }
   }
 }
-/* 超融合 A 线一期:能力标签(供应商×模型粒度;manual 覆盖不冲) */
-var CAP_TAGS = null;
-function refreshCapTags() {
-  return api.capabilityTags().then(function (v) { CAP_TAGS = (v && v.tags) || {}; })
-    .catch(function () { CAP_TAGS = {}; });
-}
-function capsEntry(p) {
-  return (CAP_TAGS && CAP_TAGS[p.id + "::" + (p.model || "")]) || null;
-}
-function capsSectionHtml(p) {
-  var e = capsEntry(p);
-  var dims = [["text", "文本"], ["tools", "工具"], ["reasoning", "推理"], ["image_in", "识图"]];
-  var chips = "";
-  dims.forEach(function (d) {
-    var val = e && e.caps ? (e.caps[d[0]] || "unknown") : "unknown";
-    var cls = val === "yes" ? "tag on" : "tag";
-    var lb = d[1] + (val === "yes" ? " ✓" : val === "no" ? " ✗" : " ?");
-    chips += '<span class="' + cls + '">' + lb + '</span>';
-  });
-  var manualTag = e && e.source === "manual" ? ' <span class="tag">手动</span>' : '';
-  var selects = dims.map(function (d) {
-    return '<span style="display:inline-flex;align-items:center;gap:3px;margin-right:8px">' + d[1]
-      + '<select data-a="cap-set" data-id="' + esc(p.id) + '" data-model="' + esc(p.model || "") + '" data-dim="' + d[0] + '">'
-      + '<option value="auto">auto</option><option value="on">on</option><option value="off">off</option>'
-      + '</select></span>';
-  }).join("");
-  return '<div style="margin:10px 0 0;padding:10px 12px;background:rgba(120,160,255,.05);border:1px solid rgba(120,160,255,.22);border-radius:9px">'
-    + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">'
-    + '<span style="font-size:11.5px;color:#A8C0F0">能力(模型 ' + esc(p.model || "未设置") + ')' + manualTag + ' ' + chips + '</span>'
-    + '<button class="btn ghost" data-a="cap-probe" data-id="' + esc(p.id) + '"' + (state.busy === "cap-probe" ? " disabled" : "") + '>⚡ 探测能力</button></div>'
-    + '<div style="margin-top:6px;font-size:10.5px;color:var(--muted)">覆盖:' + selects + '<span>auto=清除手动覆盖;on/off=手动兜底;普通探测不覆盖手动值</span></div>'
-    + '</div>';
-}
-function doCapProbe(id) {
-  state.busy = "cap-probe"; render();
-  api.probeCapabilities(id, { force: false }).then(function () {
-    return refreshCapTags();
-  }).then(function () {
-    showToast("能力探测完成", "ok");
-  }).catch(function (e2) {
-    showToast(e2.message || "探测失败", "error");
-  }).finally(function () {
-    state.busy = null; render();
-  });
-}
-function doCapSet(id, model, dim, val) {
-  api.capabilitySet({ providerId: id, model: model, dim: dim, val: val }).then(function () {
-    return refreshCapTags();
-  }).then(function () {
-    showToast(dim + " 已覆盖为 " + val, "ok");
-  }).catch(function (e) {
-    showToast(e.message || "覆盖失败", "error");
-  }).finally(function () { render(); });
-}
-
 async function refreshAll() {
-  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel(), refreshClaudeState(), refreshCapTags()]);
+  await Promise.all([refreshProviders(), refreshDesktop(), refreshSession(), refreshAccel(), refreshClaudeState()]);
 }
 
 /* ── 渲染 ── */
@@ -553,7 +515,6 @@ function providerDetailCard(p) {
     + '<div><div class="k">默认模型</div><div class="v mono">' + esc(p.model || "—") + '</div></div>'
     + '</div>'
     + '<div class="btn-row">' + btns + '</div></section>';
-  html += capsSectionHtml(p);
   if (state.diag && state.diag.forId === p.id) html += diagCard(state.diag.data);
   return html;
 }
@@ -1846,85 +1807,273 @@ function historyHtml() {  if (state.agent === "hermes") {
       + '<div class="btn-row"><button class="btn ghost" data-a="csess-refresh"' + (state.claudeSessionsLoading ? " disabled" : "") + '>刷新</button></div>'
       + '<div style="margin-top:10px">' + clist + '</div></section>';
   }
-  var s = state.sessions;
-  var listHtml;
-  if (state.sessionsRepairing) listHtml = '<div class="sub">正在对账会话…(先整库备份,再核对会话文件)</div>';
-  else if (s === null) listHtml = '<div class="sub">加载中…</div>';
-  else if (!s.length) listHtml = '<div class="sub">没有会话记录。</div>';
-  else {
-    listHtml = s.map(function (it) {
-      var tagColor = it.providerTag === "unknown" ? "" : 'style="border-color:var(--c-gw);color:var(--c-gw)"';
-      return '<div class="hist-row"><b>' + esc(it.title || "(无标题)") + '</b>'
-        + '<span class="meta">' + esc(it.providerTag) + ' · ' + esc(fmtTime(it.updatedAt)) + (it.cwd ? " · " + esc(it.cwd) : "") + '</span>'
-        + '<span class="tag" ' + tagColor + '>' + esc(it.providerTag) + '</span>'
-        + '<button class="btn sm ghost" data-a="sess-continue" data-i="' + esc(it.id) + '">继续</button></div>';
-    }).join("");
+  if (state.agent !== "codex") {
+    return '<section class="card session-empty"><div class="session-empty-icon">🕘</div><h2>' + esc(agentName(state.agent)) + ' 会话管理</h2><div class="sub">该平台的本地会话管理暂未接入。</div></section>';
   }
-  /* 首屏 50 条 + 加载更多(50/页追加);还有下一页才出按钮 */
-  if (s && s.length && s.length < state.sessionsTotal) {
-    listHtml += '<button class="btn ghost" data-a="sess-more" style="width:100%;margin-top:8px"' + (state.sessionsLoading ? " disabled" : "") + '>'
-      + (state.sessionsLoading ? "加载中…" : "加载更多") + '</button>';
-  }
-  var autoOn = !!(state.sessionsSettings && state.sessionsSettings.autoRepairBeforeHost);
-  return '<section class="card" style="min-height:100%"><h2>历史会话</h2>'
-    + '<div class="sub">Codex 对话记录(~/.codex 统一保存);修复前自动备份。共 <b>' + state.sessionsTotal + '</b> 条。</div>'
-    + '<div class="btn-row">'
-    + '<button class="btn ghost" data-a="sess-repair"' + (state.sessionsRepairing ? " disabled" : "") + '>' + (state.sessionsRepairing ? "修复中…" : "立刻修复历史会话") + '</button>'
-    + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;padding:3px 0"><input type="checkbox" data-a="sess-autofix"' + (autoOn ? " checked" : "") + '>启动前自动修复</label>'
-    + '</div>'
-    + '<div style="margin-top:10px">' + listHtml + '</div></section>';
+  return codexSessionManagerHtml();
 }
-/* Codex 会话列表:reset=true 重拉首页;false 追加下一页(50/页)——与 Claude 侧 csess-more 同构 */
-async function loadSessions(reset) {
-  if (reset !== false) { state.sessions = null; state.sessionsPage = 0; }
+function codexSessionManagerHtml() {
+  var items = state.sessions || [];
+  var stats = state.sessionsStats || {};
+  var inspect = state.sessionsInspect || {};
+  var targets = inspect.targets || [];
+  var selectedCount = Object.keys(state.sessionsSelected || {}).filter(function (id) { return state.sessionsSelected[id]; }).length;
+  var job = state.sessionsRepairJob || { percent: 0, message: "尚未运行历史会话修复。", status: "idle" };
+  var targetOptions = targets.map(function (target) {
+    return '<option value="' + esc(target.id) + '"' + (target.id === state.sessionsTarget ? ' selected' : '') + '>' + esc(target.label || target.id) + '</option>';
+  }).join("");
+  var rows;
+  if (state.sessionsLoading && !items.length) rows = '<div class="session-empty"><div class="sub">正在读取本地会话…</div></div>';
+  else if (state.sessionsError && !items.length) rows = '<div class="session-empty"><div class="sub session-error">' + esc(state.sessionsError) + '</div></div>';
+  else if (!items.length) rows = '<div class="session-empty"><div class="sub">当前页没有会话。</div></div>';
+  else rows = items.map(function (item) {
+    var checked = !!state.sessionsSelected[item.id];
+    var actionBusy = state.sessionActionId === item.id;
+    return '<div class="session-row' + (checked ? ' selected' : '') + '">'
+      + (state.sessionsSelectionMode ? '<label class="session-check"><input type="checkbox" data-a="sess-check" data-id="' + esc(item.id) + '"' + (checked ? ' checked' : '') + (item.deletable ? '' : ' disabled') + ' aria-label="选择会话"></label>' : '')
+      + '<div class="session-row-main"><b>' + esc(item.title || "(无标题)") + '</b><span class="session-meta">' + esc(item.providerTag || "unknown") + ' · ' + esc(fmtTime(item.updatedAt)) + (item.cwd ? ' · ' + esc(item.cwd) : '') + '</span></div>'
+      + '<div class="session-row-tags">' + (item.archived ? '<span class="tag">已归档</span>' : '<span class="tag on">未归档</span>') + (item.missing ? '<span class="tag danger">文件缺失</span>' : '') + '</div>'
+      + '<div class="session-row-actions"><button class="btn sm ghost" data-a="sess-continue" data-i="' + esc(item.id) + '"' + (!item.resumable || actionBusy ? ' disabled' : '') + '>' + (actionBusy ? '打开中…' : item.resumable ? '继续' : '不可继续') + '</button>'
+      + '<button class="btn sm danger" data-a="sess-delete-one" data-id="' + esc(item.id) + '"' + (!item.deletable ? ' disabled' : '') + '>删除</button></div></div>';
+  }).join("");
+  var auto = !!state.sessionsAutoDraft;
+  var progressClass = job.status === "failed" ? " error" : job.status === "completed" ? " done" : "";
+  var undo = state.sessionsLastDelete && state.sessionsLastDelete.backupId
+    ? '<button class="btn ghost" data-a="sess-undo" data-id="' + esc(state.sessionsLastDelete.backupId) + '">撤销上次删除</button>' : '';
+  return '<div class="session-page">'
+    + '<section class="session-heading"><div><h1>会话管理</h1><div class="sub">查看、删除和修复 Codex 本地会话</div></div><button class="btn ghost" data-a="sess-restart">重新打开 Codex</button></section>'
+    + '<section class="session-stats"><div><span>当前页会话</span><b>' + (stats.sessions || 0) + ' 个</b></div><div><span>当前页未归档</span><b>' + (stats.active || 0) + ' 个</b></div><div><span>当前页已归档</span><b>' + (stats.archived || 0) + ' 个</b></div><div class="wide"><span>数据库</span><b class="mono">' + esc((state.sessionsDbPaths && (state.sessionsDbPaths.catalog || state.sessionsDbPaths.state)) || "未找到") + '</b></div></section>'
+    + '<section class="card session-control"><div class="f"><label>同步目标</label><select data-a="sess-target">' + targetOptions + '</select><div class="sub">来源标签表示该 Provider 出现在配置、会话、索引、手动目录或当前配置中。</div></div><div class="btn-row"><button class="btn ghost" data-a="sess-refresh"' + (state.sessionsLoading ? ' disabled' : '') + '>刷新会话</button><button class="btn primary" data-a="sess-repair"' + (state.sessionsRepairing || !state.sessionsTarget ? ' disabled' : '') + '>立刻修复历史会话</button></div></section>'
+    + '<section class="card session-progress"><div class="session-progress-head"><b>历史会话修复进度</b><strong>' + (job.percent || 0) + '%</strong></div><div class="session-progress-track"><span class="session-progress-bar' + progressClass + '" style="width:' + Math.max(0, Math.min(100, job.percent || 0)) + '%"></span></div><div class="sub ' + (job.status === "failed" ? 'session-error' : '') + '">' + esc(job.error || job.message || "尚未运行历史会话修复。") + (job.backupId ? ' · 备份 ' + esc(job.backupId) : '') + '</div></section>'
+    + '<section class="session-warning">删除会创建本地备份；如果 Codex App 正在使用该会话，建议先关闭对应会话窗口再操作。</section>'
+    + '<section class="card session-autofix"><label><input type="checkbox" data-a="sess-autofix"' + (auto ? ' checked' : '') + '> 启动前自动修复历史会话</label><div class="sub">开启后，在继续会话或重新打开 Codex 前自动整理一次历史索引。</div><button class="btn ghost" data-a="sess-save-settings"' + (state.sessionsSettingsSaving ? ' disabled' : '') + '>' + (state.sessionsSettingsSaving ? '保存中…' : '保存自动修复设置') + '</button></section>'
+    + '<section class="card session-list"><div class="session-list-head"><div><b>本地会话</b><div class="sub">第 ' + state.sessionsPage + ' 页，每页最多 ' + state.sessionsPageSize + ' 条，按更新时间倒序显示</div></div><div class="session-select-count">已选择 ' + selectedCount + ' / ' + items.length + ' 个会话</div></div>'
+    + '<div class="session-toolbar"><button class="btn sm ghost" data-a="sess-select-all">全选当前列表</button><button class="btn sm ghost" data-a="sess-clear-selection">清空选择</button><button class="btn sm ghost" data-a="sess-selection-mode">' + (state.sessionsSelectionMode ? '退出多选' : '多选') + '</button><button class="btn sm danger" data-a="sess-delete-selected"' + (selectedCount ? '' : ' disabled') + '>删除所选</button>' + undo + '</div>'
+    + '<div class="session-rows">' + rows + '</div><div class="session-pager"><button class="btn ghost" data-a="sess-prev"' + (state.sessionsPage <= 1 || state.sessionsLoading ? ' disabled' : '') + '>上一页</button><span>第 ' + state.sessionsPage + ' 页</span><button class="btn ghost" data-a="sess-next"' + (!state.sessionsHasMore || state.sessionsLoading ? ' disabled' : '') + '>下一页</button></div></section></div>';
+}
+
+async function loadSessions(page) {
+  if (state.sessionsLoading) return;
+  page = Math.max(1, page || state.sessionsPage || 1);
+  var seq = ++state.sessionsRequestSeq;
   state.sessionsLoading = true;
+  state.sessionsError = "";
   render();
-  var page = (state.sessionsPage || 0) + 1;
   try {
-    var d = await api.sessions(page, 50, "");
-    var items = d.items || [];
-    state.sessions = page === 1 ? items : (state.sessions || []).concat(items);
+    var d = await api.sessions(page, state.sessionsPageSize, state.sessionsSnapshotId);
+    if (seq !== state.sessionsRequestSeq) return;
+    state.sessions = d.items || [];
     state.sessionsTotal = d.total || 0;
-    state.sessionsPage = page;
+    state.sessionsPage = d.page || page;
+    state.sessionsPageSize = d.size || 50;
+    state.sessionsHasMore = !!d.hasMore;
+    state.sessionsStats = d.pageStats || { sessions: state.sessions.length, active: 0, archived: 0 };
+    state.sessionsDbPaths = d.dbPaths || { catalog: "", state: "" };
+    state.sessionsSelected = {};
   } catch (e) {
-    if (reset !== false) state.sessions = [];
-    showToast("获取会话失败:" + e.message, "error");
+    if (seq === state.sessionsRequestSeq) {
+      if (e.code === "E_SESSION_SNAPSHOT" || e.status === 409) {
+        state.sessionsSnapshotId = "";
+        state.sessionsLoading = false;
+        return loadCodexHistory(page, true);
+      }
+      state.sessionsError = e.message || "获取会话失败";
+      showToast("获取会话失败：" + state.sessionsError, "error");
+    }
+  } finally {
+    if (seq === state.sessionsRequestSeq) {
+      state.sessionsLoading = false;
+      render();
+    }
   }
-  state.sessionsLoading = false;
-  render();
 }
-async function loadSessionsSettings() {
-  try { state.sessionsSettings = await api.sessionsSettings(); } catch (e) { state.sessionsSettings = null; }
+
+async function loadCodexHistory(page, forceInspect) {
+  if (state.sessionsLoading && !forceInspect) return;
+  page = Math.max(1, page || state.sessionsPage || 1);
+  var seq = ++state.sessionsRequestSeq;
+  state.sessionsLoading = true;
+  state.sessionsError = "";
   render();
+  try {
+    var inspect = await api.sessionsInspect();
+    var snapshotId = inspect && inspect.snapshotId;
+    if (!snapshotId) throw new Error("会话检查未返回快照");
+    var targets = (inspect && inspect.targets) || [];
+    var selectedTarget = state.sessionsTarget;
+    if (!selectedTarget || !targets.some(function (target) { return target.id === selectedTarget; })) {
+      var current = targets.find(function (target) { return target.isCurrent; });
+      selectedTarget = (current || targets[0] || {}).id || "";
+    }
+    var data = await api.sessions(page, state.sessionsPageSize, snapshotId);
+    var settings = await api.sessionsSettings();
+    if (seq !== state.sessionsRequestSeq) return;
+    state.sessionsInspect = inspect;
+    state.sessionsSnapshotId = snapshotId;
+    state.sessionsTarget = selectedTarget;
+    state.sessions = data.items || [];
+    state.sessionsTotal = data.total || 0;
+    state.sessionsPage = data.page || page;
+    state.sessionsPageSize = data.size || 50;
+    state.sessionsHasMore = !!data.hasMore;
+    state.sessionsStats = data.pageStats || { sessions: state.sessions.length, active: 0, archived: 0 };
+    state.sessionsDbPaths = data.dbPaths || { catalog: "", state: "" };
+    state.sessionsSettings = settings;
+    state.sessionsAutoDraft = !!(settings && settings.autoRepairBeforeLaunch);
+    state.sessionsSelected = {};
+  } catch (e) {
+    if (seq === state.sessionsRequestSeq) {
+      state.sessionsError = e.message || "获取会话失败";
+      if (e.code === "E_SESSION_SNAPSHOT" || e.status === 409) {
+        state.sessionsSnapshotId = "";
+        if (!forceInspect) {
+          state.sessionsLoading = false;
+          return loadCodexHistory(page, true);
+        }
+      } else {
+        showToast("获取会话失败：" + state.sessionsError, "error");
+      }
+    }
+  } finally {
+    if (seq === state.sessionsRequestSeq) {
+      state.sessionsLoading = false;
+      render();
+    }
+  }
 }
-/* Claude 会话列表(只读):reset=true 重拉首页;false 追加下一页(50/页) */
+
+/* Claude 会话列表保持只读分页。 */
 async function loadClaudeSessions(reset) {
   state.claudeSessionsLoading = true;
   if (reset) { state.claudeSessions = null; state.claudeSessionsPage = 0; }
   render();
   var page = (state.claudeSessionsPage || 0) + 1;
   try {
-    var d = await api.claudeSessions(page, 50);
-    var items = d.items || [];
+    var data = await api.claudeSessions(page, 50);
+    var items = data.items || [];
     state.claudeSessions = page === 1 ? items : (state.claudeSessions || []).concat(items);
-    state.claudeSessionsTotal = d.total || 0;
+    state.claudeSessionsTotal = data.total || 0;
     state.claudeSessionsPage = page;
   } catch (e) {
     if (reset) state.claudeSessions = [];
-    showToast("获取 Claude 会话失败:" + e.message, "error");
+    showToast("获取 Claude 会话失败：" + e.message, "error");
   }
   state.claudeSessionsLoading = false;
   render();
 }
-async function doSessionsRepair() {
-  state.sessionsRepairing = true; render();
+
+async function pollSessionsJob(id) {
+  clearTimeout(state.sessionsRepairTimer);
   try {
-    var d = await api.sessionsRepair();
-    showToast("修复完成:对账 " + d.scanned + " 条,修正 " + d.fixed + " 条(已先备份)", "ok");
-  } catch (e) { showToast("修复失败:" + e.message, "error"); }
-  state.sessionsRepairing = false;
-  await loadSessions();
+    var job = await api.sessionsJob(id);
+    state.sessionsRepairJob = job;
+    state.sessionsRepairing = job.status === "running";
+    render();
+    if (job.status === "running") {
+      state.sessionsRepairTimer = setTimeout(function () { pollSessionsJob(id); }, 1000);
+    } else {
+      if (job.status === "completed") showToast(job.message || "历史会话修复完成", "ok");
+      else showToast(job.error || "历史会话修复失败", "error");
+      await loadCodexHistory(1);
+    }
+  } catch (e) {
+    state.sessionsRepairing = false;
+    state.sessionsRepairJob = { status: "failed", percent: 0, error: e.message || "读取修复进度失败" };
+    render();
+  }
 }
+
+async function doSessionsRepair() {
+  if (!state.sessionsTarget || state.sessionsRepairing) return;
+  var inspect = state.sessionsInspect || {};
+  var detail = "将历史会话的 Provider 归属同步到 " + state.sessionsTarget + "，并先创建完整本地备份。";
+  if (inspect.codexRunning) detail += " Codex 当前正在运行，请先退出 Codex 后再执行。";
+  var confirmed = await askConfirm("修复历史会话？", detail);
+  if (!confirmed) return;
+  state.sessionsRepairing = true;
+  state.sessionsRepairJob = { status: "running", percent: 0, message: "正在创建修复任务…" };
+  render();
+  try {
+    var result = await api.sessionsRepair(state.sessionsTarget);
+    await pollSessionsJob(result.jobId);
+  } catch (e) {
+    state.sessionsRepairing = false;
+    state.sessionsRepairJob = { status: "failed", percent: 0, error: e.message || "修复失败" };
+    showToast("修复失败：" + (e.message || "未知错误"), "error");
+    render();
+  }
+}
+
+async function saveSessionsSettings() {
+  if (state.sessionsSettingsSaving) return;
+  state.sessionsSettingsSaving = true;
+  render();
+  try {
+    var saved = await api.sessionsSetSettings(!!state.sessionsAutoDraft);
+    state.sessionsSettings = saved;
+    state.sessionsAutoDraft = !!saved.autoRepairBeforeLaunch;
+    showToast("自动修复设置已保存", "ok");
+  } catch (e) {
+    state.sessionsAutoDraft = !!(state.sessionsSettings && state.sessionsSettings.autoRepairBeforeLaunch);
+    showToast("保存失败：" + e.message, "error");
+  }
+  state.sessionsSettingsSaving = false;
+  render();
+}
+
+async function doSessionResume(id) {
+  if (!id || state.sessionActionId) return;
+  state.sessionActionId = id;
+  render();
+  try {
+    await api.sessionsResume(id);
+    showToast("已在 Terminal 打开历史会话", "ok");
+  } catch (e) {
+    showToast("继续会话失败：" + (e.message || "请重试"), "error");
+  }
+  state.sessionActionId = "";
+  render();
+}
+
+async function deleteSessions(ids) {
+  ids = (ids || []).filter(Boolean);
+  if (!ids.length) return;
+  try {
+    var preview = await api.sessionsDeletePreview(ids);
+    var warning = "将删除 " + preview.count + " 个会话的数据库记录和 rollout 文件；操作前会创建可撤销备份。";
+    if (preview.warnings && preview.warnings.length) warning += " " + preview.warnings.join("；");
+    var confirmed = await askConfirm("删除本地会话？", warning);
+    if (!confirmed) return;
+    var result = await api.sessionsDelete(preview.confirmToken);
+    state.sessionsLastDelete = result;
+    state.sessionsSelected = {};
+    showToast("已删除 " + result.deleted + " 个会话，可使用“撤销上次删除”恢复", "ok");
+    await loadCodexHistory(state.sessionsPage);
+  } catch (e) {
+    showToast("删除失败：" + (e.message || "未知错误"), "error");
+  }
+}
+
+async function undoSessionDelete(backupId) {
+  if (!backupId) return;
+  try {
+    await api.sessionsUndoDelete(backupId);
+    state.sessionsLastDelete = null;
+    showToast("已恢复删除的会话", "ok");
+    await loadCodexHistory(1);
+  } catch (e) { showToast("撤销失败：" + e.message, "error"); }
+}
+
+async function restartCodexFromSessions() {
+  var confirmed = await askConfirm("重新打开 Codex？", "将优雅退出并重新打开 Codex；若开启自动修复，会先整理历史会话。当前对话窗口会被关闭。");
+  if (!confirmed) return;
+  try {
+    await api.sessionsRestartCodex();
+    showToast("Codex 已重新打开", "ok");
+    setTimeout(function () { loadCodexHistory(1); }, 1200);
+  } catch (e) { showToast("重新打开失败：" + e.message, "error"); }
+}
+
 
 /* ── 编辑供应商弹窗 ── */
 function renderModelRows() {
@@ -2842,14 +2991,16 @@ document.addEventListener("click", function (ev) {
     case "view":
       state.view = t.dataset.v; render();
       if (state.view === "history") {
-        if (state.agent === "codex") { loadSessions(); loadSessionsSettings(); }
-        else loadClaudeSessions(true);
+        if (state.agent === "codex") {
+          loadCodexHistory(1);
+        } else if (state.agent === "claude") {
+          loadClaudeSessions(true);
+        }
       }
       if (state.view === "eco") loadEco();
       if (state.view === "plug") plug2Load();
       break;
     case "sel": state.selId = t.dataset.id; state.diag = null; render(); break;
-    case "cap-probe": doCapProbe(t.dataset.id); break;
     case "eco-agent":
       if (ECO_STATE.agent !== t.dataset.g) { ECO_STATE.agent = t.dataset.g; ECO_STATE.data = null; loadEco(); }
       break;
@@ -3229,9 +3380,22 @@ document.addEventListener("click", function (ev) {
       break;
     case "diag": doDiag(); break;
     case "test": doTestConnection(); break;
-    case "sess-continue": showToast("继续历史会话:请在桌面版 Codex 里打开对应对话", "ok"); break;
-    case "sess-more": loadSessions(false); break;
+    case "sess-continue": doSessionResume(t.dataset.i); break;
+    case "sess-refresh": loadCodexHistory(state.sessionsPage); break;
     case "sess-repair": doSessionsRepair(); break;
+    case "sess-restart": restartCodexFromSessions(); break;
+    case "sess-save-settings": saveSessionsSettings(); break;
+    case "sess-prev": if (state.sessionsPage > 1) loadSessions(state.sessionsPage - 1); break;
+    case "sess-next": if (state.sessionsHasMore) loadSessions(state.sessionsPage + 1); break;
+    case "sess-selection-mode": state.sessionsSelectionMode = !state.sessionsSelectionMode; state.sessionsSelected = {}; render(); break;
+    case "sess-select-all":
+      state.sessionsSelected = {};
+      (state.sessions || []).forEach(function (item) { if (item.deletable) state.sessionsSelected[item.id] = true; });
+      state.sessionsSelectionMode = true; render(); break;
+    case "sess-clear-selection": state.sessionsSelected = {}; render(); break;
+    case "sess-delete-one": deleteSessions([t.dataset.id]); break;
+    case "sess-delete-selected": deleteSessions(Object.keys(state.sessionsSelected).filter(function (id) { return state.sessionsSelected[id]; })); break;
+    case "sess-undo": undoSessionDelete(t.dataset.id); break;
     case "csess-refresh": loadClaudeSessions(true); break;
     case "csess-more": loadClaudeSessions(false); break;
     case "adv-recodex": showToast("已重新检测:Codex CLI 路径 /Applications/ChatGPT.app/…/codex", "ok"); break;
@@ -3266,20 +3430,27 @@ document.addEventListener("change", function (ev) {
     else render();
     return;
   }
+  var sessionCheck = ev.target.closest("[data-a='sess-check']");
+  if (sessionCheck) {
+    state.sessionsSelected[sessionCheck.dataset.id] = sessionCheck.checked;
+    render();
+    return;
+  }
+  var target = ev.target.closest("[data-a='sess-target']");
+  if (target) {
+    state.sessionsTarget = target.value;
+    render();
+    return;
+  }
   var sauto = ev.target.closest("[data-a='sess-autofix']");
   if (sauto) {
-    var on = sauto.checked;
-    api.sessionsSetSettings(on).then(function () {
-      showToast(on ? "已开启启动前自动修复" : "已关闭启动前自动修复", "ok");
-    }).catch(function (e) { showToast(e.message, "error"); });
+    state.sessionsAutoDraft = sauto.checked;
+    render();
     return;
   }
 });
 document.addEventListener("change", function (ev) {
   var t = ev.target;
-  if (t && t.dataset && t.dataset.a === "cap-set") {
-    doCapSet(t.dataset.id, t.dataset.model, t.dataset.dim, t.value);
-  }
   if (t && t.dataset && t.dataset.a === "plug2-local-file") {
     plug2LocalFile(t);
     return;

@@ -35,7 +35,11 @@ pub fn list(backup_dir: &Path) -> Vec<Value> {
             ("config", "pre-apply", "应用配置前")
         };
 
-        let manifest_path = f.path().with_file_name(format!("{name}.manifest.json"));
+        let manifest_path = if metadata.is_dir() {
+            f.path().join("manifest.json")
+        } else {
+            f.path().with_file_name(format!("{name}.manifest.json"))
+        };
         let manifest = std::fs::read_to_string(&manifest_path)
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());

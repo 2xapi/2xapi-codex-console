@@ -9,7 +9,6 @@ mod agents;
 mod auth;
 mod autostart;
 mod backups;
-mod capprobe;
 mod claude_sessions;
 mod config;
 mod desktop;

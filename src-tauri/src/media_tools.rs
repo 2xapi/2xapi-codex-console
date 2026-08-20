@@ -1,6 +1,6 @@
 //! 多模态能力条目(媒体组 C 段,2026-08-17 一手实测定案):
 //! - 识图 image-describe:暂存图片 → 上游 chat 通道带图请求(image_url 形态)→ 文本;
-//!   按 image_in 能力标签前置拦截(No→人话拒,与网关媒体关卡同口径,Yes/Unknown 放行)。
+//!   图片请求不依赖本地能力标签,由上游返回真实结果。
 //! - 文生图 image-generate / 图编辑 image-edit:上游 /v1/images/generations|edits,
 //!   模型限 gpt-image 系(上游实测 dall-e 会被 400 拒);产物 b64 → 入媒体暂存回管内 URL。
 //!   当前 2xa Key 组未开通图生成权限(403 permission_error)——人话透出,后台开通即用。
@@ -308,15 +308,7 @@ pub async fn image_describe(s: &AppState, body: &Value) -> Response {
             "该供应商未设置默认模型,请在调用参数中指定 model",
         );
     }
-    // 媒体关卡(与网关同口径):标签 No 拦,Unknown/Yes 放行
-    if crate::capprobe::tri_of(&s.codex_home, &p.id, &model, "image_in") == crate::capprobe::Tri::No
-    {
-        return tool_err(
-            "E_CAP_IMAGE_IN",
-            "image_in=no",
-            "该模型经探测不支持识图(看不到图片),请换多模态模型,或在供应商详情卡手动更正能力标签后重试",
-        );
-    }
+    // 暂停 image_in 能力硬拦截：探测结果可能过期或误判，图片请求交给上游返回真实结果。
     let path = match media_path(&s.codex_home, media_url, MAX_IMAGE_INPUT_BYTES) {
         Ok(p) => p,
         Err(r) => return *r,
@@ -566,17 +558,7 @@ pub async fn image_generate(s: &AppState, body: &Value) -> Response {
         }
     };
     match store_image_out(&client, s, &v, "image-generate").await {
-        Ok(urls) => {
-            // 首次成功即实证标 image_out(与网关 /v1/images/generations 入口同标记)
-            crate::capprobe::mark_dim(
-                &s.codex_home,
-                &p.id,
-                &model,
-                "image_out",
-                crate::capprobe::Tri::Yes,
-            );
-            ok_data(json!({ "media_urls": urls, "mime": "image/png" }))
-        }
+        Ok(urls) => ok_data(json!({ "media_urls": urls, "mime": "image/png" })),
         Err(r) => *r,
     }
 }
@@ -683,16 +665,7 @@ pub async fn image_edit(s: &AppState, body: &Value) -> Response {
         }
     };
     match store_image_out(&client, s, &v, "image-edit").await {
-        Ok(urls) => {
-            crate::capprobe::mark_dim(
-                &s.codex_home,
-                &p.id,
-                &model,
-                "image_out",
-                crate::capprobe::Tri::Yes,
-            );
-            ok_data(json!({ "media_url": urls[0], "mime": "image/png" }))
-        }
+        Ok(urls) => ok_data(json!({ "media_url": urls[0], "mime": "image/png" })),
         Err(r) => *r,
     }
 }
@@ -910,14 +883,10 @@ mod tests {
         assert_eq!(v["data"]["text"], "红色");
         assert_eq!(v["data"]["model"], "m1");
 
-        // 关卡:image_in=no → 人话拒
-        let mut caps = crate::capprobe::Caps::unknown();
-        caps.image_in = crate::capprobe::Tri::No;
-        crate::capprobe::store_probe(&s.codex_home, "p1", "m1", &caps);
+        // 关闭能力标签后，图片请求仍应交给上游处理。
         let v = body_of(image_describe(&s, &json!({ "media_url": media_url })).await).await;
-        assert_eq!(v["ok"], false);
-        assert!(v["error"]["code"] == "E_CAP_IMAGE_IN", "应走识图关卡: {v}");
-        assert!(v["error"]["human"].as_str().unwrap().contains("识图"));
+        assert_eq!(v["ok"], true, "关闭能力标签后识图链路仍应执行: {v}");
+        assert_eq!(v["data"]["text"], "红色");
 
         let _ = std::fs::remove_dir_all(&root);
     }

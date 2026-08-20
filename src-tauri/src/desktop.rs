@@ -365,9 +365,6 @@ pub fn host(
     provider_id: &str,
     way: &str,
 ) -> Result<Value, OpError> {
-    // host 前自动跑轻量 repair(任务书 §四 autoRepairBeforeHost,默认开;只对账不重建)
-    crate::sessions::auto_repair_if_enabled(codex_home, backup_dir);
-
     if way != "gateway" && way != "direct" {
         return Err((
             400,

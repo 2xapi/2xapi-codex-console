@@ -403,28 +403,6 @@ fn save(codex_home: &Path, entries: &[Entry]) -> bool {
     write_private_json(&path, &body).is_ok()
 }
 
-/// upsert(model 条目):探测落标签时同步登记,id=provider::model。
-pub fn upsert_model(codex_home: &Path, provider_id: &str, model: &str, meta: Map<String, Value>) {
-    let mut entries = load(codex_home);
-    let id = format!("{provider_id}::{model}");
-    if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
-        e.meta = meta;
-    } else {
-        entries.push(Entry {
-            id,
-            kind: Kind::Model,
-            provider_id: Some(provider_id.to_string()),
-            model: Some(model.to_string()),
-            enabled: true,
-            meta,
-            config: Map::new(),
-            source: String::new(),
-            updated_at: now(),
-        });
-    }
-    save(codex_home, &entries);
-}
-
 /// upsert(plugin 条目):meta=manifest 全量;同 id 覆盖(重装/更新,保留用户 config)。
 /// 新条目带默认配置(config def 种子化 + manifest models + failover 默认开)与 source。
 pub fn upsert_plugin(codex_home: &Path, manifest: &Map<String, Value>) {
@@ -591,25 +569,6 @@ fn public_config(codex_home: &Path, entry: &Entry) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn upsert_and_list() {
-        let r = std::env::temp_dir().join(format!("2xapi-reg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&r);
-        std::fs::create_dir_all(&r).unwrap();
-        let mut meta = Map::new();
-        meta.insert("image_in".into(), json!("yes"));
-        upsert_model(&r, "p1", "m1", meta.clone());
-        upsert_model(&r, "p1", "m1", meta.clone()); // 幂等
-        let v = list_json(&r);
-        let arr = v["entries"].as_array().unwrap();
-        assert_eq!(arr.len(), 1, "同 id upsert 不重复");
-        assert_eq!(arr[0]["kind"], "model");
-        assert_eq!(arr[0]["meta"]["image_in"], "yes");
-        upsert_model(&r, "p2", "m1", meta);
-        assert_eq!(list_json(&r)["entries"].as_array().unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&r);
-    }
 
     #[test]
     fn legacy_plugin_secrets_are_migrated_and_never_listed() {
